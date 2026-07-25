@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "llama")]
+pub mod llama;
+
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const PAGE_SIZE: usize = 4096;
 // Crude placeholder for the `warm` heuristic below — the roadmap's own open
