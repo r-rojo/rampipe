@@ -57,66 +57,90 @@ pub enum LoadError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvictError {
-    #[error("path is not resident")]
-    NotResident,
+    #[error("unknown model id: {0:?}")]
+    UnknownId(ModelId),
     #[error("{outstanding} handle(s) still outstanding, refusing to evict")]
     HandleOutstanding { outstanding: usize },
 }
 
+/// Stable identifier for a resident model. Cheap to copy, and — unlike a
+/// `PathBuf` — safe to hand across an FFI boundary as a plain `u64`, which
+/// matters once Phase 4 (UniFFI/Swift) exists to hand it to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ModelId(u64);
+
 struct Resident {
-    mmap: Arc<Mmap>,
+    path: PathBuf,
+    mmap: Mmap,
     metrics: SwapMetrics,
 }
 
-/// A live reference to a mapped model. While any handle for a given path is
-/// alive, `SwapRegistry::evict` for that path fails — this is the safety
+/// A live reference to a mapped model. While any handle for a given model is
+/// alive, `SwapRegistry::evict` for its id fails — this is the safety
 /// invariant that makes eviction safe under concurrent generation: a live
 /// generation holds a handle, so the scheduler cannot unmap weights under it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ModelHandle {
-    path: PathBuf,
-    mmap: Arc<Mmap>,
-    metrics: SwapMetrics,
+    id: ModelId,
+    inner: Arc<Resident>,
 }
 
 impl ModelHandle {
+    pub fn id(&self) -> ModelId {
+        self.id
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
-        &self.mmap
+        &self.inner.mmap
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
     pub fn metrics(&self) -> SwapMetrics {
-        self.metrics
+        self.inner.metrics
     }
 }
 
+impl std::fmt::Debug for ModelHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelHandle")
+            .field("id", &self.id)
+            .field("path", &self.inner.path)
+            .field("metrics", &self.inner.metrics)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct RegistryState {
+    next_id: u64,
+    resident: HashMap<ModelId, Arc<Resident>>,
+    by_path: HashMap<PathBuf, ModelId>,
+}
+
 pub struct SwapRegistry {
-    resident: Mutex<HashMap<PathBuf, Resident>>,
+    state: Mutex<RegistryState>,
 }
 
 impl SwapRegistry {
     pub fn new() -> Self {
         SwapRegistry {
-            resident: Mutex::new(HashMap::new()),
+            state: Mutex::new(RegistryState::default()),
         }
     }
 
     /// Maps `path` into memory and validates it as a GGUF file. If `path` is
     /// already resident, hands out another handle to the existing mapping
-    /// instead of mapping it again.
+    /// (same `ModelId`) instead of mapping it again.
     pub fn load(&self, path: impl AsRef<Path>, residency: Residency) -> Result<ModelHandle, LoadError> {
         let path = path.as_ref().to_path_buf();
-        let mut table = self.resident.lock().expect("rampipe registry lock poisoned");
+        let mut state = self.state.lock().expect("rampipe registry lock poisoned");
 
-        if let Some(entry) = table.get(&path) {
-            return Ok(ModelHandle {
-                path,
-                mmap: entry.mmap.clone(),
-                metrics: entry.metrics,
-            });
+        if let Some(&id) = state.by_path.get(&path) {
+            let inner = state.resident.get(&id).expect("by_path/resident desync").clone();
+            return Ok(ModelHandle { id, inner });
         }
 
         let rss_before = current_rss_bytes();
@@ -164,42 +188,59 @@ impl SwapRegistry {
             rss_delta_bytes,
             warm,
         };
-        let mmap = Arc::new(mmap);
-        table.insert(
-            path.clone(),
-            Resident {
-                mmap: mmap.clone(),
-                metrics,
-            },
-        );
 
-        Ok(ModelHandle { path, mmap, metrics })
+        let id = ModelId(state.next_id);
+        state.next_id += 1;
+        let inner = Arc::new(Resident { path: path.clone(), mmap, metrics });
+        state.resident.insert(id, inner.clone());
+        state.by_path.insert(path, id);
+
+        Ok(ModelHandle { id, inner })
     }
 
-    /// Evicts `path`, freeing its mapping — but only if no `ModelHandle` for
-    /// it is still alive. This is the invariant that protects an in-flight
-    /// generation from having its weights unmapped out from under it.
-    pub fn evict(&self, path: impl AsRef<Path>) -> Result<(), EvictError> {
-        let path = path.as_ref();
-        let mut table = self.resident.lock().expect("rampipe registry lock poisoned");
-        let Some(entry) = table.get(path) else {
-            return Err(EvictError::NotResident);
+    /// Evicts the model identified by `id`, freeing its mapping — but only
+    /// if no `ModelHandle` for it is still alive. This is the invariant
+    /// that protects an in-flight generation from having its weights
+    /// unmapped out from under it.
+    pub fn evict(&self, id: ModelId) -> Result<(), EvictError> {
+        let mut state = self.state.lock().expect("rampipe registry lock poisoned");
+        let Some(inner) = state.resident.get(&id) else {
+            return Err(EvictError::UnknownId(id));
         };
-        // The registry's own `Resident` entry holds one strong reference;
-        // anything beyond that is an outstanding `ModelHandle`.
-        let outstanding = Arc::strong_count(&entry.mmap) - 1;
+        // The registry's own table holds one strong reference; anything
+        // beyond that is an outstanding `ModelHandle`.
+        let outstanding = Arc::strong_count(inner) - 1;
         if outstanding > 0 {
             return Err(EvictError::HandleOutstanding { outstanding });
         }
-        table.remove(path);
+        let path = inner.path.clone();
+        state.resident.remove(&id);
+        state.by_path.remove(&path);
         Ok(())
     }
 
-    pub fn is_resident(&self, path: impl AsRef<Path>) -> bool {
-        self.resident
+    pub fn is_resident(&self, id: ModelId) -> bool {
+        self.state
             .lock()
             .expect("rampipe registry lock poisoned")
-            .contains_key(path.as_ref())
+            .resident
+            .contains_key(&id)
+    }
+
+    pub fn resident_count(&self) -> usize {
+        self.state.lock().expect("rampipe registry lock poisoned").resident.len()
+    }
+
+    /// Total mapped bytes across resident models. Not RSS — this is the
+    /// ceiling, not the current cost.
+    pub fn mapped_bytes(&self) -> usize {
+        self.state
+            .lock()
+            .expect("rampipe registry lock poisoned")
+            .resident
+            .values()
+            .map(|r| r.mmap.len())
+            .sum()
     }
 }
 

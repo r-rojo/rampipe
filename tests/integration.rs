@@ -43,7 +43,7 @@ fn loads_a_valid_gguf_file() {
 
     assert_eq!(&handle.as_bytes()[..4], b"GGUF");
     assert_eq!(handle.metrics().mapped_bytes, 4 + 4096);
-    assert!(registry.is_resident(f.path()));
+    assert!(registry.is_resident(handle.id()));
 }
 
 #[test]
@@ -84,7 +84,10 @@ fn repeated_load_of_same_path_dedups_to_one_mapping() {
     let first = registry.load(f.path(), Residency::Lazy).expect("first load");
     let second = registry.load(f.path(), Residency::Lazy).expect("second load");
 
+    assert_eq!(first.id(), second.id());
     assert_eq!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());
+    assert_eq!(registry.resident_count(), 1);
+    assert_eq!(registry.mapped_bytes(), 4 + 4096);
 }
 
 #[test]
@@ -93,22 +96,30 @@ fn eviction_fails_while_a_handle_is_outstanding_then_succeeds_after_drop() {
     let registry = SwapRegistry::new();
 
     let handle = registry.load(f.path(), Residency::Lazy).expect("load");
+    let id = handle.id();
 
-    let err = registry.evict(f.path()).expect_err("evict should refuse while handle is live");
+    let err = registry.evict(id).expect_err("evict should refuse while handle is live");
     assert!(matches!(err, EvictError::HandleOutstanding { outstanding: 1 }));
-    assert!(registry.is_resident(f.path()), "must still be resident after a refused evict");
+    assert!(registry.is_resident(id), "must still be resident after a refused evict");
 
     drop(handle);
 
-    registry.evict(f.path()).expect("evict should succeed once the handle is dropped");
-    assert!(!registry.is_resident(f.path()));
+    registry.evict(id).expect("evict should succeed once the handle is dropped");
+    assert!(!registry.is_resident(id));
 }
 
 #[test]
-fn evicting_a_path_that_was_never_loaded_is_an_error() {
+fn evicting_an_unknown_id_is_an_error() {
+    let f = gguf_fixture(4096);
     let registry = SwapRegistry::new();
-    let err = registry.evict("/nonexistent/path.gguf").expect_err("should fail");
-    assert!(matches!(err, EvictError::NotResident));
+
+    let handle = registry.load(f.path(), Residency::Lazy).expect("load");
+    let id = handle.id();
+    drop(handle);
+    registry.evict(id).expect("first evict should succeed");
+
+    let err = registry.evict(id).expect_err("id is no longer resident");
+    assert!(matches!(err, EvictError::UnknownId(unknown) if unknown == id));
 }
 
 #[test]
