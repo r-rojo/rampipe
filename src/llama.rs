@@ -107,17 +107,33 @@ impl LlamaSession {
             return Err(LlamaSessionError::PromptTooLong { requested, n_ctx });
         }
 
+        // Prompt decode in chunks of at most the batch's token capacity
+        // (512): `LlamaBatch::add` only has room for 512 tokens per
+        // `decode` call regardless of `n_ctx`, so a prompt longer than
+        // that (already allowed by the `n_ctx`-only check above) needs
+        // multiple decode calls. Only the very last token of the whole
+        // prompt requests logits — that's the one sampling starts from.
         let mut batch = LlamaBatch::new(512, 1);
         let last_index = (tokens_list.len() - 1) as i32;
-        for (i, token) in (0_i32..).zip(tokens_list.iter().copied()) {
-            batch.add(token, i, &[0], i == last_index)?;
+        for chunk_start in (0..tokens_list.len()).step_by(512) {
+            let chunk_end = (chunk_start + 512).min(tokens_list.len());
+            batch.clear();
+            for (offset, &token) in tokens_list[chunk_start..chunk_end].iter().enumerate() {
+                let i = (chunk_start + offset) as i32;
+                batch.add(token, i, &[0], i == last_index)?;
+            }
+            ctx.decode(&mut batch)?;
         }
-        ctx.decode(&mut batch)?;
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut sampler = LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
 
-        let mut n_cur = batch.n_tokens();
+        // Not `batch.n_tokens()`: the batch was cleared and refilled per
+        // chunk above, so it only reflects the size of the *last* chunk,
+        // not the full prompt — using it here would make the generation
+        // loop's positions diverge from the KV cache's actual last
+        // position by the size of every chunk before the final one.
+        let mut n_cur = tokens_list.len() as i32;
         let end = tokens_list.len() as i32 + max_new_tokens;
         let mut text = String::new();
         let mut tokens_generated = 0usize;
