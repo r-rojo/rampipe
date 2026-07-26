@@ -111,6 +111,29 @@ coupling."
 cargo run --release --features llama --example residency_vs_ttft
 ```
 
+### 7B-scale smoke test — `Prefault` costs seconds, not milliseconds, on a cold file
+
+Every measurement above was on Qwen2.5-0.5B, and every run of it this session reused the same
+small, already-OS-cached file. `examples/smoke_7b.rs` loads a real Qwen2.5-7B-Instruct Q4_K_M
+GGUF (4.68GB) the same way — no code changes needed, `SwapRegistry` + `LlamaSession` scale
+cleanly, Metal offload confirmed, no crashes, no memory pressure (25.5GB free reported by
+llama.cpp). Steady-state numbers are solid: TTFT ~270ms, ~22 tok/s, coherent output, and a
+second `generate()` call on the same session works cleanly — confirms the "load once, serve many
+requests" shape a real backend needs.
+
+But `map_latency` staying near-instant (97µs) hid something: `Residency::Prefault`'s synchronous
+touch-loop took **8.05 seconds** on this file's first-ever touch — not proportional to the
+~9.5x size jump from 491MB to 4.68GB, because every prior `Prefault` measurement in this
+project was implicitly warm-cache. At this scale, on a genuinely cold file, `Prefault` blocks
+for multiple real seconds pulling the model off disk. Don't default to `Prefault` for a 7B-class
+model without deciding that startup stall is acceptable — `Lazy` (defer the cost to first
+inference) or `Advise` (non-blocking kernel hint) are real alternatives now that this cost is
+visible instead of hidden by warm-cache testing.
+
+```sh
+cargo run --release --features llama --example smoke_7b
+```
+
 ## Known-crude, called out on purpose
 
 - `resident_fraction`/`warm` are backed by `mincore(2)` now, not a timing
