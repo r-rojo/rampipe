@@ -8,6 +8,7 @@ llama-cpp-2 = { version = "0.1.152", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 memmap2 = "0.9.11"
 thiserror = "2.0.19"
+libc = "0.2.189"
 
 [dev-dependencies]
 tempfile = "3.27.0"

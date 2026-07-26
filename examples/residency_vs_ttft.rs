@@ -1,17 +1,25 @@
-//! Loads the same GGUF model twice — once with `Residency::Lazy`, once
-//! with `Residency::Prefault` — through two independent `SwapRegistry`s
-//! (independent so neither load can dedup-hit the other), then runs a real
-//! generation against each and reports time-to-first-token alongside the
-//! residency metrics. The point: page-in cost should show up as slower
-//! TTFT for the `Lazy` load relative to `Prefault`, since prefaulting
-//! warms the same OS page cache llama.cpp's own (separate) mmap reads
-//! from.
+//! Loads the same GGUF model three times — `Residency::Lazy`, `Prefault`,
+//! and `Advise` — through independent `SwapRegistry`s (independent so no
+//! load can dedup-hit another), then runs a real generation against each
+//! and reports time-to-first-token alongside the residency metrics. The
+//! point: page-in cost should show up as slower TTFT for `Lazy` relative
+//! to the two eager modes, since both warm the same OS page cache
+//! llama.cpp's own (separate) mmap reads from.
+//!
+//! `resident_fraction`/`warm` are printed but — see `SwapMetrics::
+//! resident_fraction`'s doc comment — not trustworthy for file-backed
+//! mappings on Darwin as of this writing; `mincore(2)` was empirically
+//! found to report a fixed ~25% resident regardless of actual state,
+//! even after `mlock(2)`. Printed anyway so the (also real, also
+//! interesting) contrast between `Prefault`'s blocking guarantee and
+//! `Advise`'s non-blocking hint is visible in `prefault_latency`, which
+//! isn't affected by that caveat.
 //!
 //! Caveat, stated plainly: this doesn't control for OS filesystem cache
 //! state going into the run (dropping the page cache needs root on
 //! macOS), so on a machine where the file is already cached from a
-//! previous run, the Lazy/Prefault gap will be smaller than a genuine
-//! cold start. Treat this as illustrative, not a rigorous cold-start
+//! previous run, the Lazy/eager gap will be smaller than a genuine cold
+//! start. Treat this as illustrative, not a rigorous cold-start
 //! benchmark — that's still open work.
 //!
 //!     cargo run --release --features llama --example residency_vs_ttft
@@ -52,7 +60,8 @@ fn run(label: &str, model_path: &PathBuf, backend: &llama_cpp_2::llama_backend::
     println!("  prefault_latency:  {:?}", metrics.prefault_latency);
     println!("  mapped_bytes:      {}", metrics.mapped_bytes);
     println!("  rss_delta_bytes:   {:?}", metrics.rss_delta_bytes);
-    println!("  warm:              {}", metrics.warm);
+    println!("  resident_fraction: {:?} (see caveat in module docs)", metrics.resident_fraction);
+    println!("  warm:              {} (same caveat)", metrics.warm);
     println!("  time_to_first_token: {:?}", result.time_to_first_token);
     println!("  tokens_generated:  {}", result.tokens_generated);
     println!("  text: {}{}", PROMPT, result.text);
@@ -69,6 +78,7 @@ fn main() -> Result<()> {
 
     run("Lazy", &model_path, &backend, Residency::Lazy)?;
     run("Prefault", &model_path, &backend, Residency::Prefault)?;
+    run("Advise", &model_path, &backend, Residency::Advise)?;
 
     Ok(())
 }

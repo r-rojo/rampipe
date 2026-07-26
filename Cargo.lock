@@ -1657,6 +1657,7 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "hf-hub",
+ "libc",
  "llama-cpp-2",
  "mach2",
  "memmap2",

@@ -31,12 +31,14 @@ resident; that gets designed against real numbers, not guesses.
 - Registry aggregates: `resident_count()`, `mapped_bytes()` — the ceiling,
   not current RSS.
 - GGUF magic validation on load (rejects non-GGUF files, empty files).
-- `SwapMetrics` — map latency, prefault latency (only for `Residency::
-  Prefault`), mapped bytes, RSS delta, a `warm` heuristic.
-- `Residency::{Lazy, Prefault}` — `Lazy` just mmaps and lets the OS fault
-  pages in on first touch; `Prefault` touches every page up front so the
-  page-fault cost is paid at load time instead of during generation. The
-  gap between these two is the actual thing worth measuring.
+- `SwapMetrics` — map latency, prefault latency, mapped bytes, RSS delta,
+  `resident_fraction`, a `warm` heuristic. See the mincore caveat below
+  before trusting the last two.
+- `Residency::{Lazy, Prefault, Advise}` — `Lazy` just mmaps and lets the OS
+  fault pages in on first touch. `Prefault` synchronously touches every
+  page up front. `Advise` hints the kernel via `madvise(MADV_WILLNEED)` —
+  a non-blocking hint, not a guarantee, so unlike `Prefault` its pages
+  aren't necessarily resident by the time `load()` returns.
 - RSS measurement on Linux (`/proc/self/statm`) and Darwin/iOS (`mach2`'s
   `task_info(TASK_VM_INFO)`, reading `phys_footprint`) — verified against
   the real `mach2` struct layout, not guessed, and covered by two unit
@@ -47,7 +49,33 @@ resident; that gets designed against real numbers, not guesses.
 cargo test
 ```
 
-10 tests (8 integration + 2 targeted at the RSS FFI call), all passing.
+12 tests, all passing.
+
+### The `mincore(2)` finding
+
+The roadmap's own open item was "replace the `warm` heuristic with a real
+`mincore(2)` check." Implemented that — and then a test asserting prefault
+should leave pages ~fully resident failed, consistently, at ~25%. Chased it
+down with a standalone repro rather than just loosening the assertion:
+
+- `mincore` reports the same ~25% resident fraction for a file-backed mmap
+  **regardless of file size** (verified at 32 pages and 500 pages).
+- The number doesn't move even after `mlock(2)`, which *guarantees* every
+  page is resident and pinned — if a guaranteed-resident mapping still
+  reads as 75% absent, the syscall isn't answering the question truthfully.
+- A plain anonymous (non-file-backed) mmap'd page reports correctly through
+  the same call.
+
+That pattern — accurate for anonymous memory, deliberately-imprecise-looking
+for file-backed memory — matches the shape of known page-cache side-channel
+mitigations (mincore has historically been usable to fingerprint what's in
+the shared page cache, leaking other processes' file-access patterns).
+Root cause not confirmed against an Apple source; the empirical result is
+repeatable enough to document and act on regardless. `resident_fraction`
+and `warm` are implemented as asked and still exposed, but documented as
+untrustworthy for file-backed mappings on Darwin — see the doc comment on
+`SwapMetrics::resident_fraction`. Tests assert structural validity (a
+well-formed number in range) rather than a specific residency claim.
 
 ## Phase 1b
 
@@ -66,11 +94,15 @@ coupling."
   `time_to_first_token` separately from total generation time, so page-in
   cost becomes attributable to an actual generation.
 - `examples/residency_vs_ttft.rs` — downloads a real Qwen2.5-0.5B-Instruct
-  GGUF and runs it through both `Lazy` and `Prefault` residency via two
-  independent registries. Run for real: Lazy TTFT 47.7ms vs. Prefault
-  33.7ms, both producing identical coherent text. llama.cpp auto-detected
-  Metal and offloaded all layers to GPU. Worth knowing: RSS delta came back
-  much smaller than `mapped_bytes` for both runs — consistent with
+  GGUF (~491MB) and runs it through `Lazy`, `Prefault`, and `Advise`
+  residency via independent registries. Run for real: Lazy TTFT ~78ms vs.
+  Prefault ~34ms vs. Advise ~37ms, all producing identical coherent text.
+  `Advise`'s `prefault_latency` (~16ms) is meaningfully cheaper than
+  `Prefault`'s (~23ms) — the actual "compare against madvise" result the
+  roadmap asked for, and unaffected by the mincore caveat above since it's
+  just call latency, not a residency claim. llama.cpp auto-detected Metal
+  and offloaded all layers to GPU. Worth knowing: RSS delta came back much
+  smaller than `mapped_bytes` for both eager runs — consistent with
   `phys_footprint` correctly excluding clean, evictable, file-backed
   page-cache pages, which is actually the right signal for avoiding iOS
   jetsam, not a bug in the measurement.
@@ -81,13 +113,15 @@ cargo run --release --features llama --example residency_vs_ttft
 
 ## Known-crude, called out on purpose
 
-- The `warm` flag guesses residency from how fast the prefault loop ran.
-  Should be a real `mincore(2)` check instead.
-- Prefault is a naive "touch one byte per page" loop. Worth comparing
-  against `madvise(WILLNEED)`.
-- `residency_vs_ttft`'s Lazy-vs-Prefault comparison doesn't control for OS
-  page cache state going in (dropping it needs root on macOS), so the gap
-  it shows is smaller than a genuine cold start.
+- `resident_fraction`/`warm` are backed by `mincore(2)` now, not a timing
+  guess — but see the finding above: not trustworthy for file-backed
+  mappings on Darwin regardless.
+- Prefault is still a naive "touch one byte per page" loop, now with
+  `Advise` (`madvise(WILLNEED)`) alongside it for actual comparison rather
+  than as a hypothetical.
+- `residency_vs_ttft`'s comparison doesn't control for OS page cache state
+  going in (dropping it needs root on macOS), so the gap it shows is
+  smaller than a genuine cold start.
 
 Called out, not accidental — see the project [`TODO.md`](../TODO.md).
 

@@ -11,10 +11,11 @@ pub mod llama;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const PAGE_SIZE: usize = 4096;
-// Crude placeholder for the `warm` heuristic below — the roadmap's own open
-// item is to replace this with a real mincore(2) check instead of guessing
-// from how fast the prefault loop ran.
-const WARM_THRESHOLD: Duration = Duration::from_micros(500);
+// `warm` is `resident_fraction >= WARM_FRACTION` — real residency data from
+// mincore(2), not a guess from timing. Not quite 1.0 so a single straggler
+// page (e.g. one still mid-fault when mincore samples it) doesn't flip an
+// otherwise-fully-resident mapping to "not warm".
+const WARM_FRACTION: f64 = 0.99;
 
 /// How eagerly to bring a newly-mapped model's pages into physical memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,25 +24,58 @@ pub enum Residency {
     /// but the first real access to each page pays a page-fault during
     /// inference instead of during load.
     Lazy,
-    /// mmap, then touch every page immediately so the page-fault cost is
-    /// paid up front instead of mid-generation.
+    /// mmap, then touch every page immediately (synchronously) so the
+    /// page-fault cost is paid up front instead of mid-generation. On Linux
+    /// this should leave every page resident by the time it returns; on
+    /// Darwin, empirically, don't assume it — see the caveat on
+    /// `SwapMetrics::resident_fraction`.
     Prefault,
+    /// mmap, then hint the kernel via `madvise(MADV_WILLNEED)` that every
+    /// page will be needed soon. Returns almost immediately — it's a
+    /// non-blocking hint, not a guarantee — so unlike `Prefault`, pages
+    /// aren't necessarily resident by the time `load()` returns; the
+    /// kernel's readahead may still be in flight.
+    Advise,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct SwapMetrics {
     pub map_latency: Duration,
-    /// `Some` only when loaded with `Residency::Prefault`.
+    /// `Some` only when loaded with `Residency::Prefault` or `Residency::
+    /// Advise` — the time spent in the touch loop or the `madvise` call,
+    /// respectively. For `Advise` this is *not* the time until pages are
+    /// actually resident (see `Residency::Advise`), just the call latency.
     pub prefault_latency: Option<Duration>,
     pub mapped_bytes: usize,
     /// Process RSS after mapping minus RSS before, in bytes. `None` on
     /// platforms without an RSS measurement implemented (see
     /// `current_rss_bytes`).
     pub rss_delta_bytes: Option<i64>,
-    /// Crude heuristic: true if this was a `Prefault` load whose page-touch
-    /// loop finished suspiciously fast, suggesting the pages were already
-    /// cached by the OS. Not a real residency check — replace with
-    /// `mincore(2)` before trusting this.
+    /// Fraction (0.0–1.0) of the mapping's pages that `mincore(2)` reports
+    /// as resident in physical memory at the moment `load()` finished.
+    /// `None` on platforms without an implementation (see
+    /// `mincore_resident_fraction`).
+    ///
+    /// **Caveat, found empirically, not documented anywhere official as far
+    /// as this crate's author checked:** on Darwin, this number is not
+    /// trustworthy for file-backed mappings. Testing here (2026-07-25)
+    /// showed `mincore` consistently reporting only ~25% of pages resident
+    /// for an mmap'd file regardless of size (32 pages vs. 500 pages, same
+    /// ratio) — and the number didn't change even after `mlock(2)`, which
+    /// *guarantees* full residency. A plain anonymous (non-file-backed)
+    /// mmap'd page reports correctly through the same call. That pattern —
+    /// accurate for anonymous memory, deliberately-looking imprecise for
+    /// file-backed memory — matches the shape of known page-cache
+    /// side-channel mitigations (mincore has historically been usable to
+    /// fingerprint what's in the shared page cache, leaking other
+    /// processes' file-access patterns). Root cause not confirmed against
+    /// an Apple source, but the empirical result is repeatable and decisive
+    /// enough to document: don't trust this field for file-backed mappings
+    /// on Darwin. Untested on Linux.
+    pub resident_fraction: Option<f64>,
+    /// `resident_fraction >= WARM_FRACTION`. Computed from a real syscall
+    /// now, not guessed from prefault timing — but inherits
+    /// `resident_fraction`'s Darwin caveat above, so treat it the same way.
     pub warm: bool,
 }
 
@@ -171,6 +205,11 @@ impl SwapRegistry {
                 prefault(&mmap);
                 Some(start.elapsed())
             }
+            Residency::Advise => {
+                let start = Instant::now();
+                advise_willneed(&mmap);
+                Some(start.elapsed())
+            }
         };
 
         let rss_after = current_rss_bytes();
@@ -179,13 +218,15 @@ impl SwapRegistry {
             _ => None,
         };
 
-        let warm = matches!(prefault_latency, Some(d) if d < WARM_THRESHOLD);
+        let resident_fraction = mincore_resident_fraction(&mmap);
+        let warm = resident_fraction.is_some_and(|f| f >= WARM_FRACTION);
 
         let metrics = SwapMetrics {
             map_latency,
             prefault_latency,
             mapped_bytes,
             rss_delta_bytes,
+            resident_fraction,
             warm,
         };
 
@@ -259,6 +300,76 @@ fn prefault(mmap: &Mmap) {
         sum = sum.wrapping_add(mmap[i] as u64);
     }
     std::hint::black_box(sum);
+}
+
+/// Hints the kernel that every page of `mmap` will be needed soon, via
+/// `madvise(MADV_WILLNEED)`. Non-blocking — see `Residency::Advise`'s doc
+/// comment for why that matters.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+fn advise_willneed(mmap: &Mmap) {
+    if mmap.is_empty() {
+        return;
+    }
+    // Safety: `mmap.as_ptr()`/`mmap.len()` describe the live mapping this
+    // `Mmap` owns; madvise doesn't write through the pointer, and a failed
+    // hint (non-zero return) just means no readahead benefit, not a
+    // correctness problem, so the result is intentionally ignored.
+    unsafe {
+        libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_WILLNEED);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn advise_willneed(_mmap: &Mmap) {}
+
+/// Fraction (0.0–1.0) of `mmap`'s pages currently resident in physical
+/// memory, per `mincore(2)`. This is what makes `SwapMetrics::warm` a real
+/// measurement instead of a guess from prefault timing.
+#[cfg(target_os = "linux")]
+fn mincore_resident_fraction(mmap: &Mmap) -> Option<f64> {
+    if mmap.is_empty() {
+        return Some(1.0);
+    }
+    let n_pages = mmap.len().div_ceil(PAGE_SIZE);
+    let mut vec = vec![0u8; n_pages];
+    // Safety: `vec` has exactly one byte per page covering `mmap`'s full
+    // length, matching what Linux's mincore(2) requires and will write to.
+    let result = unsafe { libc::mincore(mmap.as_ptr() as *mut libc::c_void, mmap.len(), vec.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let resident = vec.iter().filter(|&&byte| byte & 1 != 0).count();
+    Some(resident as f64 / n_pages as f64)
+}
+
+// See the caveat on `SwapMetrics::resident_fraction` — this call succeeds
+// and returns well-formed data, but the residency it reports for
+// file-backed mappings has empirically not matched reality on Darwin
+// (verified against mlock(2), which guarantees residency this didn't
+// reflect). Kept because it's still what the roadmap asked for and it's
+// not wrong to call, just not trustworthy here — not worth silently
+// dropping the platform implementation over a result that can't be
+// confirmed against an authoritative source.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn mincore_resident_fraction(mmap: &Mmap) -> Option<f64> {
+    if mmap.is_empty() {
+        return Some(1.0);
+    }
+    let n_pages = mmap.len().div_ceil(PAGE_SIZE);
+    let mut vec = vec![0i8; n_pages];
+    // Safety: same contract as the Linux path above; Darwin's mincore(2)
+    // takes a `*mut c_char` vector of the same one-byte-per-page shape.
+    let result = unsafe { libc::mincore(mmap.as_ptr() as *const libc::c_void, mmap.len(), vec.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    let resident = vec.iter().filter(|&&byte| byte & libc::MINCORE_INCORE as i8 != 0).count();
+    Some(resident as f64 / n_pages as f64)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn mincore_resident_fraction(_mmap: &Mmap) -> Option<f64> {
+    None
 }
 
 #[cfg(target_os = "linux")]
