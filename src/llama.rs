@@ -49,6 +49,23 @@ pub struct LlamaSession {
     model: LlamaModel,
 }
 
+/// How `generate()` picks the next token. `Greedy` is pure argmax — fully
+/// deterministic given a prompt, which is what a first attempt at a task
+/// wants (reproducible, and the model's single best guess). `Temperature`
+/// exists for retries: after a first attempt already failed, re-sampling
+/// the exact same distribution greedily just reproduces the same output
+/// (verified empirically — a real caller-observed case is a small model
+/// converging back to the same wrong `ropey` API guess across retries),
+/// so a retry needs the chain to actually explore other high-probability
+/// candidates instead of only ever taking the single most likely one.
+/// `seed` should vary per retry attempt — reusing it would make
+/// `Temperature` just as deterministic (and just as stuck) as `Greedy`.
+#[derive(Debug, Clone, Copy)]
+pub enum Sampling {
+    Greedy,
+    Temperature { temperature: f32, top_k: i32, seed: u32 },
+}
+
 pub struct GenerationResult {
     pub text: String,
     /// Wall-clock from the start of `generate()` to the first sampled
@@ -94,6 +111,7 @@ impl LlamaSession {
         backend: &LlamaBackend,
         prompt: &str,
         max_new_tokens: i32,
+        sampling: Sampling,
     ) -> Result<GenerationResult, LlamaSessionError> {
         let start = Instant::now();
 
@@ -134,7 +152,21 @@ impl LlamaSession {
         }
 
         let mut decoder = encoding_rs::UTF_8.new_decoder();
-        let mut sampler = LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
+        // `Greedy` chains straight to `greedy()` — no `dist()` in front of
+        // it, since a sampler chain's *last* stage picks the token, and
+        // `greedy()` always overwrites whatever came before with pure
+        // argmax (confirmed by source-tracing `llama_cpp_2`'s
+        // `dist_apply`/`greedy_apply`). `Temperature` filters to the
+        // `top_k` highest-probability candidates, reshapes the
+        // distribution by `temperature`, then samples from it via
+        // `dist(seed)` as the actual final stage — no `greedy()` after it,
+        // so the sampled draw is what's actually used.
+        let mut sampler = match sampling {
+            Sampling::Greedy => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+            Sampling::Temperature { temperature, top_k, seed } => {
+                LlamaSampler::chain_simple([LlamaSampler::top_k(top_k), LlamaSampler::temp(temperature), LlamaSampler::dist(seed)])
+            }
+        };
 
         // Not `batch.n_tokens()`: the batch was cleared and refilled per
         // chunk above, so it only reflects the size of the *last* chunk,

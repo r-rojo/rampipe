@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         println!("\n=== {label} ===");
         let gen_start = Instant::now();
         let result = session
-            .generate(&backend, prompt, MAX_NEW_TOKENS)
+            .generate(&backend, prompt, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy)
             .with_context(|| format!("generating for {label}"))?;
         let total_wall_time = gen_start.elapsed();
         let tok_per_sec = result.tokens_generated as f64 / total_wall_time.as_secs_f64().max(f64::EPSILON);
