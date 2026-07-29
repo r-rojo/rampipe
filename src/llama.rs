@@ -115,15 +115,19 @@ impl LlamaSession {
     ) -> Result<GenerationResult, LlamaSessionError> {
         let start = Instant::now();
 
-        // Raised from 2048: a real taskpipe PlanThenLocal prompt (task body
-        // + a detailed Claude-generated implementation plan) measured at
-        // ~2389 tokens, already over 2048 before any generation headroom.
-        // Qwen2.5-7B-Instruct's native trained context is 32K, so 4096
-        // isn't a context-extension trick, just using more of what the
-        // model already supports — costs roughly double the KV cache
-        // (~112MiB -> ~224MiB at this model size), negligible next to the
-        // ~4.4GiB model weights.
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));
+        // Raised 2048 -> 4096 -> 8192, twice now for the same underlying
+        // reason: `describe_dependency`'s API-summary budget
+        // (`MAX_SUMMARY_CHARS`) is tuned to fit a annotated method list,
+        // not any specific crate's real size — a verbose crate's summary
+        // (real case: `ratatui`, a real taskpipe run against piper task 3)
+        // measured the full prompt at 5060 tokens, already over 4096
+        // before any generation headroom, where `ropey`'s summary fit
+        // comfortably. Qwen2.5-7B-Instruct's native trained context is
+        // 32K, so 8192 still isn't a context-extension trick, just using
+        // more of what the model already supports — costs roughly double
+        // the KV cache again (~224MiB -> ~448MiB at this model size),
+        // still negligible next to the ~4.4GiB model weights.
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(8192));
         let mut ctx = self.model.new_context(backend, ctx_params)?;
 
         let tokens_list = self.model.str_to_token(prompt, AddBos::Always)?;
