@@ -38,8 +38,8 @@ pub enum LlamaSessionError {
     Detokenize(#[from] llama_cpp_2::TokenToStringError),
     #[error("batch error: {0}")]
     Batch(#[from] llama_cpp_2::llama_batch::BatchAddError),
-    #[error("prompt plus max_new_tokens ({requested}) exceeds context size ({n_ctx})")]
-    PromptTooLong { requested: i32, n_ctx: i32 },
+    #[error("prompt ({prompt_tokens} tokens) leaves no room in context size ({n_ctx})")]
+    PromptTooLong { prompt_tokens: i32, n_ctx: i32 },
     #[error("chat template error: {0}")]
     ChatTemplate(#[from] llama_cpp_2::ChatTemplateError),
     #[error("chat message construction error: {0}")]
@@ -139,9 +139,16 @@ impl LlamaSession {
         let formatted_prompt = self.formatted_prompt(prompt)?;
         let tokens_list = self.model.str_to_token(&formatted_prompt, AddBos::Always)?;
         let n_ctx = ctx.n_ctx() as i32;
-        let requested = tokens_list.len() as i32 + max_new_tokens;
-        if requested > n_ctx {
-            return Err(LlamaSessionError::PromptTooLong { requested, n_ctx });
+        // Not `+ max_new_tokens` any more: `max_new_tokens` no longer
+        // bounds the whole generation, only the metered (non-thinking)
+        // portion of it — see the loop below. The only thing that has to
+        // fit up front is the prompt itself; there being at least one
+        // token of room left is checked implicitly by the loop condition
+        // (`n_cur < n_ctx`), so an oversized prompt just generates zero
+        // tokens rather than erroring here. A prompt that's already at or
+        // past `n_ctx` is the one real failure worth surfacing early.
+        if tokens_list.len() as i32 >= n_ctx {
+            return Err(LlamaSessionError::PromptTooLong { prompt_tokens: tokens_list.len() as i32, n_ctx });
         }
 
         // Prompt decode in chunks of at most the batch's token capacity
@@ -185,32 +192,36 @@ impl LlamaSession {
         // loop's positions diverge from the KV cache's actual last
         // position by the size of every chunk before the final one.
         let mut n_cur = tokens_list.len() as i32;
-        let mut end = tokens_list.len() as i32 + max_new_tokens;
         let mut text = String::new();
         let mut tokens_generated = 0usize;
         let mut time_to_first_token = None;
         // Thinking-mode models (Qwen3.6, DeepSeek-R1-style) spend an
-        // unpredictable, sometimes large chunk of `max_new_tokens` on
+        // unpredictable, sometimes large chunk of generation on
         // `<think>...</think>` deliberation before the real answer even
-        // starts — a fixed shared budget can run out mid-thought, before
+        // starts. A fixed shared budget can run out mid-thought, before
         // any answer exists at all (real case: Qwen3.6-35B-A3B, piper
         // task 1 attempt 1 — an 8,879-char response entirely inside an
         // unclosed `<think>`, cut off with no answer to extract; see
         // `taskpipe::backend::strip_thinking_block`, which is what turns
         // that case into a clean retry instead of a silent bad extract).
-        // The moment `</think>` closes, this grants one fresh
-        // `max_new_tokens`-sized budget for the answer specifically —
-        // capped at `n_ctx`, the hard ceiling this context was actually
-        // sized for — rather than making the answer live off whatever
-        // was left over from an unpredictable thinking phase. Only ever
-        // fires once (`answer_budget_granted`): a model that reopens
-        // `<think>` later in its own output doesn't get repeated
-        // extensions. A no-think response never contains `</think>`, so
-        // `end` is simply never touched — this is a no-op for every
-        // model that doesn't use this convention.
-        let mut answer_budget_granted = false;
+        //
+        // `budget_used` only increments for tokens generated *outside* an
+        // open, unclosed `<think>` block — so deliberation is metered
+        // against `n_ctx` alone (the hard physical ceiling — the KV cache
+        // literally cannot hold more), not against `max_new_tokens`, and
+        // `max_new_tokens` ends up meaning exactly what it says: a budget
+        // for the answer, not for the answer *and* however much thinking
+        // happened to come first. A response with no `<think>` at all
+        // (most models, including the current default) never has an open
+        // block, so `budget_used` increments every token from the very
+        // first one — behavior is unchanged for those.
+        let mut budget_used: i32 = 0;
 
-        while n_cur <= end {
+        loop {
+            if n_cur >= n_ctx || budget_used >= max_new_tokens {
+                break;
+            }
+
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
             sampler.accept(token);
 
@@ -218,16 +229,38 @@ impl LlamaSession {
                 time_to_first_token = Some(start.elapsed());
             }
 
+            let inside_open_think = text.contains("<think>") && !text.contains("</think>");
+
             if self.model.is_eog_token(token) {
-                break;
+                if !inside_open_think {
+                    break;
+                }
+                // The model tried to end its turn while still "supposed
+                // to be" thinking — honoring that would leave a response
+                // with deliberation but no answer at all, exactly the
+                // failure this whole mechanism exists to avoid. Not
+                // fabricating a substitute token and not just `continue`ing
+                // either — `llama-cpp-2` has no clean way to ban a token
+                // mid-chain, and resampling from unchanged logits would
+                // deterministically reselect the same EOG token forever
+                // under greedy sampling. Feeding it back like an ordinary
+                // token instead genuinely advances the KV cache, so the
+                // *next* sample is conditioned on the model having "seen"
+                // its own attempted stop — out-of-distribution for what it
+                // was trained on, but self-limiting (still bounded by
+                // `n_cur < n_ctx` above) and never an infinite loop.
+                batch.clear();
+                batch.add(token, n_cur, &[0], true)?;
+                n_cur += 1;
+                ctx.decode(&mut batch)?;
+                continue;
             }
 
             text.push_str(&self.model.token_to_piece(token, &mut decoder, true, None)?);
             tokens_generated += 1;
 
-            if !answer_budget_granted && text.contains("</think>") {
-                answer_budget_granted = true;
-                end = (n_cur + max_new_tokens).min(n_ctx);
+            if !inside_open_think {
+                budget_used += 1;
             }
 
             batch.clear();
