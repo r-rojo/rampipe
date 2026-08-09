@@ -185,10 +185,30 @@ impl LlamaSession {
         // loop's positions diverge from the KV cache's actual last
         // position by the size of every chunk before the final one.
         let mut n_cur = tokens_list.len() as i32;
-        let end = tokens_list.len() as i32 + max_new_tokens;
+        let mut end = tokens_list.len() as i32 + max_new_tokens;
         let mut text = String::new();
         let mut tokens_generated = 0usize;
         let mut time_to_first_token = None;
+        // Thinking-mode models (Qwen3.6, DeepSeek-R1-style) spend an
+        // unpredictable, sometimes large chunk of `max_new_tokens` on
+        // `<think>...</think>` deliberation before the real answer even
+        // starts — a fixed shared budget can run out mid-thought, before
+        // any answer exists at all (real case: Qwen3.6-35B-A3B, piper
+        // task 1 attempt 1 — an 8,879-char response entirely inside an
+        // unclosed `<think>`, cut off with no answer to extract; see
+        // `taskpipe::backend::strip_thinking_block`, which is what turns
+        // that case into a clean retry instead of a silent bad extract).
+        // The moment `</think>` closes, this grants one fresh
+        // `max_new_tokens`-sized budget for the answer specifically —
+        // capped at `n_ctx`, the hard ceiling this context was actually
+        // sized for — rather than making the answer live off whatever
+        // was left over from an unpredictable thinking phase. Only ever
+        // fires once (`answer_budget_granted`): a model that reopens
+        // `<think>` later in its own output doesn't get repeated
+        // extensions. A no-think response never contains `</think>`, so
+        // `end` is simply never touched — this is a no-op for every
+        // model that doesn't use this convention.
+        let mut answer_budget_granted = false;
 
         while n_cur <= end {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
@@ -204,6 +224,11 @@ impl LlamaSession {
 
             text.push_str(&self.model.token_to_piece(token, &mut decoder, true, None)?);
             tokens_generated += 1;
+
+            if !answer_budget_granted && text.contains("</think>") {
+                answer_budget_granted = true;
+                end = (n_cur + max_new_tokens).min(n_ctx);
+            }
 
             batch.clear();
             batch.add(token, n_cur, &[0], true)?;
