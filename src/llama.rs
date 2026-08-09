@@ -16,7 +16,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -40,6 +40,12 @@ pub enum LlamaSessionError {
     Batch(#[from] llama_cpp_2::llama_batch::BatchAddError),
     #[error("prompt plus max_new_tokens ({requested}) exceeds context size ({n_ctx})")]
     PromptTooLong { requested: i32, n_ctx: i32 },
+    #[error("chat template error: {0}")]
+    ChatTemplate(#[from] llama_cpp_2::ChatTemplateError),
+    #[error("chat message construction error: {0}")]
+    ChatMessage(#[from] llama_cpp_2::NewLlamaChatMessageError),
+    #[error("chat template application error: {0}")]
+    ApplyChatTemplate(#[from] llama_cpp_2::ApplyChatTemplateError),
 }
 
 /// A model resident in both `rampipe`'s accounting mmap and llama.cpp's
@@ -130,7 +136,8 @@ impl LlamaSession {
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(8192));
         let mut ctx = self.model.new_context(backend, ctx_params)?;
 
-        let tokens_list = self.model.str_to_token(prompt, AddBos::Always)?;
+        let formatted_prompt = self.formatted_prompt(prompt)?;
+        let tokens_list = self.model.str_to_token(&formatted_prompt, AddBos::Always)?;
         let n_ctx = ctx.n_ctx() as i32;
         let requested = tokens_list.len() as i32 + max_new_tokens;
         if requested > n_ctx {
@@ -209,5 +216,29 @@ impl LlamaSession {
             time_to_first_token: time_to_first_token.unwrap_or_default(),
             tokens_generated,
         })
+    }
+
+    /// Wraps `prompt` in the model's own baked-in chat template as a
+    /// single "user" turn (`add_ass: true`, so the rendered text ends
+    /// with the assistant turn already opened, ready for generation to
+    /// continue into it) before tokenizing. Previously `generate` fed the
+    /// raw instructional text straight to the tokenizer with no role
+    /// structure at all -- `llama_cpp_2`'s own doc comment on
+    /// `apply_chat_template` warns that skipping this "can result in
+    /// really unexpected responses," and a real caller-observed case
+    /// (Qwen3.6-35B-A3B leaving a referenced type undefined, one attempt
+    /// producing no parseable output at all) matched that failure shape.
+    /// Not every GGUF has a template baked in, though -- falls back to
+    /// the untouched raw prompt on `MissingTemplate` rather than hard
+    /// erroring, since that was the only behavior available before this
+    /// existed and is still strictly better than refusing to run.
+    fn formatted_prompt(&self, prompt: &str) -> Result<String, LlamaSessionError> {
+        let template = match self.model.chat_template(None) {
+            Ok(template) => template,
+            Err(llama_cpp_2::ChatTemplateError::MissingTemplate) => return Ok(prompt.to_string()),
+            Err(other) => return Err(other.into()),
+        };
+        let message = LlamaChatMessage::new("user".to_string(), prompt.to_string())?;
+        Ok(self.model.apply_chat_template(&template, &[message], true)?)
     }
 }
