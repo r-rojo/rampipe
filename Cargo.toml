@@ -25,3 +25,11 @@ llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:minijinja"]
 [[example]]
 name = "residency_vs_ttft"
 required-features = ["llama"]
+
+[[example]]
+name = "smoke_7b"
+required-features = ["llama"]
+
+[[example]]
+name = "determinism_probe"
+required-features = ["llama"]

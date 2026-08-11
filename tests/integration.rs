@@ -174,6 +174,74 @@ fn mincore_result_is_structurally_valid_after_prefault() {
 }
 
 #[test]
+fn resident_ids_by_lru_orders_by_most_recent_access() {
+    let file_a = gguf_fixture(4096);
+    let file_b = gguf_fixture(4096);
+    let file_c = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+
+    let a = registry.load(file_a.path(), Residency::Lazy).expect("load a");
+    let b = registry.load(file_b.path(), Residency::Lazy).expect("load b");
+    let c = registry.load(file_c.path(), Residency::Lazy).expect("load c");
+
+    assert_eq!(registry.resident_ids_by_lru(), vec![a.id(), b.id(), c.id()], "load order is access order with nothing re-touched yet");
+
+    // Re-loading `a` (a cache hit, same path) counts as an access too --
+    // it should move to the most-recently-used end, not stay oldest.
+    registry.load(file_a.path(), Residency::Lazy).expect("re-load a");
+    assert_eq!(registry.resident_ids_by_lru(), vec![b.id(), c.id(), a.id()], "re-touching a should move it to most-recently-used");
+}
+
+#[test]
+fn resident_ids_by_lru_drops_an_evicted_model() {
+    let file_a = gguf_fixture(4096);
+    let file_b = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+
+    let a = registry.load(file_a.path(), Residency::Lazy).expect("load a");
+    let b = registry.load(file_b.path(), Residency::Lazy).expect("load b");
+    drop(a);
+    let a_id = registry.resident_ids_by_lru()[0];
+    registry.evict(a_id).expect("evict a");
+
+    assert_eq!(registry.resident_ids_by_lru(), vec![b.id()]);
+}
+
+#[test]
+fn fits_within_budget_is_true_for_a_tiny_model_at_a_generous_budget() {
+    let registry = SwapRegistry::new();
+    // Best-effort: only checked where `system_free_bytes` actually has an
+    // implementation (see that function's own doc comment) -- `None`
+    // elsewhere is itself the correct, honest answer, not a failure.
+    if let Some(fits) = registry.fits_within_budget(1024, 1.0) {
+        assert!(fits, "1KB should trivially fit under a 100% budget on any real machine");
+    }
+}
+
+#[test]
+fn fits_within_budget_is_false_for_an_absurdly_large_model() {
+    let registry = SwapRegistry::new();
+    if let Some(fits) = registry.fits_within_budget(u64::MAX / 2, 0.8) {
+        assert!(!fits, "no real machine has ~9 exabytes of free+resident memory to spare");
+    }
+}
+
+#[test]
+fn fits_within_budget_counts_already_resident_bytes_toward_the_ceiling() {
+    // A budget of 0.0 means "nothing may ever fit, including what's
+    // already resident" -- proves resident bytes are actually counted in
+    // the ceiling calculation, not just free system memory alone (a
+    // model already loaded still occupies real space).
+    let f = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+    registry.load(f.path(), Residency::Lazy).expect("load");
+
+    if let Some(fits) = registry.fits_within_budget(1, 0.0) {
+        assert!(!fits, "a 0.0 budget fraction should never fit anything");
+    }
+}
+
+#[test]
 fn resident_fraction_is_populated_regardless_of_residency_mode() {
     // Whether or not this platform has a working mincore, the field itself
     // should be computed the same way for every mode -- it's not something

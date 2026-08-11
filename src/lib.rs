@@ -152,6 +152,15 @@ struct RegistryState {
     next_id: u64,
     resident: HashMap<ModelId, Arc<Resident>>,
     by_path: HashMap<PathBuf, ModelId>,
+    /// When each resident model was last handed out (a fresh load *or*
+    /// a cache-hit against an already-resident one) — separate from
+    /// `Resident` itself (shared via `Arc` and handed out through
+    /// `ModelHandle`) so updating it on every access never needs
+    /// interior mutability inside something callers hold a live
+    /// reference to; it's purely the registry's own bookkeeping, always
+    /// touched under the same lock as everything else here. What makes
+    /// `resident_ids_by_lru` real LRU, not just insertion order.
+    last_accessed: HashMap<ModelId, Instant>,
 }
 
 pub struct SwapRegistry {
@@ -174,6 +183,7 @@ impl SwapRegistry {
 
         if let Some(&id) = state.by_path.get(&path) {
             let inner = state.resident.get(&id).expect("by_path/resident desync").clone();
+            state.last_accessed.insert(id, Instant::now());
             return Ok(ModelHandle { id, inner });
         }
 
@@ -235,6 +245,7 @@ impl SwapRegistry {
         let inner = Arc::new(Resident { path: path.clone(), mmap, metrics });
         state.resident.insert(id, inner.clone());
         state.by_path.insert(path, id);
+        state.last_accessed.insert(id, Instant::now());
 
         Ok(ModelHandle { id, inner })
     }
@@ -257,6 +268,7 @@ impl SwapRegistry {
         let path = inner.path.clone();
         state.resident.remove(&id);
         state.by_path.remove(&path);
+        state.last_accessed.remove(&id);
         Ok(())
     }
 
@@ -282,6 +294,39 @@ impl SwapRegistry {
             .values()
             .map(|r| r.mmap.len())
             .sum()
+    }
+
+    /// Every resident model's id, oldest-accessed first — the order a
+    /// caller managing several resident models at once (`rampiped`, not
+    /// this crate, which never evicts on its own) should walk when it
+    /// needs to free budget for a new one. "Accessed" means handed out
+    /// by `load()`, whether that was a fresh map or a cache hit against
+    /// an already-resident model — see `RegistryState::last_accessed`'s
+    /// own doc comment.
+    pub fn resident_ids_by_lru(&self) -> Vec<ModelId> {
+        let state = self.state.lock().expect("rampipe registry lock poisoned");
+        let mut ids: Vec<(ModelId, Instant)> =
+            state.last_accessed.iter().map(|(&id, &accessed)| (id, accessed)).collect();
+        ids.sort_by_key(|&(_, accessed)| accessed);
+        ids.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Whether loading a new model of `new_size_bytes` would keep total
+    /// resident bytes within `budget_fraction` of the memory actually
+    /// available for models — system free memory *plus* whatever's
+    /// already resident, since a caller managing eviction (`rampiped`)
+    /// can always reclaim already-resident bytes; counting only
+    /// currently-free memory would make an already-fully-loaded machine
+    /// look permanently out of budget even when eviction would free
+    /// plenty of room. `None` — not `Some(true)` or `Some(false)` — when
+    /// `system_free_bytes` itself can't be measured (see that
+    /// function's own doc comment for which platforms), so a caller
+    /// never silently treats "couldn't tell" as "yes" or "no".
+    pub fn fits_within_budget(&self, new_size_bytes: u64, budget_fraction: f64) -> Option<bool> {
+        let free = system_free_bytes()?;
+        let mapped = self.mapped_bytes() as u64;
+        let available_for_models = free + mapped;
+        Some((mapped + new_size_bytes) as f64 <= budget_fraction * available_for_models as f64)
     }
 }
 
@@ -415,6 +460,102 @@ fn current_rss_bytes() -> Option<i64> {
     None
 }
 
+/// Best-effort system-wide "how much memory could a new model use"
+/// figure — `free + inactive` pages (matching what `vm_stat`/Activity
+/// Monitor traditionally call "available" memory: pages that aren't
+/// actively used and can be reclaimed without swapping), not just
+/// literally-free pages alone. `free_count` on its own dramatically
+/// understates real headroom on a system that's been running a while,
+/// since macOS aggressively uses "free" RAM for file-backed page cache
+/// it'll happily evict under pressure — this is meant to answer "is
+/// there room," not "is anything sitting fully idle."
+///
+/// `host_statistics64`/`HOST_VM_INFO64` aren't bound by the `mach2`
+/// crate itself (only the `vm_statistics64` struct type is) — declared
+/// directly here via a small, deliberate `extern "C"` block rather than
+/// pulling in a whole second mach-bindings crate for one function.
+/// `HOST_VM_INFO64 = 4`, confirmed against Apple's own
+/// `osfmk/mach/host_info.h` (`#define HOST_VM_INFO64 4 /* 64-bit
+/// virtual memory stats */`), not guessed. Page size via
+/// `libc::sysconf(_SC_PAGESIZE)` (the portable POSIX way — real on
+/// Apple Silicon, where the hardware page size is actually 16KB, not
+/// the 4096 this file's own `PAGE_SIZE` const assumes elsewhere;
+/// getting this wrong would corrupt the computed byte figure, not just
+/// look slightly off), not a second mach call.
+///
+/// `None` — not `Some(0)` — on any failure (the syscall failing, or no
+/// implementation for this platform below), so `SwapRegistry::
+/// fits_within_budget` never silently treats "couldn't measure" as "no
+/// room at all."
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn system_free_bytes() -> Option<u64> {
+    use mach2::kern_return::{KERN_SUCCESS, kern_return_t};
+    use mach2::mach_init::mach_host_self;
+    use mach2::mach_types::host_t;
+    use mach2::message::mach_msg_type_number_t;
+    use mach2::vm_statistics::vm_statistics64;
+    use mach2::vm_types::{integer_t, natural_t};
+    use std::mem;
+
+    const HOST_VM_INFO64: integer_t = 4;
+
+    unsafe extern "C" {
+        fn host_statistics64(
+            host_priv: host_t,
+            host_flavor: integer_t,
+            host_info64_out: *mut integer_t,
+            host_info64_out_cnt: *mut mach_msg_type_number_t,
+        ) -> kern_return_t;
+    }
+
+    // Safety: a plain `sysconf` read, no pointers involved.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+
+    let mut info = vm_statistics64::default();
+    let mut count = (mem::size_of::<vm_statistics64>() / mem::size_of::<natural_t>()) as mach_msg_type_number_t;
+    // Safety: `info` is `vm_statistics64`'s real layout from `mach2`
+    // (not hand-rolled), and `count` is sized in `natural_t` units to
+    // match, so `host_statistics64` writes exactly as many words as
+    // `info` has room for — the same shape `current_rss_bytes` above
+    // already uses for `task_info`. `mach_host_self()` returns a
+    // `thread_port_t`, assignment-compatible with the `host_t` this
+    // takes since both are plain aliases of `mach_port_t`.
+    let result = unsafe {
+        host_statistics64(mach_host_self(), HOST_VM_INFO64, &mut info as *mut vm_statistics64 as *mut integer_t, &mut count)
+    };
+    if result != KERN_SUCCESS {
+        return None;
+    }
+
+    let free_pages = info.free_count as u64 + info.inactive_count as u64;
+    Some(free_pages * page_size as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn system_free_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // Format: "MemAvailable:   12345678 kB" — the kernel's own
+            // "free + reclaimable, without swapping" figure, already
+            // exactly the semantics wanted here, no free+inactive-style
+            // approximation needed the way the macOS path has to build
+            // one from more primitive counters.
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn system_free_bytes() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod rss_tests {
     use super::current_rss_bytes;
@@ -461,5 +602,31 @@ mod rss_tests {
             after - before > 32 * 1024 * 1024,
             "touching 64MB should grow RSS by a comparable amount, before={before} after={after}"
         );
+    }
+}
+
+#[cfg(test)]
+mod system_free_bytes_tests {
+    use super::system_free_bytes;
+
+    // Same shape as `rss_tests::current_rss_is_a_plausible_positive_number`
+    // above: targeted at the real syscall, not a synthetic mock -- on a
+    // supported platform this must return a real, plausible value, not
+    // silently fail (a bad HOST_VM_INFO64/page-size mismatch would show
+    // up here as `None`) or return nonsense (a real machine has well
+    // over a few hundred MB free+inactive in any realistic test
+    // environment).
+    #[test]
+    fn system_free_bytes_is_a_plausible_positive_number() {
+        let free = system_free_bytes();
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
+        {
+            let free = free.expect("system_free_bytes should succeed on a supported platform");
+            assert!(free > 100_000_000, "expected well over 100MB free+inactive on a real machine, got {free}");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+        {
+            assert!(free.is_none());
+        }
     }
 }
