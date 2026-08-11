@@ -16,8 +16,16 @@
 //! Usage:
 //!     cargo run --release --features llama --example prompt_harness -- <prompt-file> [--seed N] [--save <path>]
 //!
-//! `<prompt-file>` is read whole and sent as-is — write/edit it in a
-//! real editor between runs. Without `--seed`, uses `Sampling::Greedy`
+//! `<prompt-file>` is read and sent almost as-is — write/edit it in a
+//! real editor between runs. One exception: a line whose first
+//! non-whitespace character is `#`, followed by whitespace or nothing
+//! else (a bare `#`), is dropped entirely before the prompt is sent —
+//! see `strip_comment_lines`'s own doc comment for exactly why that
+//! narrow a rule, not "any line containing `#`." Lets an old version of
+//! a prompt section stay in the file, commented out, instead of lost to
+//! shell history/undo the moment it's replaced — the same "comment it
+//! out, don't delete it" convention `scripts/model_sweep.sh`'s own
+//! `DEFAULT_MODELS` uses. Without `--seed`, uses `Sampling::Greedy`
 //! (deterministic, matching a task's first attempt in the real retry
 //! loop). With `--seed N`, uses `Sampling::Temperature` at the same
 //! temperature/top_k `LocalBackend` uses for retries — useful for
@@ -191,6 +199,26 @@ fn parse_args() -> Result<ParsedArgs> {
     Ok((PathBuf::from(prompt_file), sampling, save_path, model, repo_dir))
 }
 
+/// Drops every line whose first non-whitespace character is `#`,
+/// *only* when that `#` is standalone (end of line right after it) or
+/// followed by whitespace — `# like this`, or a bare `#`. Deliberately
+/// not "any line starting with `#`": a prompt for this harness is very
+/// often itself full of real Rust, and `#[derive(Debug)]`/`#![no_std]`
+/// are completely ordinary lines to have sitting in one — stripping
+/// those would silently corrupt the actual prompt being tested, not
+/// just remove a comment. Requiring whitespace (or nothing) right after
+/// the `#` is what tells a real comment apart from a real attribute.
+fn strip_comment_lines(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let Some(rest) = trimmed.strip_prefix('#') else { return true };
+            !(rest.is_empty() || rest.starts_with(char::is_whitespace))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Mirrors `taskpipe::backend::extract_code_block` exactly — kept in
 /// sync by comment, not by sharing code across crates (same reasoning
 /// as `LOCAL_MAX_NEW_TOKENS` above): this harness extracting a code
@@ -330,10 +358,19 @@ fn resolve_model_path(model: &ModelCandidate) -> Result<PathBuf> {
 
 fn main() -> Result<()> {
     let (prompt_path, sampling, save_path, model, repo_dir) = parse_args()?;
-    let prompt = std::fs::read_to_string(&prompt_path)
+    let raw_prompt = std::fs::read_to_string(&prompt_path)
         .with_context(|| format!("reading prompt file {}", prompt_path.display()))?;
+    let prompt = strip_comment_lines(&raw_prompt);
+    let dropped_lines = raw_prompt.lines().count().saturating_sub(prompt.lines().count());
 
-    println!("Prompt: {} ({} chars) — sampling: {:?} — model: {}/{}", prompt_path.display(), prompt.chars().count(), sampling, model.repo_owner, model.repo_name);
+    println!(
+        "Prompt: {} ({} chars, {dropped_lines} comment line(s) dropped) — sampling: {:?} — model: {}/{}",
+        prompt_path.display(),
+        prompt.chars().count(),
+        sampling,
+        model.repo_owner,
+        model.repo_name
+    );
 
     let model_path = resolve_model_path(model)?;
     let backend = llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?;
