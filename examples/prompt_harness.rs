@@ -46,15 +46,21 @@ struct ModelCandidate {
     filename: &'static str,
 }
 
-/// Kept in sync by comment with a subset of `taskpipe`'s
-/// `policy/policy.lua` `LOCAL_MODEL_CANDIDATES` table — only the
-/// entries actually useful to test against here, not a full mirror of
-/// every quant taskpipe knows about (add one when you actually need to
-/// iterate against it). Selectable via `--model <name>`; add new
-/// entries here as `policy.lua`'s own table changes, the same
-/// hand-maintained-in-parallel convention `LOCAL_MAX_NEW_TOKENS`/
-/// `RETRY_TEMPERATURE`/`RETRY_TOP_K` below already use.
+/// Kept in sync by comment with `taskpipe`'s `policy/policy.lua`
+/// `LOCAL_MODEL_CANDIDATES` table — every real entry there, mirrored
+/// here (same repo_owner/repo_name/filename), the same hand-maintained-
+/// in-parallel convention `LOCAL_MAX_NEW_TOKENS`/`RETRY_TEMPERATURE`/
+/// `RETRY_TOP_K` below already use. Selectable via `--model <name>`;
+/// add an entry here whenever `policy.lua`'s own table gets a new one.
 const MODEL_CANDIDATES: &[(&str, ModelCandidate)] = &[
+    (
+        "unsloth_q4km",
+        ModelCandidate {
+            repo_owner: "unsloth",
+            repo_name: "Qwen3-Coder-30B-A3B-Instruct-GGUF",
+            filename: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        },
+    ),
     (
         "giladgd_q4km",
         ModelCandidate {
@@ -62,6 +68,30 @@ const MODEL_CANDIDATES: &[(&str, ModelCandidate)] = &[
             repo_name: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M-GGUF",
             filename: "qwen3-coder-30b-a3b-instruct-q4_k_m.gguf",
         },
+    ),
+    (
+        "unsloth_q5km",
+        ModelCandidate {
+            repo_owner: "unsloth",
+            repo_name: "Qwen3-Coder-30B-A3B-Instruct-GGUF",
+            filename: "Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf",
+        },
+    ),
+    (
+        "unsloth_q6k",
+        ModelCandidate {
+            repo_owner: "unsloth",
+            repo_name: "Qwen3-Coder-30B-A3B-Instruct-GGUF",
+            filename: "Qwen3-Coder-30B-A3B-Instruct-Q6_K.gguf",
+        },
+    ),
+    (
+        "qwen3_6_35b_a3b_q4km",
+        ModelCandidate { repo_owner: "unsloth", repo_name: "Qwen3.6-35B-A3B-GGUF", filename: "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf" },
+    ),
+    (
+        "devstral_small_2507_q4km",
+        ModelCandidate { repo_owner: "unsloth", repo_name: "Devstral-Small-2507-GGUF", filename: "Devstral-Small-2507-Q4_K_M.gguf" },
     ),
     (
         "jamba_mini_1_7_q3km",
