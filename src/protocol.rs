@@ -46,3 +46,38 @@ pub enum GenerateResponse {
     Ok { text: String, tokens_generated: usize, time_to_first_token_ms: u64 },
     Err { message: String },
 }
+
+/// `~/.rampipe/rampiped.sock` — the one real source of truth for
+/// "where's the daemon," so `rampiped`'s own `main()` and every client
+/// (`rampipe::client`, or an external caller like taskpipe) fall back to
+/// the same path instead of each hardcoding it independently. Without
+/// this, two independently started processes agreeing to share one
+/// daemon required a human to type the identical path on both command
+/// lines; with it, doing nothing on either side already agrees. `--socket`
+/// (`rampiped`) and an explicit client-supplied path still override this,
+/// same as before — this is only ever the fallback when neither says
+/// otherwise.
+///
+/// `None` only when `$HOME` isn't set — matches `system_free_bytes`'s own
+/// "can't determine, never guess" convention (`crate::lib`) rather than
+/// falling back to something like `/tmp`, which would silently put the
+/// socket somewhere no other process's own unset-`$HOME` fallback would
+/// agree on either.
+pub fn default_socket_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".rampipe").join("rampiped.sock"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_socket_path_ends_with_the_expected_relative_layout() {
+        // Not asserting the exact absolute path (that's whatever $HOME
+        // happens to be in the test environment) -- just the stable part
+        // this function's own contract promises.
+        let path = default_socket_path().expect("HOME should be set in a real test environment");
+        assert!(path.ends_with(".rampipe/rampiped.sock"));
+    }
+}

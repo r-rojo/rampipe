@@ -64,11 +64,6 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>>
     Ok(Some(args.remove(pos)))
 }
 
-fn default_socket_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from).context("could not determine home directory (HOME not set)")?;
-    Ok(home.join(".rampipe").join("rampiped.sock"))
-}
-
 fn parse_args() -> Result<Args> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let socket = take_flag_value(&mut args, "--socket")?.map(PathBuf::from);
@@ -81,7 +76,10 @@ fn parse_args() -> Result<Args> {
     }
     let socket = match socket {
         Some(path) => path,
-        None => default_socket_path()?,
+        // `rampipe::protocol::default_socket_path` -- the one shared
+        // source of truth every client falls back to as well (see that
+        // function's own doc comment), not a value re-derived here.
+        None => rampipe::protocol::default_socket_path().context("--socket not given, and could not determine a default (~/.rampipe/rampiped.sock) -- HOME not set")?,
     };
     Ok(Args { socket, budget_fraction })
 }

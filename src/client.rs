@@ -14,6 +14,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+/// Re-exported so a caller only needs `rampipe::client` to both find and
+/// connect to the daemon, without a separate `use rampipe::protocol` just
+/// for this one function.
+pub use crate::protocol::default_socket_path;
+
 #[derive(Debug, thiserror::Error)]
 pub enum RampipedError {
     #[error("connecting to rampiped socket {path} (is rampiped running?): {source}")]
