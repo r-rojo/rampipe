@@ -265,7 +265,11 @@ fn count_code_blocks(text: &str) -> usize {
 /// Every `FILE: <path>` line is located first, then `extract_code_block`
 /// above runs against just the text between this marker and the next
 /// one (or the end of the response), so a stray fence anywhere is
-/// contained to whichever marker's own window it falls in.
+/// contained to whichever marker's own window it falls in. Falls back
+/// to `extract_comment_marked_blocks` when zero `FILE:` markers are
+/// found at all — real, live case: a response prompted without the
+/// strict marker convention named each file via a leading comment
+/// instead (Jamba Mini, chronopipe's `draft-1`).
 fn extract_multi_file_blocks(text: &str) -> Vec<(String, String)> {
     let mut markers: Vec<(String, usize, usize)> = Vec::new();
     let mut line_start = 0usize;
@@ -284,7 +288,67 @@ fn extract_multi_file_blocks(text: &str) -> Vec<(String, String)> {
             result.push((path.clone(), code));
         }
     }
+
+    if result.is_empty() {
+        return extract_comment_marked_blocks(text);
+    }
     result
+}
+
+/// Mirrors `taskpipe::backend::comment_prefix_for_language` exactly.
+fn comment_prefix_for_language(lang: &str) -> Option<&'static str> {
+    match lang.trim().to_ascii_lowercase().as_str() {
+        "rust" | "rs" | "c" | "cpp" | "c++" | "java" | "javascript" | "js" | "typescript" | "ts" | "go" | "swift" | "kotlin" => Some("//"),
+        "python" | "py" | "ruby" | "rb" | "bash" | "sh" | "shell" | "yaml" | "yml" | "toml" => Some("#"),
+        _ => None,
+    }
+}
+
+/// Mirrors `taskpipe::backend::extract_all_code_blocks` exactly.
+fn extract_all_code_blocks(text: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel_start) = text[search_from..].find("```") {
+        let fence_start = search_from + rel_start;
+        let after_start = &text[fence_start + 3..];
+        let lang_line_end = after_start.find('\n').unwrap_or(after_start.len());
+        let lang = after_start[..lang_line_end].trim().to_string();
+        let content_start = if lang_line_end < after_start.len() { lang_line_end + 1 } else { lang_line_end };
+        let after_lang = &after_start[content_start..];
+        let Some(end) = after_lang.find("```") else { break };
+        let code = after_lang[..end].trim_end().to_string();
+        let block_end = fence_start + 3 + content_start + end + 3;
+
+        if code.trim().is_empty() {
+            search_from = fence_start + 3 + content_start + end;
+            continue;
+        }
+
+        result.push((lang, code));
+        search_from = block_end;
+    }
+    result
+}
+
+/// Mirrors `taskpipe::backend::extract_comment_marked_blocks` exactly —
+/// fallback for a response that names each file via a leading `//`/`#`-
+/// style comment (language-dependent) instead of a `FILE:` marker line;
+/// see `extract_multi_file_blocks`'s own doc comment for the real, live
+/// case (Jamba Mini, chronopipe's `draft-1`) this covers.
+fn extract_comment_marked_blocks(text: &str) -> Vec<(String, String)> {
+    extract_all_code_blocks(text)
+        .into_iter()
+        .filter_map(|(lang, code)| {
+            let prefix = comment_prefix_for_language(&lang)?;
+            let first_line = code.lines().next()?.trim();
+            let stated = first_line.strip_prefix(prefix)?.trim();
+            if stated.is_empty() || stated.chars().any(char::is_whitespace) {
+                return None;
+            }
+            let path = if stated.contains('/') { stated.to_string() } else { format!("src/{stated}") };
+            Some((path, code))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
