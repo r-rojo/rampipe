@@ -231,6 +231,7 @@ fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Resu
         text: result.text,
         tokens_generated: result.tokens_generated,
         time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
+        formatted_prompt: result.formatted_prompt,
     })
 }
 

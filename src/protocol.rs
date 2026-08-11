@@ -43,8 +43,19 @@ pub struct GenerateRequest {
 /// QueryResponse`'s own shape.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GenerateResponse {
-    Ok { text: String, tokens_generated: usize, time_to_first_token_ms: u64 },
-    Err { message: String },
+    Ok {
+        text: String,
+        tokens_generated: usize,
+        time_to_first_token_ms: u64,
+        /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
+        /// comment — the same value, carried across the socket so a
+        /// daemon-backed caller has the same visibility into what the
+        /// model actually saw as an in-process caller already does.
+        formatted_prompt: String,
+    },
+    Err {
+        message: String,
+    },
 }
 
 /// `~/.rampipe/rampiped.sock` — the one real source of truth for

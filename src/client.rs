@@ -45,6 +45,9 @@ pub struct GenerateOutcome {
     pub text: String,
     pub tokens_generated: usize,
     pub time_to_first_token_ms: u64,
+    /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
+    /// comment.
+    pub formatted_prompt: String,
 }
 
 pub struct RampipedClient {
@@ -85,8 +88,8 @@ impl RampipedClient {
         let response: GenerateResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
 
         match response {
-            GenerateResponse::Ok { text, tokens_generated, time_to_first_token_ms } => {
-                Ok(GenerateOutcome { text, tokens_generated, time_to_first_token_ms })
+            GenerateResponse::Ok { text, tokens_generated, time_to_first_token_ms, formatted_prompt } => {
+                Ok(GenerateOutcome { text, tokens_generated, time_to_first_token_ms, formatted_prompt })
             }
             GenerateResponse::Err { message } => Err(RampipedError::Remote(message)),
         }

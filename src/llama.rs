@@ -149,6 +149,17 @@ pub struct GenerationResult {
     /// pages for the first time.
     pub time_to_first_token: Duration,
     pub tokens_generated: usize,
+    /// What `formatted_prompt()` actually produced — the input `prompt`
+    /// after chat-template wrapping (or `ChatWrap`, or the raw prompt
+    /// unchanged, whichever `formatted_prompt` fell back to), exactly as
+    /// tokenized and handed to the model. Already computed internally as
+    /// an unavoidable step before tokenization; this only stops throwing
+    /// it away afterward. Pure instrumentation — nothing about how a
+    /// prompt gets sent to the model changes because of this field
+    /// existing — so a caller doing verbose logging (or debugging a
+    /// model behaving oddly) can see what the model was actually shown,
+    /// not just what it said back.
+    pub formatted_prompt: String,
 }
 
 impl LlamaSession {
@@ -359,6 +370,7 @@ impl LlamaSession {
             text,
             time_to_first_token: time_to_first_token.unwrap_or_default(),
             tokens_generated,
+            formatted_prompt,
         })
     }
 
