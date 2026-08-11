@@ -1679,6 +1679,8 @@ dependencies = [
  "mach2",
  "memmap2",
  "minijinja",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

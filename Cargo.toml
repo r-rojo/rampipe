@@ -10,17 +10,20 @@ minijinja = { version = "2", features = ["json"], optional = true }
 memmap2 = "0.9.11"
 thiserror = "2.0.19"
 libc = "0.2.189"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3.27.0"
 hf-hub = { version = "1.0", features = ["blocking"] }
-anyhow = "1"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 mach2 = "0.6.0"
 
 [features]
 llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:minijinja"]
+client = []
 
 [[example]]
 name = "residency_vs_ttft"
@@ -32,4 +35,8 @@ required-features = ["llama"]
 
 [[example]]
 name = "determinism_probe"
+required-features = ["llama"]
+
+[[bin]]
+name = "rampiped"
 required-features = ["llama"]

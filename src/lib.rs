@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "llama")]
 pub mod llama;
+#[cfg(feature = "client")]
+pub mod client;
+pub mod protocol;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const PAGE_SIZE: usize = 4096;

@@ -186,6 +186,14 @@ impl LlamaSession {
         self.handle.path()
     }
 
+    /// The underlying registry handle's id — what a caller managing
+    /// several resident sessions at once (`rampiped`) needs to match a
+    /// session back to `SwapRegistry::resident_ids_by_lru()`'s output
+    /// when deciding what to evict.
+    pub fn id(&self) -> crate::ModelId {
+        self.handle.id()
+    }
+
     /// Runs a real generation, using greedy sampling over a fresh context
     /// each call. Attributes time-to-first-token separately from total
     /// generation time so page-in cost (see `metrics()`) can be correlated
