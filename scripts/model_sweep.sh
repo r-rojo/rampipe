@@ -61,6 +61,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RAMPIPE_DIR="$(dirname "$SCRIPT_DIR")"
 HARNESS_BIN="$RAMPIPE_DIR/target/release/examples/prompt_harness"
 
+# Used when `--models` isn't passed. Comment a line out (don't delete
+# it) to skip that candidate without losing track of it — real, live
+# numbers as of 2026-08-11 on this machine: ~62 GiB free, and
+# unsloth_q5km/unsloth_q6k are the only two of the seven real
+# LOCAL_MODEL_CANDIDATES not already in the local HF cache (~20.2 GiB
+# and ~23.4 GiB respectively — same Qwen3-Coder-30B weights as the
+# already-cached unsloth_q4km/giladgd_q4km, just bigger quants, not a
+# different model). Downloading both at once would leave only ~18 GiB
+# free afterward — tight enough to risk normal system operation
+# alongside whatever else runs overnight. The five active below cover
+# four genuinely distinct model families with zero new downloads;
+# uncomment either commented-out line once there's confirmed headroom,
+# or to specifically test whether a bigger quant changes the result for
+# the Qwen3-Coder-30B family already covered by q4km.
+DEFAULT_MODELS=(
+    "unsloth_q4km"
+    "giladgd_q4km"
+    "devstral_small_2507_q4km"
+    "qwen3_6_35b_a3b_q4km"
+    "jamba_mini_1_7_q3km"
+    # "unsloth_q5km"              # ~20.2 GiB fresh download, not cached as of 2026-08-11
+    # "unsloth_q6k"               # ~23.4 GiB fresh download, not cached as of 2026-08-11
+)
+
 # macOS ships no `timeout`/`gtimeout` by default (GNU coreutils isn't
 # installed here) -- this is a portable, bash-only replacement: run the
 # command in the background, race it against a `sleep`-based watchdog,
@@ -154,16 +178,32 @@ if [[ ! -x "$HARNESS_BIN" ]]; then
 fi
 
 if [[ -z "$MODELS" ]]; then
-    # Every `(name, ...)` entry in MODEL_CANDIDATES, in the order
-    # they're declared — a plain grep, not a Rust parse, so this stays
-    # a shell script; good enough for a name that's always a bare
-    # quoted string on its own line right after the `[` or a `),`.
-    MODELS="$(grep -oE '^\s*"[a-zA-Z0-9_]+",\s*$' "$RAMPIPE_DIR/examples/prompt_harness.rs" | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"' | paste -sd, -)"
+    # `${DEFAULT_MODELS[@]+...}` guard: same bash-3.2-under-`set -u`
+    # empty-array gotcha as `seed_args`/`REPO_DIR_ARGS` below — every
+    # DEFAULT_MODELS line could in principle be commented out.
+    MODELS="$(printf '%s,' ${DEFAULT_MODELS[@]+"${DEFAULT_MODELS[@]}"})"
+    MODELS="${MODELS%,}"
 fi
 if [[ -z "$MODELS" ]]; then
-    echo "couldn't auto-detect any models from prompt_harness.rs's MODEL_CANDIDATES table — pass --models explicitly" >&2
+    echo "DEFAULT_MODELS is empty (every line commented out?) and no --models was given — nothing to run" >&2
     exit 1
 fi
+
+# Validates every requested name against prompt_harness.rs's own real
+# MODEL_CANDIDATES table — a plain grep, not a Rust parse, so this
+# stays a shell script; good enough for a name that's always a bare
+# quoted string on its own line right after the `[` or a `),`. Catches
+# a typo in DEFAULT_MODELS above or a bad --models value here, with a
+# clear message, instead of failing deep inside the harness on run 1
+# of what might be a long unattended sweep.
+KNOWN_MODELS="$(grep -oE '^\s*"[a-zA-Z0-9_]+",\s*$' "$RAMPIPE_DIR/examples/prompt_harness.rs" | grep -oE '"[a-zA-Z0-9_]+"' | tr -d '"')"
+IFS=',' read -ra REQUESTED_MODELS <<< "$MODELS"
+for requested in "${REQUESTED_MODELS[@]}"; do
+    if ! grep -qxF "$requested" <<< "$KNOWN_MODELS"; then
+        echo "no model candidate named \"$requested\" in prompt_harness.rs's own MODEL_CANDIDATES — known: $(tr '\n' ' ' <<< "$KNOWN_MODELS")" >&2
+        exit 1
+    fi
+done
 
 REPO_DIR_ARGS=()
 if [[ -n "$REPO_DIR" ]]; then
