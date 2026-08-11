@@ -290,6 +290,17 @@ impl LlamaSession {
     /// the untouched raw prompt on `MissingTemplate` rather than hard
     /// erroring, since that was the only behavior available before this
     /// existed and is still strictly better than refusing to run.
+    ///
+    /// Same fallback for a template that *is* present but fails to
+    /// render -- real, live case: AI21's Jamba Mini GGUF ships a baked-in
+    /// template that llama.cpp's own minimal Jinja engine can't execute
+    /// (`apply_chat_template` returns `ffi error -1`), even though the
+    /// model itself loads and runs fine (a llama.cpp template-engine gap,
+    /// not a taskpipe/rampipe bug, and not evidence the model itself is
+    /// unusable). Treating this the same as `MissingTemplate` rather than
+    /// hard-failing the whole call means a model with an unsupported
+    /// template degrades to the older, always-worked raw-prompt behavior
+    /// instead of being unusable outright.
     fn formatted_prompt(&self, prompt: &str) -> Result<String, LlamaSessionError> {
         let template = match self.model.chat_template(None) {
             Ok(template) => template,
@@ -297,6 +308,9 @@ impl LlamaSession {
             Err(other) => return Err(other.into()),
         };
         let message = LlamaChatMessage::new("user".to_string(), prompt.to_string())?;
-        Ok(self.model.apply_chat_template(&template, &[message], true)?)
+        match self.model.apply_chat_template(&template, &[message], true) {
+            Ok(formatted) => Ok(formatted),
+            Err(_) => Ok(prompt.to_string()),
+        }
     }
 }
