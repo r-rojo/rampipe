@@ -18,13 +18,16 @@
 //!
 //! `<prompt-file>` is read and sent almost as-is — write/edit it in a
 //! real editor between runs. One exception: a line whose first
-//! non-whitespace character is `#`, followed by whitespace or nothing
-//! else (a bare `#`), is dropped entirely before the prompt is sent —
-//! see `strip_comment_lines`'s own doc comment for exactly why that
-//! narrow a rule, not "any line containing `#`." Lets an old version of
-//! a prompt section stay in the file, commented out, instead of lost to
-//! shell history/undo the moment it's replaced — the same "comment it
-//! out, don't delete it" convention `scripts/model_sweep.sh`'s own
+//! non-whitespace characters are `;;` is dropped entirely before the
+//! prompt is sent — see `strip_comment_lines`'s own doc comment for why
+//! `;;` specifically, not `#` (the first thing tried): a prompt here is
+//! routinely real Rust *and* real Markdown at once (a task body's own
+//! `## Acceptance criteria` heading, `#[derive(...)]` attributes in
+//! example code), and `#` collides with both. `;;` isn't valid syntax
+//! in either, or in ordinary prose. Lets an old version of a prompt
+//! section stay in the file, commented out, instead of lost to shell
+//! history/undo the moment it's replaced — the same "comment it out,
+//! don't delete it" convention `scripts/model_sweep.sh`'s own
 //! `DEFAULT_MODELS` uses. Without `--seed`, uses `Sampling::Greedy`
 //! (deterministic, matching a task's first attempt in the real retry
 //! loop). With `--seed N`, uses `Sampling::Temperature` at the same
@@ -199,22 +202,18 @@ fn parse_args() -> Result<ParsedArgs> {
     Ok((PathBuf::from(prompt_file), sampling, save_path, model, repo_dir))
 }
 
-/// Drops every line whose first non-whitespace character is `#`,
-/// *only* when that `#` is standalone (end of line right after it) or
-/// followed by whitespace — `# like this`, or a bare `#`. Deliberately
-/// not "any line starting with `#`": a prompt for this harness is very
-/// often itself full of real Rust, and `#[derive(Debug)]`/`#![no_std]`
-/// are completely ordinary lines to have sitting in one — stripping
-/// those would silently corrupt the actual prompt being tested, not
-/// just remove a comment. Requiring whitespace (or nothing) right after
-/// the `#` is what tells a real comment apart from a real attribute.
+/// Drops every line whose first non-whitespace characters are `;;`.
+/// Not `#` (tried first, reverted): a real prompt for this harness is
+/// routinely both real Rust *and* real Markdown in the same file — a
+/// task body's own `## Acceptance criteria` heading, `#[derive(Debug)]`/
+/// `#![no_std]` attributes in example code — and `#` collides with all
+/// of that, silently eating real prompt content instead of just a
+/// comment. `;;` isn't valid syntax in Rust or Markdown, or anything
+/// likely in ordinary prose, so there's nothing real for it to collide
+/// with.
 fn strip_comment_lines(text: &str) -> String {
     text.lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            let Some(rest) = trimmed.strip_prefix('#') else { return true };
-            !(rest.is_empty() || rest.starts_with(char::is_whitespace))
-        })
+        .filter(|line| !line.trim_start().starts_with(";;"))
         .collect::<Vec<_>>()
         .join("\n")
 }
