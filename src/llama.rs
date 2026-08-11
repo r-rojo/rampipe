@@ -48,11 +48,79 @@ pub enum LlamaSessionError {
     ApplyChatTemplate(#[from] llama_cpp_2::ApplyChatTemplateError),
 }
 
+/// A manual override for how a prompt is wrapped into a chat turn —
+/// `prefix + prompt + suffix`, used *instead of* the GGUF's own baked-in
+/// chat template. Was the primary fix for a template llama.cpp's own
+/// minimal Jinja engine can't render (live case: AI21's Jamba Mini —
+/// `apply_chat_template` returns `ffi error -1` on macro/namespace usage
+/// llama.cpp's Jinja subset doesn't support); now that
+/// `render_with_minijinja` below handles that same template correctly
+/// (a real, general Jinja engine, not llama.cpp's limited one), this is
+/// a narrower last-resort: a hand-captured wrap for the rare template
+/// even `minijinja` can't render, tried only after that's already
+/// failed. Deliberately not removed just because no current candidate
+/// needs it — a real, if hopefully rarely-used, escape hatch.
+#[derive(Debug, Clone)]
+pub struct ChatWrap {
+    pub prefix: String,
+    pub suffix: String,
+}
+
+/// Renders `template_text` (a model's own real `tokenizer.chat_template`
+/// Jinja source, as returned by `chat_template()`) for a single `user`
+/// turn with generation left open for the assistant to continue into —
+/// the one shape `generate()` actually needs. `None` on any parse or
+/// render failure (unsupported syntax, a template that genuinely calls
+/// `raise_exception` for this input shape, etc.) — the caller falls back
+/// further, this never itself decides there's no other option.
+///
+/// `set_trim_blocks`/`set_lstrip_blocks`: real HF chat templates
+/// (Jamba's included) are authored assuming `transformers`' own
+/// `jinja2.Environment(trim_blocks=True, lstrip_blocks=True)` convention
+/// — without it, the newlines/indentation between `{% %}` control tags
+/// that don't carry their own `-` trim markers leak into macro return
+/// values and break arithmetic/filters downstream (a real, live failure
+/// hit rendering Jamba's own `get_last_user_index` macro before this was
+/// set: `|int` failed on a string padded with accumulated block-tag
+/// whitespace, not the "0" the macro's actual `{{- ... -}}` content
+/// produced).
+///
+/// `raise_exception`: not a builtin in any Jinja engine — every real
+/// chat-template caller (including `transformers` itself) registers
+/// this by convention, since templates call it as an ordinary function
+/// for their own input-validation errors (e.g. an unsupported tool
+/// type). Registering it here matches that convention rather than
+/// leaving the name undefined and turning a template's own deliberate
+/// validation error into an unrelated "unknown function" failure.
+fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
+    use minijinja::{Environment, Value, context};
+
+    let mut env = Environment::new();
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.add_function("raise_exception", |msg: String| -> Result<Value, minijinja::Error> {
+        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+    });
+    env.add_template("chat", template_text).ok()?;
+    let tmpl = env.get_template("chat").ok()?;
+
+    let ctx = context! {
+        messages => vec![context! { role => "user", content => prompt }],
+        add_generation_prompt => true,
+    };
+    tmpl.render(ctx).ok()
+}
+
 /// A model resident in both `rampipe`'s accounting mmap and llama.cpp's
 /// own loaded state — see module docs for why there are two mappings.
 pub struct LlamaSession {
     handle: ModelHandle,
     model: LlamaModel,
+    /// `None` (the default `load` leaves this) for every model whose own
+    /// chat template renders correctly, or has no template at all — see
+    /// `ChatWrap`'s doc comment for when a caller sets this instead, via
+    /// `with_chat_wrap`.
+    chat_wrap: Option<ChatWrap>,
 }
 
 /// How `generate()` picks the next token. `Greedy` is pure argmax — fully
@@ -95,7 +163,17 @@ impl LlamaSession {
         let path = path.as_ref();
         let handle = registry.load(path, residency)?;
         let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())?;
-        Ok(Self { handle, model })
+        Ok(Self { handle, model, chat_wrap: None })
+    }
+
+    /// Opts this session into a manual `ChatWrap` instead of the GGUF's
+    /// own baked-in template — see `ChatWrap`'s doc comment for why.
+    /// Builder-style (consumes and returns `Self`) rather than a
+    /// `&mut self` setter, so a caller can chain it directly onto `load`
+    /// without an extra `let mut` binding.
+    pub fn with_chat_wrap(mut self, chat_wrap: ChatWrap) -> Self {
+        self.chat_wrap = Some(chat_wrap);
+        self
     }
 
     /// Residency metrics from the `rampipe` side of this session (map
@@ -277,40 +355,114 @@ impl LlamaSession {
     }
 
     /// Wraps `prompt` in the model's own baked-in chat template as a
-    /// single "user" turn (`add_ass: true`, so the rendered text ends
-    /// with the assistant turn already opened, ready for generation to
-    /// continue into it) before tokenizing. Previously `generate` fed the
-    /// raw instructional text straight to the tokenizer with no role
-    /// structure at all -- `llama_cpp_2`'s own doc comment on
-    /// `apply_chat_template` warns that skipping this "can result in
-    /// really unexpected responses," and a real caller-observed case
-    /// (Qwen3.6-35B-A3B leaving a referenced type undefined, one attempt
-    /// producing no parseable output at all) matched that failure shape.
-    /// Not every GGUF has a template baked in, though -- falls back to
-    /// the untouched raw prompt on `MissingTemplate` rather than hard
-    /// erroring, since that was the only behavior available before this
-    /// existed and is still strictly better than refusing to run.
+    /// single "user" turn (`add_ass: true`/`add_generation_prompt: true`,
+    /// so the rendered text ends with the assistant turn already opened,
+    /// ready for generation to continue into it) before tokenizing.
+    /// Previously `generate` fed the raw instructional text straight to
+    /// the tokenizer with no role structure at all -- `llama_cpp_2`'s own
+    /// doc comment on `apply_chat_template` warns that skipping this "can
+    /// result in really unexpected responses," and a real caller-observed
+    /// case (Qwen3.6-35B-A3B leaving a referenced type undefined, one
+    /// attempt producing no parseable output at all) matched that failure
+    /// shape.
     ///
-    /// Same fallback for a template that *is* present but fails to
-    /// render -- real, live case: AI21's Jamba Mini GGUF ships a baked-in
-    /// template that llama.cpp's own minimal Jinja engine can't execute
-    /// (`apply_chat_template` returns `ffi error -1`), even though the
-    /// model itself loads and runs fine (a llama.cpp template-engine gap,
-    /// not a taskpipe/rampipe bug, and not evidence the model itself is
-    /// unusable). Treating this the same as `MissingTemplate` rather than
-    /// hard-failing the whole call means a model with an unsupported
-    /// template degrades to the older, always-worked raw-prompt behavior
-    /// instead of being unusable outright.
+    /// Four-step fallback chain, each step only reached if every one
+    /// before it couldn't produce an answer:
+    /// 1. `render_with_minijinja` against the model's own real template
+    ///    text -- a genuine Jinja engine, not llama.cpp's limited one, so
+    ///    this is now the primary path for every model with a template,
+    ///    not just ones known to need it (see that function's own doc
+    ///    comment for why llama.cpp's own engine isn't good enough:
+    ///    real, live case, AI21's Jamba Mini's template uses
+    ///    macros/namespaces llama.cpp's Jinja subset can't execute at
+    ///    all, `apply_chat_template` returning `ffi error -1`).
+    /// 2. llama.cpp's own `apply_chat_template` -- kept as a fallback,
+    ///    not removed, in case some template shape renders correctly
+    ///    there but not through `minijinja` (untested, defense in depth
+    ///    rather than a known real case).
+    /// 3. `self.chat_wrap`, if the caller configured one -- a narrow,
+    ///    hand-captured override for a template neither engine can
+    ///    render (see `ChatWrap`'s own doc comment).
+    /// 4. The untouched raw prompt -- strictly better than refusing to
+    ///    run at all, the same reasoning that's applied since before any
+    ///    of the above existed.
     fn formatted_prompt(&self, prompt: &str) -> Result<String, LlamaSessionError> {
         let template = match self.model.chat_template(None) {
             Ok(template) => template,
             Err(llama_cpp_2::ChatTemplateError::MissingTemplate) => return Ok(prompt.to_string()),
             Err(other) => return Err(other.into()),
         };
-        let message = LlamaChatMessage::new("user".to_string(), prompt.to_string())?;
-        match self.model.apply_chat_template(&template, &[message], true) {
-            Ok(formatted) => Ok(formatted),
-            Err(_) => Ok(prompt.to_string()),
+
+        if let Ok(template_text) = template.to_str()
+            && let Some(rendered) = render_with_minijinja(template_text, prompt)
+        {
+            return Ok(rendered);
         }
+
+        let message = LlamaChatMessage::new("user".to_string(), prompt.to_string())?;
+        if let Ok(formatted) = self.model.apply_chat_template(&template, &[message], true) {
+            return Ok(formatted);
+        }
+
+        if let Some(wrap) = &self.chat_wrap {
+            return Ok(format!("{}{}{}", wrap.prefix, prompt, wrap.suffix));
+        }
+
+        Ok(prompt.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A model's real `tokenizer.chat_template` GGUF metadata, extracted
+    /// once via Python's `gguf` package against the real, downloaded
+    /// `bartowski/ai21labs_AI21-Jamba-Mini-1.7-GGUF` file (not hand-
+    /// assembled) -- the same template whose rendering failure through
+    /// llama.cpp's own engine (`ffi error -1`) motivated
+    /// `render_with_minijinja` existing at all. Real macros, a
+    /// `namespace()`, `is not defined` checks, `tojson`, tool/document
+    /// handling this test's own call never exercises -- exactly the
+    /// shape `render_with_minijinja`'s doc comment claims llama.cpp's
+    /// engine can't execute but this can.
+    const JAMBA_CHAT_TEMPLATE: &str = include_str!("../tests/fixtures/jamba_mini_1_7_chat_template.jinja");
+
+    #[test]
+    fn renders_jambas_real_template_for_a_single_user_turn() {
+        let rendered = render_with_minijinja(JAMBA_CHAT_TEMPLATE, "Hello, how are you?").expect("should render");
+        assert_eq!(rendered, "<|bom|><|system|> <|eom|><|bom|><|user|> Hello, how are you?<|eom|><|bom|><|assistant|>");
+    }
+
+    /// Not just Jamba-specific -- a plain ChatML-style template (the
+    /// shape most instruct-tuned GGUFs actually ship, and one llama.cpp's
+    /// own engine already handles fine) needs to keep working too, since
+    /// this is now the *primary* renderer for every model, not a
+    /// Jamba-only escape hatch.
+    #[test]
+    fn renders_a_plain_chatml_style_template() {
+        let template = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n\
+                         {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        let rendered = render_with_minijinja(template, "hi").expect("should render");
+        assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+    }
+
+    #[test]
+    fn returns_none_for_a_template_with_genuinely_invalid_syntax() {
+        assert_eq!(render_with_minijinja("{% this is not valid jinja %}", "hi"), None);
+    }
+
+    /// `raise_exception` must be registered -- a template calling it
+    /// (even one that would never do so for a real single-user-turn
+    /// input) shouldn't fail with "unknown function" instead of the
+    /// template's own intended error.
+    #[test]
+    fn a_template_defining_raise_exception_as_a_call_does_not_fail_on_an_unknown_function() {
+        let template = "{% if false %}{{ raise_exception(\"unreachable\") }}{% endif %}{{ prompt }}";
+        // `prompt` isn't part of the context this function builds (only
+        // `messages`/`add_generation_prompt` are) -- this asserts the
+        // render doesn't fail on `raise_exception` being undefined, not
+        // that this exact template produces a particular string.
+        assert!(render_with_minijinja(template, "hi").is_some());
     }
 }

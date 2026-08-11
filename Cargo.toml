@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 llama-cpp-2 = { version = "0.1.152", optional = true }
 encoding_rs = { version = "0.8", optional = true }
+minijinja = { version = "2", features = ["json"], optional = true }
 memmap2 = "0.9.11"
 thiserror = "2.0.19"
 libc = "0.2.189"
@@ -19,7 +20,7 @@ anyhow = "1"
 mach2 = "0.6.0"
 
 [features]
-llama = ["dep:llama-cpp-2", "dep:encoding_rs"]
+llama = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:minijinja"]
 
 [[example]]
 name = "residency_vs_ttft"
