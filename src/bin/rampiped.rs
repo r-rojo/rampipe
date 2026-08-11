@@ -16,14 +16,21 @@
 //! established local convention rather than a new shared IPC crate for
 //! ~100 lines of socket boilerplate.
 //!
-//! Serial by design: every request is handled to completion, one at a
-//! time, in the single accept loop below — no worker threads, no
-//! request queue. A GPU can only usefully run one decode at a time
-//! anyway, so serializing is simpler and strictly safer than
-//! concurrency here, not a missing feature. The real cost is that a
-//! slow or silent client blocks every other client while its connection
-//! is open; acceptable for a local, single-machine, trusted-clients
-//! daemon, not defended against here.
+//! Connection handling is concurrent (one thread per connection); the
+//! actual GPU-touching work — deciding what to load/evict and running a
+//! generation — is not: it all happens inside one critical section,
+//! guarded by `SharedState`'s own `Mutex`, so at most one load, evict, or
+//! decode is ever in flight process-wide. A GPU can only usefully run one
+//! decode at a time anyway, and loading a second model onto it while a
+//! decode is using it risks the same kind of memory pressure this daemon
+//! exists to avoid — so this is a deliberate choice, not a missing
+//! optimization: real gain is a slow-to-send or slow-to-receive client no
+//! longer blocking every *other* client's request while its own
+//! connection is merely open (the previous, fully single-threaded
+//! version's actual limitation), and eviction never touching a model
+//! that's mid-generation for someone else, enforced structurally (the
+//! whole load-then-generate turn is one atomic critical section) rather
+//! than true only by accident of nothing else being able to run at all.
 //!
 //!     cargo run --release --features llama --bin rampiped -- \
 //!         [--socket <path>] [--budget-fraction <0.0-1.0>]
@@ -37,6 +44,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Instant;
 
 const DEFAULT_BUDGET_FRACTION: f64 = 0.8;
@@ -84,23 +93,37 @@ fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
     }
 }
 
-/// Every model this daemon currently holds resident, keyed by path —
-/// the natural key for clients (which only know a file path, never a
-/// `ModelId`), with `SwapRegistry` underneath doing the actual
-/// residency accounting/eviction-safety bookkeeping `LlamaSession`
-/// itself relies on.
-struct ModelStore {
+/// Everything a load, evict, or generate call touches — bundled into one
+/// struct specifically so it can live behind one `Mutex` (see module doc
+/// comment). `backend` lives in here too, not as a separate `&LlamaBackend`
+/// passed alongside: `llama_cpp_2::llama_backend::LlamaBackend` is
+/// expected to be `Send` but not necessarily `Sync` (see brush's `aish`
+/// builtin, `ai.rs::ModelState`'s own doc comment, which this mirrors) —
+/// putting it behind the same `Mutex` as everything else means only
+/// `Send` is ever required, never `Sync`, and it's never touched from two
+/// threads at once by construction.
+struct SharedState {
+    backend: LlamaBackend,
     registry: SwapRegistry,
     sessions: HashMap<PathBuf, LlamaSession>,
     budget_fraction: f64,
 }
 
-impl ModelStore {
-    fn new(budget_fraction: f64) -> Self {
-        Self { registry: SwapRegistry::new(), sessions: HashMap::new(), budget_fraction }
+impl SharedState {
+    fn new(backend: LlamaBackend, budget_fraction: f64) -> Self {
+        Self { backend, registry: SwapRegistry::new(), sessions: HashMap::new(), budget_fraction }
     }
 
-    fn get_or_load(&mut self, backend: &LlamaBackend, path: &Path) -> Result<&LlamaSession> {
+    /// Ensures `path` is resident in `self.sessions`, loading it (and
+    /// evicting, if the budget requires it) if it isn't already. Returns
+    /// nothing — deliberately not `&LlamaSession`, since a reference tied
+    /// to `&mut self` here would keep the whole `SharedState` borrowed
+    /// mutably for as long as the caller holds it, blocking the caller
+    /// from also borrowing `self.backend` immutably alongside
+    /// `self.sessions.get(path)` for the actual `generate()` call right
+    /// after. Two separate immutable field borrows once this returns is
+    /// simpler than threading a reference through.
+    fn ensure_loaded(&mut self, path: &Path) -> Result<()> {
         if self.sessions.contains_key(path) {
             // A cache hit still needs to count as an access for LRU
             // purposes -- `SwapRegistry::load` already treats a
@@ -109,27 +132,30 @@ impl ModelStore {
             // so re-calling it here (cheap: no new mmap, no reload) is
             // what keeps `resident_ids_by_lru` honest.
             self.registry.load(path, Residency::Lazy).context("touching cached model for LRU accounting")?;
-            return Ok(self.sessions.get(path).expect("checked contains_key above"));
+            return Ok(());
         }
 
         self.make_room_for(path)?;
 
         eprintln!("rampiped: loading {}", path.display());
         let load_start = Instant::now();
-        let session =
-            LlamaSession::load(&self.registry, backend, path, Residency::Lazy).with_context(|| format!("loading model {}", path.display()))?;
+        let session = LlamaSession::load(&self.registry, &self.backend, path, Residency::Lazy)
+            .with_context(|| format!("loading model {}", path.display()))?;
         eprintln!("rampiped: loaded {} in {:?} (now {} model(s) resident, {} bytes mapped)",
             path.display(), load_start.elapsed(), self.sessions.len() + 1, self.registry.mapped_bytes());
         self.sessions.insert(path.to_path_buf(), session);
-        Ok(self.sessions.get(path).expect("just inserted"))
+        Ok(())
     }
 
     /// Evicts least-recently-used resident models, one at a time, until
-    /// loading `new_size_bytes` more would stay within budget --
-    /// respects `SwapRegistry::evict`'s own `HandleOutstanding` safety
-    /// check implicitly, since every session's only outstanding handle
-    /// is the one this store itself holds, dropped right before
-    /// eviction.
+    /// loading `new_size_bytes` more would stay within budget. Safe by
+    /// construction, not just by convention: `ensure_loaded` (the only
+    /// caller) already runs inside the one critical section
+    /// `SharedState`'s `Mutex` guards, so nothing else can be mid-`generate()`
+    /// against any resident session while this runs — there is no window
+    /// where a model both has `SwapRegistry::evict`'s `HandleOutstanding`
+    /// check pass *and* is actually in use elsewhere, because "in use"
+    /// only ever happens inside this same lock.
     fn make_room_for(&mut self, path: &Path) -> Result<()> {
         let new_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         loop {
@@ -167,13 +193,19 @@ impl ModelStore {
     }
 }
 
-fn handle_connection(stream: UnixStream, backend: &LlamaBackend, store: &mut ModelStore) -> Result<()> {
+/// Request reading and response writing happen with no lock held —
+/// only `handle_request` (the actual GPU-touching work) takes
+/// `state`'s lock, and only for as long as that one request's turn
+/// takes. A slow-to-send or slow-to-receive client blocks only its own
+/// thread, never another connection's request from being read or
+/// another already-queued request's turn at the lock.
+fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning connection stream")?);
     let mut line = String::new();
     reader.read_line(&mut line).context("reading request")?;
     let request: GenerateRequest = serde_json::from_str(line.trim()).context("decoding request")?;
 
-    let response = match handle_request(backend, store, &request) {
+    let response = match handle_request(state, &request) {
         Ok(response) => response,
         Err(error) => GenerateResponse::Err { message: format!("{error:#}") },
     };
@@ -184,11 +216,17 @@ fn handle_connection(stream: UnixStream, backend: &LlamaBackend, store: &mut Mod
     Ok(())
 }
 
-fn handle_request(backend: &LlamaBackend, store: &mut ModelStore, request: &GenerateRequest) -> Result<GenerateResponse> {
-    let session = store.get_or_load(backend, &request.model_path)?;
+/// The one critical section: locks `state` for exactly as long as it
+/// takes to ensure the requested model is resident (loading/evicting if
+/// needed) and run one generation against it, then releases before
+/// `handle_connection` writes the response.
+fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Result<GenerateResponse> {
+    let mut state = state.lock().expect("rampiped model store lock poisoned");
+    state.ensure_loaded(&request.model_path)?;
+    let session = state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this");
     let sampling = wire_sampling_to_sampling(request.sampling);
     let result = session
-        .generate(backend, &request.prompt, request.max_new_tokens, sampling)
+        .generate(&state.backend, &request.prompt, request.max_new_tokens, sampling)
         .with_context(|| format!("generating against {}", request.model_path.display()))?;
 
     Ok(GenerateResponse::Ok {
@@ -223,7 +261,8 @@ fn main() -> Result<()> {
     // not "no such file" because the socket path didn't exist yet.
     let listener = bind_fresh(&args.socket)?;
     let backend = LlamaBackend::init().context("llama.cpp backend init")?;
-    let mut store = ModelStore::new(args.budget_fraction);
+    let state = Arc::new(Mutex::new(SharedState::new(backend, args.budget_fraction)));
+
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -232,9 +271,12 @@ fn main() -> Result<()> {
                 continue;
             }
         };
-        if let Err(error) = handle_connection(stream, &backend, &mut store) {
-            eprintln!("rampiped: connection error: {error:#}");
-        }
+        let state = Arc::clone(&state);
+        thread::spawn(move || {
+            if let Err(error) = handle_connection(stream, &state) {
+                eprintln!("rampiped: connection error: {error:#}");
+            }
+        });
     }
     Ok(())
 }
