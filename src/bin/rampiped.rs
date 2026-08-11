@@ -216,10 +216,14 @@ fn main() -> Result<()> {
     println!("rampiped: socket {}", args.socket.display());
     println!("rampiped: budget_fraction {}", args.budget_fraction);
 
+    // Bind before backend init, not after: `LlamaBackend::init()` can take
+    // several real seconds on a cold Metal shader cache (observed:
+    // ~10.5s), and a client connecting during that window should see its
+    // connection queue in the kernel accept backlog and then get served,
+    // not "no such file" because the socket path didn't exist yet.
+    let listener = bind_fresh(&args.socket)?;
     let backend = LlamaBackend::init().context("llama.cpp backend init")?;
     let mut store = ModelStore::new(args.budget_fraction);
-
-    let listener = bind_fresh(&args.socket)?;
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
