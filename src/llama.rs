@@ -13,7 +13,14 @@
 
 use crate::{ModelHandle, Residency, SwapMetrics, SwapRegistry};
 use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
+// Re-exported: `LlamaSession::load`/`generate` both take `&LlamaBackend`
+// as a parameter, so any caller constructing one (every caller, since
+// there's no other way to get one) needs to be able to name the type —
+// without this, that means every caller pinning its own direct
+// `llama-cpp-2` dependency just to match whatever version this crate
+// happens to use internally, a leaky-abstraction cost `rampipe` itself
+// is better positioned to absorb than each of its callers repeating it.
+pub use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
@@ -109,6 +116,61 @@ fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
         add_generation_prompt => true,
     };
     tmpl.render(ctx).ok()
+}
+
+/// Silences llama.cpp/ggml's own stderr logging (model-loader tensor
+/// dumps, Metal kernel-compile spam, etc.) and works around a real
+/// upstream llama.cpp/ggml-metal bug, both discovered live wiring up a
+/// caller (brush's `aish` builtin) that talks to this crate in-process:
+///
+/// - llama.cpp logs straight to the process's real stderr by default,
+///   with no hook a caller embedding this crate can filter through its
+///   own output — this replaces ggml's log callback with a no-op.
+/// - Separately, its residency-set collection asserts `count == 0` in
+///   its own process-exit teardown (`ggml_metal_rsets_free`,
+///   `ggml-metal-device.m:656`) — reliably reproduced on Apple Silicon.
+///   Setting `GGML_METAL_NO_RESIDENCY` disables that bookkeeping
+///   entirely, avoiding the assert; it's a GPU scheduling hint, not a
+///   correctness requirement, and the env var is ggml's own documented
+///   escape hatch for it. A no-op on non-macOS builds (the Metal
+///   backend doesn't exist there to read it).
+///
+/// Call this *before* [`LlamaBackend::init`], not after — Metal device
+/// registration (the source of most of the log spam, and the only
+/// thing that reads `GGML_METAL_NO_RESIDENCY`) happens during `init()`
+/// itself, before a `LlamaBackend` value exists for any per-instance
+/// equivalent to act on.
+///
+/// # Safety
+///
+/// Mutates the process environment (`GGML_METAL_NO_RESIDENCY`) via
+/// `std::env::set_var`, which is only sound if nothing else in the
+/// process is concurrently reading or writing the environment. Callers
+/// embedding this crate in-process should call this once, early
+/// (before spawning any threads that might touch the environment
+/// concurrently), the same way `LlamaBackend::init` itself is normally
+/// called once at startup.
+pub unsafe fn suppress_logs() {
+    // Safety: see this function's own `# Safety` section above — the
+    // caller is responsible for the "nothing else touches the
+    // environment concurrently" precondition `std::env::set_var` itself
+    // requires.
+    unsafe {
+        std::env::set_var("GGML_METAL_NO_RESIDENCY", "1");
+    }
+
+    unsafe extern "C" fn void_log(
+        _level: llama_cpp_sys_2::ggml_log_level,
+        _text: *const std::os::raw::c_char,
+        _user_data: *mut std::os::raw::c_void,
+    ) {
+    }
+    // Safety: `void_log` matches `ggml_log_callback`'s required
+    // signature exactly, and a null user-data pointer is valid since
+    // `void_log` never dereferences it.
+    unsafe {
+        llama_cpp_sys_2::llama_log_set(Some(void_log), std::ptr::null_mut());
+    }
 }
 
 /// A model resident in both `rampipe`'s accounting mmap and llama.cpp's
