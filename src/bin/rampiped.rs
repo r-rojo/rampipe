@@ -101,7 +101,7 @@ fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
 /// `Send` is ever required, never `Sync`, and it's never touched from two
 /// threads at once by construction.
 struct SharedState {
-    backend: LlamaBackend,
+    backend: Arc<LlamaBackend>,
     registry: SwapRegistry,
     sessions: HashMap<PathBuf, LlamaSession>,
     budget_fraction: f64,
@@ -109,7 +109,7 @@ struct SharedState {
 
 impl SharedState {
     fn new(backend: LlamaBackend, budget_fraction: f64) -> Self {
-        Self { backend, registry: SwapRegistry::new(), sessions: HashMap::new(), budget_fraction }
+        Self { backend: Arc::new(backend), registry: SwapRegistry::new(), sessions: HashMap::new(), budget_fraction }
     }
 
     /// Ensures `path` is resident in `self.sessions`, loading it (and
@@ -137,7 +137,7 @@ impl SharedState {
 
         eprintln!("rampiped: loading {}", path.display());
         let load_start = Instant::now();
-        let session = LlamaSession::load(&self.registry, &self.backend, path, Residency::Lazy)
+        let session = LlamaSession::load(&self.registry, Arc::clone(&self.backend), path, Residency::Lazy)
             .with_context(|| format!("loading model {}", path.display()))?;
         eprintln!("rampiped: loaded {} in {:?} (now {} model(s) resident, {} bytes mapped)",
             path.display(), load_start.elapsed(), self.sessions.len() + 1, self.registry.mapped_bytes());
@@ -224,7 +224,7 @@ fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Resu
     let session = state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this");
     let sampling = wire_sampling_to_sampling(request.sampling);
     let result = session
-        .generate(&state.backend, &request.prompt, request.max_new_tokens, sampling)
+        .generate(&request.prompt, request.max_new_tokens, sampling)
         .with_context(|| format!("generating against {}", request.model_path.display()))?;
 
     Ok(GenerateResponse::Ok {

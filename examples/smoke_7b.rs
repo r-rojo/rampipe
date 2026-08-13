@@ -44,12 +44,12 @@ fn main() -> Result<()> {
     println!("Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (~4.7GB, cached after first run)...");
     let model_path = download_model()?;
 
-    let backend = llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?;
+    let backend = std::sync::Arc::new(llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?);
     let registry = SwapRegistry::new();
 
     println!("Loading (Residency::Prefault)...");
     let load_start = Instant::now();
-    let session = LlamaSession::load(&registry, &backend, &model_path, Residency::Prefault)
+    let session = LlamaSession::load(&registry, backend, &model_path, Residency::Prefault)
         .context("loading 7B session")?;
     let load_wall_time = load_start.elapsed();
 
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         println!("\n=== {label} ===");
         let gen_start = Instant::now();
         let result = session
-            .generate(&backend, prompt, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy)
+            .generate(prompt, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy)
             .with_context(|| format!("generating for {label}"))?;
         let total_wall_time = gen_start.elapsed();
         let tok_per_sec = result.tokens_generated as f64 / total_wall_time.as_secs_f64().max(f64::EPSILON);

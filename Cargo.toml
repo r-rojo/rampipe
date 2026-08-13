@@ -35,7 +35,7 @@ name = "smoke_7b"
 required-features = ["llama"]
 
 [[example]]
-name = "determinism_probe"
+name = "chat_smoke"
 required-features = ["llama"]
 
 [[bin]]

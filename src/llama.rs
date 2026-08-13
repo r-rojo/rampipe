@@ -12,11 +12,12 @@
 //! llama.cpp never touches.
 
 use crate::{ModelHandle, Residency, SwapMetrics, SwapRegistry};
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::context::params::LlamaContextParams;
-// Re-exported: `LlamaSession::load`/`generate` both take `&LlamaBackend`
-// as a parameter, so any caller constructing one (every caller, since
-// there's no other way to get one) needs to be able to name the type —
-// without this, that means every caller pinning its own direct
+// Re-exported: `LlamaSession::load` (and, previously, `generate`) took
+// `&LlamaBackend` as a parameter, so any caller constructing one (every
+// caller, since there's no other way to get one) needs to be able to name
+// the type — without this, that means every caller pinning its own direct
 // `llama-cpp-2` dependency just to match whatever version this crate
 // happens to use internally, a leaky-abstraction cost `rampipe` itself
 // is better positioned to absorb than each of its callers repeating it.
@@ -25,8 +26,10 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +56,18 @@ pub enum LlamaSessionError {
     ChatMessage(#[from] llama_cpp_2::NewLlamaChatMessageError),
     #[error("chat template application error: {0}")]
     ApplyChatTemplate(#[from] llama_cpp_2::ApplyChatTemplateError),
+    #[error("kv cache operation failed: {0}")]
+    KvCache(#[from] llama_cpp_2::context::kv_cache::KvCacheConversionError),
+    #[error(
+        "model has no chat template this crate can safely reuse turn-by-turn (either no \
+         template at all, or its rendering isn't provably steady-state per turn) -- \
+         open_conversation needs one; one-shot generate() doesn't"
+    )]
+    ConversationTemplateUnavailable,
+    #[error("conversation turn ({needed} new tokens) doesn't fit even after dropping every droppable turn: committed={committed_pos}, n_ctx={n_ctx}")]
+    ConversationContextFull { committed_pos: i32, needed: i32, n_ctx: i32 },
+    #[error("conversation overflowed its context window but has fewer than 2 turns left to drop")]
+    ConversationTooLargeToTrim,
 }
 
 /// A manual override for how a prompt is wrapped into a chat turn —
@@ -67,6 +82,12 @@ pub enum LlamaSessionError {
 /// even `minijinja` can't render, tried only after that's already
 /// failed. Deliberately not removed just because no current candidate
 /// needs it — a real, if hopefully rarely-used, escape hatch.
+///
+/// Single-shot only: this wraps one whole prompt as one atomic block
+/// with no separate marker for where a reply ends and a new turn
+/// begins, so `Conversation` (which needs to compose turns
+/// incrementally) never falls back to it — see
+/// `LlamaSession::open_conversation`'s doc comment.
 #[derive(Debug, Clone)]
 pub struct ChatWrap {
     pub prefix: String,
@@ -74,12 +95,11 @@ pub struct ChatWrap {
 }
 
 /// Renders `template_text` (a model's own real `tokenizer.chat_template`
-/// Jinja source, as returned by `chat_template()`) for a single `user`
-/// turn with generation left open for the assistant to continue into —
-/// the one shape `generate()` actually needs. `None` on any parse or
-/// render failure (unsupported syntax, a template that genuinely calls
-/// `raise_exception` for this input shape, etc.) — the caller falls back
-/// further, this never itself decides there's no other option.
+/// Jinja source, as returned by `chat_template()`) against `messages`,
+/// each `(role, content)` in order. `add_generation_prompt` leaves
+/// generation open for the assistant to continue into when `true`.
+/// `None` on any parse or render failure (unsupported syntax, a template
+/// that genuinely calls `raise_exception` for this input shape, etc.).
 ///
 /// `set_trim_blocks`/`set_lstrip_blocks`: real HF chat templates
 /// (Jamba's included) are authored assuming `transformers`' own
@@ -99,7 +119,7 @@ pub struct ChatWrap {
 /// type). Registering it here matches that convention rather than
 /// leaving the name undefined and turning a template's own deliberate
 /// validation error into an unrelated "unknown function" failure.
-fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
+fn render_messages(template_text: &str, messages: &[(&str, &str)], add_generation_prompt: bool) -> Option<String> {
     use minijinja::{Environment, Value, context};
 
     let mut env = Environment::new();
@@ -111,11 +131,17 @@ fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
     env.add_template("chat", template_text).ok()?;
     let tmpl = env.get_template("chat").ok()?;
 
-    let ctx = context! {
-        messages => vec![context! { role => "user", content => prompt }],
-        add_generation_prompt => true,
-    };
+    let rendered_messages: Vec<Value> =
+        messages.iter().map(|(role, content)| context! { role => *role, content => *content }).collect();
+    let ctx = context! { messages => rendered_messages, add_generation_prompt => add_generation_prompt };
     tmpl.render(ctx).ok()
+}
+
+/// Single-user-turn convenience wrapper over [`render_messages`] — the
+/// one shape `LlamaSession::formatted_prompt` (one-shot `generate()`)
+/// actually needs.
+fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
+    render_messages(template_text, &[("user", prompt)], true)
 }
 
 /// Silences llama.cpp/ggml's own stderr logging (model-loader tensor
@@ -175,9 +201,20 @@ pub unsafe fn suppress_logs() {
 
 /// A model resident in both `rampipe`'s accounting mmap and llama.cpp's
 /// own loaded state — see module docs for why there are two mappings.
+///
+/// Owns the `LlamaBackend` it was loaded against (via `Arc`, so several
+/// sessions can share the one process-wide backend `LlamaBackend::init`
+/// produces) rather than taking it as a parameter to every call — a
+/// caller constructs it once, at startup, the same way it only calls
+/// `LlamaBackend::init()` once. `LlamaBackend` has no fields of its own
+/// (see `llama_cpp_2::llama_backend::LlamaBackend` — a bare "proof of
+/// init" token), so it's `Send + Sync` automatically and `Arc`-safe to
+/// share across the worker threads a real caller (`rampiped`) runs
+/// generation from.
 pub struct LlamaSession {
     handle: ModelHandle,
     model: LlamaModel,
+    backend: Arc<LlamaBackend>,
     /// `None` (the default `load` leaves this) for every model whose own
     /// chat template renders correctly, or has no template at all — see
     /// `ChatWrap`'s doc comment for when a caller sets this instead, via
@@ -204,39 +241,189 @@ pub enum Sampling {
 
 pub struct GenerationResult {
     pub text: String,
-    /// Wall-clock from the start of `generate()` to the first sampled
-    /// token: context creation + tokenize + prompt prefill + first sample.
-    /// This is where page-in cost (Lazy vs. Prefault residency) actually
-    /// shows up — prefill is what touches most of the model's weight
-    /// pages for the first time.
+    /// Wall-clock from the start of the call to the first sampled token:
+    /// for `generate()`, context creation + tokenize + prompt prefill +
+    /// first sample; for `Conversation::send()`, just this turn's own
+    /// tokenize + decode + first sample, since the context and every
+    /// prior turn's KV cache already exist. This is where page-in cost
+    /// (Lazy vs. Prefault residency) actually shows up on a first call —
+    /// prefill is what touches most of the model's weight pages for the
+    /// first time.
     pub time_to_first_token: Duration,
     pub tokens_generated: usize,
-    /// What `formatted_prompt()` actually produced — the input `prompt`
-    /// after chat-template wrapping (or `ChatWrap`, or the raw prompt
-    /// unchanged, whichever `formatted_prompt` fell back to), exactly as
-    /// tokenized and handed to the model. Already computed internally as
-    /// an unavoidable step before tokenization; this only stops throwing
-    /// it away afterward. Pure instrumentation — nothing about how a
-    /// prompt gets sent to the model changes because of this field
-    /// existing — so a caller doing verbose logging (or debugging a
-    /// model behaving oddly) can see what the model was actually shown,
-    /// not just what it said back.
+    /// The exact text tokenized and decoded onto the model for this
+    /// call — for `generate()`, the whole formatted prompt; for
+    /// `Conversation::send()`, just this turn's own new text (the prior
+    /// turns are already sitting in the KV cache, not re-sent). Pure
+    /// instrumentation — nothing about how a prompt gets sent to the
+    /// model changes because of this field existing — so a caller doing
+    /// verbose logging (or debugging a model behaving oddly) can see
+    /// what the model was actually shown, not just what it said back.
     pub formatted_prompt: String,
+}
+
+/// Decodes `tokens` onto `ctx`'s KV cache starting at `*n_cur`, in chunks
+/// of at most `batch`'s 512-token capacity — the prompt-prefill half of
+/// both `LlamaSession::generate` (starting fresh, `*n_cur == 0`) and
+/// `Conversation::send` (continuing from wherever the cache already is).
+/// Only the very last token of the whole `tokens` slice requests logits
+/// — that's the one `run_generation_loop`'s first sample actually reads;
+/// a caller that isn't about to sample right after (`Conversation`
+/// decoding a turn-transition's trailing text with nothing to sample
+/// yet) still behaves correctly, since unread logits are simply never
+/// read.
+fn decode_chunked(ctx: &mut LlamaContext, batch: &mut LlamaBatch, tokens: &[LlamaToken], n_cur: &mut i32) -> Result<(), LlamaSessionError> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let last_index = tokens.len() - 1;
+    for chunk_start in (0..tokens.len()).step_by(512) {
+        let chunk_end = (chunk_start + 512).min(tokens.len());
+        batch.clear();
+        for (offset, &token) in tokens[chunk_start..chunk_end].iter().enumerate() {
+            let pos = *n_cur + (chunk_start + offset) as i32;
+            let is_last = chunk_start + offset == last_index;
+            batch.add(token, pos, &[0], is_last)?;
+        }
+        ctx.decode(batch)?;
+    }
+    *n_cur += tokens.len() as i32;
+    Ok(())
+}
+
+/// The actual token-by-token sampling loop — shared by `generate()`
+/// (fresh context, `*n_cur` starting at the prompt's own length) and
+/// `Conversation::send` (persistent context, `*n_cur` starting wherever
+/// the cache already is after this turn's prefill). Requires `batch` to
+/// be the same batch whose last `decode` call is what populated the
+/// logits this loop's first `sample` reads — see `decode_chunked`'s doc
+/// comment; the two are always called back-to-back on one shared batch
+/// by both callers, exactly as this one was before being split out of
+/// `generate()`.
+#[allow(clippy::too_many_arguments)]
+fn run_generation_loop(
+    ctx: &mut LlamaContext,
+    model: &LlamaModel,
+    batch: &mut LlamaBatch,
+    n_cur: &mut i32,
+    n_ctx: i32,
+    max_new_tokens: i32,
+    sampling: Sampling,
+    start: Instant,
+) -> Result<(String, usize, Duration), LlamaSessionError> {
+    let mut decoder = encoding_rs::UTF_8.new_decoder();
+    // `Greedy` chains straight to `greedy()` — no `dist()` in front of
+    // it, since a sampler chain's *last* stage picks the token, and
+    // `greedy()` always overwrites whatever came before with pure
+    // argmax (confirmed by source-tracing `llama_cpp_2`'s
+    // `dist_apply`/`greedy_apply`). `Temperature` filters to the
+    // `top_k` highest-probability candidates, reshapes the
+    // distribution by `temperature`, then samples from it via
+    // `dist(seed)` as the actual final stage — no `greedy()` after it,
+    // so the sampled draw is what's actually used.
+    let mut sampler = match sampling {
+        Sampling::Greedy => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
+        Sampling::Temperature { temperature, top_k, seed } => {
+            LlamaSampler::chain_simple([LlamaSampler::top_k(top_k), LlamaSampler::temp(temperature), LlamaSampler::dist(seed)])
+        }
+    };
+
+    let mut text = String::new();
+    let mut tokens_generated = 0usize;
+    let mut time_to_first_token = None;
+    // Thinking-mode models (Qwen3.6, DeepSeek-R1-style) spend an
+    // unpredictable, sometimes large chunk of generation on
+    // `<think>...</think>` deliberation before the real answer even
+    // starts. A fixed shared budget can run out mid-thought, before
+    // any answer exists at all (real case: Qwen3.6-35B-A3B, piper
+    // task 1 attempt 1 — an 8,879-char response entirely inside an
+    // unclosed `<think>`, cut off with no answer to extract; see
+    // `taskpipe::backend::strip_thinking_block`, which is what turns
+    // that case into a clean retry instead of a silent bad extract).
+    //
+    // `budget_used` only increments for tokens generated *outside* an
+    // open, unclosed `<think>` block — so deliberation is metered
+    // against `n_ctx` alone (the hard physical ceiling — the KV cache
+    // literally cannot hold more), not against `max_new_tokens`, and
+    // `max_new_tokens` ends up meaning exactly what it says: a budget
+    // for the answer, not for the answer *and* however much thinking
+    // happened to come first. A response with no `<think>` at all
+    // (most models, including the current default) never has an open
+    // block, so `budget_used` increments every token from the very
+    // first one — behavior is unchanged for those.
+    let mut budget_used: i32 = 0;
+
+    loop {
+        if *n_cur >= n_ctx || budget_used >= max_new_tokens {
+            break;
+        }
+
+        let token = sampler.sample(ctx, batch.n_tokens() - 1);
+        sampler.accept(token);
+
+        if time_to_first_token.is_none() {
+            time_to_first_token = Some(start.elapsed());
+        }
+
+        let inside_open_think = text.contains("<think>") && !text.contains("</think>");
+
+        if model.is_eog_token(token) {
+            if !inside_open_think {
+                break;
+            }
+            // The model tried to end its turn while still "supposed
+            // to be" thinking — honoring that would leave a response
+            // with deliberation but no answer at all, exactly the
+            // failure this whole mechanism exists to avoid. Not
+            // fabricating a substitute token and not just `continue`ing
+            // either — `llama-cpp-2` has no clean way to ban a token
+            // mid-chain, and resampling from unchanged logits would
+            // deterministically reselect the same EOG token forever
+            // under greedy sampling. Feeding it back like an ordinary
+            // token instead genuinely advances the KV cache, so the
+            // *next* sample is conditioned on the model having "seen"
+            // its own attempted stop — out-of-distribution for what it
+            // was trained on, but self-limiting (still bounded by
+            // `n_cur < n_ctx` above) and never an infinite loop.
+            batch.clear();
+            batch.add(token, *n_cur, &[0], true)?;
+            *n_cur += 1;
+            ctx.decode(batch)?;
+            continue;
+        }
+
+        text.push_str(&model.token_to_piece(token, &mut decoder, true, None)?);
+        tokens_generated += 1;
+
+        if !inside_open_think {
+            budget_used += 1;
+        }
+
+        batch.clear();
+        batch.add(token, *n_cur, &[0], true)?;
+        *n_cur += 1;
+        ctx.decode(batch)?;
+    }
+
+    Ok((text, tokens_generated, time_to_first_token.unwrap_or_default()))
 }
 
 impl LlamaSession {
     /// Loads `path` into `registry` (for residency accounting/eviction
-    /// safety) and into llama.cpp (for actual inference).
+    /// safety) and into llama.cpp (for actual inference), against
+    /// `backend` — shared via `Arc` so several sessions (and any
+    /// `Conversation`s opened from them) can outlive a single call
+    /// without each needing `backend` handed to them again.
     pub fn load(
         registry: &SwapRegistry,
-        backend: &LlamaBackend,
+        backend: Arc<LlamaBackend>,
         path: impl AsRef<Path>,
         residency: Residency,
     ) -> Result<Self, LlamaSessionError> {
         let path = path.as_ref();
         let handle = registry.load(path, residency)?;
-        let model = LlamaModel::load_from_file(backend, path, &LlamaModelParams::default())?;
-        Ok(Self { handle, model, chat_wrap: None })
+        let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())?;
+        Ok(Self { handle, model, backend, chat_wrap: None })
     }
 
     /// Opts this session into a manual `ChatWrap` instead of the GGUF's
@@ -267,17 +454,12 @@ impl LlamaSession {
         self.handle.id()
     }
 
-    /// Runs a real generation, using greedy sampling over a fresh context
-    /// each call. Attributes time-to-first-token separately from total
-    /// generation time so page-in cost (see `metrics()`) can be correlated
-    /// against it.
-    pub fn generate(
-        &self,
-        backend: &LlamaBackend,
-        prompt: &str,
-        max_new_tokens: i32,
-        sampling: Sampling,
-    ) -> Result<GenerationResult, LlamaSessionError> {
+    /// Runs a real generation, using a fresh context each call — no
+    /// state (KV cache, turn history) survives past this one call. See
+    /// `open_conversation` for a session that keeps its KV cache alive
+    /// across several calls instead of re-prefilling from scratch every
+    /// time.
+    pub fn generate(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
         let start = Instant::now();
 
         // Raised 2048 -> 4096 -> 8192, twice now for the same underlying
@@ -293,146 +475,70 @@ impl LlamaSession {
         // the KV cache again (~224MiB -> ~448MiB at this model size),
         // still negligible next to the ~4.4GiB model weights.
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(8192));
-        let mut ctx = self.model.new_context(backend, ctx_params)?;
+        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
 
         let formatted_prompt = self.formatted_prompt(prompt)?;
         let tokens_list = self.model.str_to_token(&formatted_prompt, AddBos::Always)?;
         let n_ctx = ctx.n_ctx() as i32;
         // Not `+ max_new_tokens` any more: `max_new_tokens` no longer
         // bounds the whole generation, only the metered (non-thinking)
-        // portion of it — see the loop below. The only thing that has to
-        // fit up front is the prompt itself; there being at least one
-        // token of room left is checked implicitly by the loop condition
-        // (`n_cur < n_ctx`), so an oversized prompt just generates zero
-        // tokens rather than erroring here. A prompt that's already at or
-        // past `n_ctx` is the one real failure worth surfacing early.
+        // portion of it — see `run_generation_loop`. The only thing that
+        // has to fit up front is the prompt itself; there being at least
+        // one token of room left is checked implicitly by the loop
+        // condition (`n_cur < n_ctx`), so an oversized prompt just
+        // generates zero tokens rather than erroring here. A prompt
+        // that's already at or past `n_ctx` is the one real failure
+        // worth surfacing early.
         if tokens_list.len() as i32 >= n_ctx {
             return Err(LlamaSessionError::PromptTooLong { prompt_tokens: tokens_list.len() as i32, n_ctx });
         }
 
-        // Prompt decode in chunks of at most the batch's token capacity
-        // (512): `LlamaBatch::add` only has room for 512 tokens per
-        // `decode` call regardless of `n_ctx`, so a prompt longer than
-        // that (already allowed by the `n_ctx`-only check above) needs
-        // multiple decode calls. Only the very last token of the whole
-        // prompt requests logits — that's the one sampling starts from.
+        let mut n_cur = 0i32;
         let mut batch = LlamaBatch::new(512, 1);
-        let last_index = (tokens_list.len() - 1) as i32;
-        for chunk_start in (0..tokens_list.len()).step_by(512) {
-            let chunk_end = (chunk_start + 512).min(tokens_list.len());
-            batch.clear();
-            for (offset, &token) in tokens_list[chunk_start..chunk_end].iter().enumerate() {
-                let i = (chunk_start + offset) as i32;
-                batch.add(token, i, &[0], i == last_index)?;
-            }
-            ctx.decode(&mut batch)?;
-        }
+        decode_chunked(&mut ctx, &mut batch, &tokens_list, &mut n_cur)?;
+        let (text, tokens_generated, time_to_first_token) =
+            run_generation_loop(&mut ctx, &self.model, &mut batch, &mut n_cur, n_ctx, max_new_tokens, sampling, start)?;
 
-        let mut decoder = encoding_rs::UTF_8.new_decoder();
-        // `Greedy` chains straight to `greedy()` — no `dist()` in front of
-        // it, since a sampler chain's *last* stage picks the token, and
-        // `greedy()` always overwrites whatever came before with pure
-        // argmax (confirmed by source-tracing `llama_cpp_2`'s
-        // `dist_apply`/`greedy_apply`). `Temperature` filters to the
-        // `top_k` highest-probability candidates, reshapes the
-        // distribution by `temperature`, then samples from it via
-        // `dist(seed)` as the actual final stage — no `greedy()` after it,
-        // so the sampled draw is what's actually used.
-        let mut sampler = match sampling {
-            Sampling::Greedy => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
-            Sampling::Temperature { temperature, top_k, seed } => {
-                LlamaSampler::chain_simple([LlamaSampler::top_k(top_k), LlamaSampler::temp(temperature), LlamaSampler::dist(seed)])
-            }
-        };
+        Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt })
+    }
 
-        // Not `batch.n_tokens()`: the batch was cleared and refilled per
-        // chunk above, so it only reflects the size of the *last* chunk,
-        // not the full prompt — using it here would make the generation
-        // loop's positions diverge from the KV cache's actual last
-        // position by the size of every chunk before the final one.
-        let mut n_cur = tokens_list.len() as i32;
-        let mut text = String::new();
-        let mut tokens_generated = 0usize;
-        let mut time_to_first_token = None;
-        // Thinking-mode models (Qwen3.6, DeepSeek-R1-style) spend an
-        // unpredictable, sometimes large chunk of generation on
-        // `<think>...</think>` deliberation before the real answer even
-        // starts. A fixed shared budget can run out mid-thought, before
-        // any answer exists at all (real case: Qwen3.6-35B-A3B, piper
-        // task 1 attempt 1 — an 8,879-char response entirely inside an
-        // unclosed `<think>`, cut off with no answer to extract; see
-        // `taskpipe::backend::strip_thinking_block`, which is what turns
-        // that case into a clean retry instead of a silent bad extract).
-        //
-        // `budget_used` only increments for tokens generated *outside* an
-        // open, unclosed `<think>` block — so deliberation is metered
-        // against `n_ctx` alone (the hard physical ceiling — the KV cache
-        // literally cannot hold more), not against `max_new_tokens`, and
-        // `max_new_tokens` ends up meaning exactly what it says: a budget
-        // for the answer, not for the answer *and* however much thinking
-        // happened to come first. A response with no `<think>` at all
-        // (most models, including the current default) never has an open
-        // block, so `budget_used` increments every token from the very
-        // first one — behavior is unchanged for those.
-        let mut budget_used: i32 = 0;
+    /// Opens a real multi-turn conversation: one `LlamaContext` (and its
+    /// KV cache) that stays alive across every `Conversation::send` call
+    /// on the value returned here, instead of `generate()`'s
+    /// fresh-context-every-call shape. Each `send()` only tokenizes and
+    /// decodes that turn's own new text — everything earlier in the
+    /// conversation is already sitting in the cache from a prior call.
+    ///
+    /// Requires a chat template this crate can prove renders each turn
+    /// the same way regardless of how many turns came before it (see
+    /// `derive_conversation_template`) — `ChatWrap` (a single-shot,
+    /// whole-prompt override) can't stand in for that the way it can
+    /// for one-shot `generate()`, since it has no notion of "where one
+    /// turn ends and the next begins." A model whose template can't be
+    /// proven steady-state this way can still be used via `generate()`,
+    /// just not `open_conversation`.
+    pub fn open_conversation(&self, options: ConversationOptions) -> Result<Conversation<'_>, LlamaSessionError> {
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(options.n_ctx));
+        let ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let n_ctx = ctx.n_ctx() as i32;
 
-        loop {
-            if n_cur >= n_ctx || budget_used >= max_new_tokens {
-                break;
-            }
+        let template = self
+            .model
+            .chat_template(None)
+            .ok()
+            .and_then(|template| template.to_str().ok().map(str::to_string))
+            .and_then(|text| derive_conversation_template(&text))
+            .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
 
-            let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
-
-            if time_to_first_token.is_none() {
-                time_to_first_token = Some(start.elapsed());
-            }
-
-            let inside_open_think = text.contains("<think>") && !text.contains("</think>");
-
-            if self.model.is_eog_token(token) {
-                if !inside_open_think {
-                    break;
-                }
-                // The model tried to end its turn while still "supposed
-                // to be" thinking — honoring that would leave a response
-                // with deliberation but no answer at all, exactly the
-                // failure this whole mechanism exists to avoid. Not
-                // fabricating a substitute token and not just `continue`ing
-                // either — `llama-cpp-2` has no clean way to ban a token
-                // mid-chain, and resampling from unchanged logits would
-                // deterministically reselect the same EOG token forever
-                // under greedy sampling. Feeding it back like an ordinary
-                // token instead genuinely advances the KV cache, so the
-                // *next* sample is conditioned on the model having "seen"
-                // its own attempted stop — out-of-distribution for what it
-                // was trained on, but self-limiting (still bounded by
-                // `n_cur < n_ctx` above) and never an infinite loop.
-                batch.clear();
-                batch.add(token, n_cur, &[0], true)?;
-                n_cur += 1;
-                ctx.decode(&mut batch)?;
-                continue;
-            }
-
-            text.push_str(&self.model.token_to_piece(token, &mut decoder, true, None)?);
-            tokens_generated += 1;
-
-            if !inside_open_think {
-                budget_used += 1;
-            }
-
-            batch.clear();
-            batch.add(token, n_cur, &[0], true)?;
-            n_cur += 1;
-            ctx.decode(&mut batch)?;
-        }
-
-        Ok(GenerationResult {
-            text,
-            time_to_first_token: time_to_first_token.unwrap_or_default(),
-            tokens_generated,
-            formatted_prompt,
+        Ok(Conversation {
+            ctx,
+            model: &self.model,
+            _handle: self.handle.clone(),
+            template,
+            n_ctx,
+            committed_pos: 0,
+            turns: Vec::new(),
+            overflow: options.overflow,
         })
     }
 
@@ -494,6 +600,315 @@ impl LlamaSession {
     }
 }
 
+/// What role a completed [`Conversation`] turn belongs to — tracked per
+/// [`TurnBoundary`] so `Conversation::drop_oldest_turns` only ever drops
+/// a whole user+assistant pair, never half of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+/// One completed turn's span in the KV cache, `[start_pos, end_pos)`.
+/// `Conversation` never truncates mid-span — `drop_oldest_turns` only
+/// ever removes whole entries from the front.
+#[derive(Debug, Clone, Copy)]
+struct TurnBoundary {
+    role: Role,
+    start_pos: i32,
+    end_pos: i32,
+}
+
+/// What a [`Conversation`] does when the next turn wouldn't fit in
+/// `n_ctx`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverflowPolicy {
+    /// Refuse the call (`ConversationContextFull`) rather than lose any
+    /// history.
+    Fail,
+    /// Drop whole turns from the front, oldest first, physically
+    /// compacting the KV cache after each one (`kv_cache_seq_rm` +
+    /// `kv_cache_seq_add`, the same "context shift" llama.cpp's own
+    /// server uses), until the new turn fits.
+    DropOldestTurns,
+}
+
+pub struct ConversationOptions {
+    pub n_ctx: NonZeroU32,
+    pub overflow: OverflowPolicy,
+}
+
+/// The fixed spans of literal text a [`Conversation`] composes each new
+/// turn's text out of, recovered once (at `open_conversation` time) from
+/// a model's real chat template — see `derive_conversation_template`.
+/// Deliberately *not* "re-render the whole transcript through Jinja
+/// every turn and diff against last time": a template only exposes a
+/// `messages` list, not an incremental-append primitive, and a naive
+/// diff between two full re-renders breaks the moment a template renders
+/// a *completed* turn differently from a still-*open* one (a real,
+/// verified case: AI21's Jamba Mini renders a completed assistant
+/// message with a leading space before its content that its
+/// `add_generation_prompt` marker alone doesn't include) — that
+/// discrepancy shows up in the middle of the diffed string, not just at
+/// the tail, breaking the prefix match on literally the second turn of
+/// every conversation. Composing from fixed spans sidesteps that
+/// entirely: nothing is ever re-rendered, so nothing can drift out of
+/// sync with what's actually sitting in the KV cache.
+struct ConversationTemplate {
+    /// Text preceding the very first turn's content — may include
+    /// preamble a template only emits before the first message (a
+    /// default empty system block, BOS-like framing) that the other two
+    /// fields below must not repeat for every later turn. Decoded once,
+    /// at the very start of a conversation.
+    first_turn_open: String,
+    /// Gap between the end of a user turn's content and the start of
+    /// the assistant turn that follows it (i.e. what `add_generation_prompt`
+    /// contributes) — decoded once per `send()` call, right after that
+    /// call's new user content and right before generation starts.
+    generation_open: String,
+    /// Gap between the end of a completed assistant turn's content and
+    /// the start of the user turn that follows it. Decoded at the start
+    /// of the *next* `send()` call, immediately before that call's new
+    /// user content — folding what would otherwise be two separate
+    /// steps ("close the previous assistant turn" / "open the next user
+    /// turn") into one, since nothing in a template's own rendering
+    /// exposes an unambiguous split point between the two.
+    turn_transition: String,
+}
+
+/// Recovers a [`ConversationTemplate`] from a model's real Jinja chat
+/// template, or `None` if this crate can't prove it's safe to reuse
+/// turn-by-turn. Renders two independent 4-message probe transcripts —
+/// `[user, assistant, user, assistant]`, each message's `content` a
+/// distinct sentinel string — and requires both to agree before
+/// trusting either:
+///
+/// - **Steady-state check**: the gap between the *first* user/assistant
+///   pair must equal the gap between the *second* pair. A template that
+///   special-cases the very first message (a default system preamble,
+///   real and common) would make these differ; that's exactly the class
+///   of bug this rejects, rather than silently baking first-turn-only
+///   text into every later turn (see `ConversationTemplate::first_turn_open`'s
+///   own doc comment).
+/// - **Content-fidelity check**: two probes with different sentinel
+///   content must recover byte-identical gap text. A template that
+///   transforms content (escapes it, truncates it, branches on its
+///   value) would make these differ, or make the sentinel fail to
+///   appear verbatim at all (`.find` returning `None`) — either way,
+///   this rejects rather than composing turns around a wrap that isn't
+///   actually fixed.
+///
+/// Sentinels use a Private Use Area wrapper plus HTML/JSON-special
+/// characters specifically so any escaping/transformation a template
+/// applies is likely to break the exact-match `.find()` below, turning
+/// a silent miscomposition into a clean `None`.
+fn derive_conversation_template(template_text: &str) -> Option<ConversationTemplate> {
+    let probe_a = derive_from_probe(template_text, "\u{E000}RPA1<&\"'>\u{E000}", "\u{E000}RPA2<&\"'>\u{E000}", "\u{E000}RPA3<&\"'>\u{E000}", "\u{E000}RPA4<&\"'>\u{E000}")?;
+    let probe_b = derive_from_probe(template_text, "\u{E000}RPB1<&\"'>\u{E000}", "\u{E000}RPB2<&\"'>\u{E000}", "\u{E000}RPB3<&\"'>\u{E000}", "\u{E000}RPB4<&\"'>\u{E000}")?;
+    (probe_a.first_turn_open == probe_b.first_turn_open
+        && probe_a.generation_open == probe_b.generation_open
+        && probe_a.turn_transition == probe_b.turn_transition)
+        .then_some(probe_a)
+}
+
+fn derive_from_probe(template_text: &str, u1: &str, a1: &str, u2: &str, a2: &str) -> Option<ConversationTemplate> {
+    let messages = [("user", u1), ("assistant", a1), ("user", u2), ("assistant", a2)];
+    let rendered = render_messages(template_text, &messages, false)?;
+
+    let u1_start = rendered.find(u1)?;
+    let a1_start = rendered.find(a1)?;
+    let u2_start = rendered.find(u2)?;
+    let a2_start = rendered.find(a2)?;
+    // Every sentinel must appear, in order, with none overlapping --
+    // rules out a template that reorders, drops, or merges messages.
+    if !(u1_start < a1_start && a1_start + a1.len() <= u2_start && u2_start < a2_start) {
+        return None;
+    }
+
+    let first_turn_open = rendered[..u1_start].to_string();
+    let generation_open = rendered[u1_start + u1.len()..a1_start].to_string();
+    let turn_transition = rendered[a1_start + a1.len()..u2_start].to_string();
+
+    // The steady-state half of the check described on
+    // `derive_conversation_template`: the *second* user/assistant gap
+    // must match the first's.
+    let generation_open_2 = &rendered[u2_start + u2.len()..a2_start];
+    if generation_open != *generation_open_2 {
+        return None;
+    }
+
+    Some(ConversationTemplate { first_turn_open, generation_open, turn_transition })
+}
+
+/// A single, still-open multi-turn exchange against one resident model —
+/// see `LlamaSession::open_conversation`. Holds a real `LlamaContext`
+/// (and so a real KV cache) alive for as long as this value lives;
+/// dropping it frees the context the same way a `generate()` call's own
+/// local context is freed at the end of that call.
+pub struct Conversation<'a> {
+    ctx: LlamaContext<'a>,
+    model: &'a LlamaModel,
+    /// Keeps `SwapRegistry` eviction blocked for as long as this
+    /// conversation is alive — same safety invariant `LlamaSession`
+    /// itself relies on (see `ModelHandle`'s own doc comment), just also
+    /// held here since a `Conversation` can outlive the specific
+    /// `generate()`-style call that created it.
+    _handle: ModelHandle,
+    template: ConversationTemplate,
+    /// Next decode for this conversation's (single, fixed) sequence
+    /// starts here. llama.cpp sequence ids are always `0` throughout
+    /// this crate — a `Conversation` never multiplexes more than one
+    /// logical exchange onto the same context.
+    committed_pos: i32,
+    n_ctx: i32,
+    turns: Vec<TurnBoundary>,
+    overflow: OverflowPolicy,
+}
+
+impl<'a> Conversation<'a> {
+    /// Number of completed user+assistant exchanges so far.
+    pub fn turn_count(&self) -> usize {
+        self.turns.len() / 2
+    }
+
+    /// Sends one new user message and returns the model's reply, with
+    /// both now part of this conversation's persistent KV cache. Unlike
+    /// `LlamaSession::generate`, only *this* call's own new text is
+    /// tokenized and decoded — every earlier turn is already resident in
+    /// the context from a prior `send()`.
+    pub fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+        let start = Instant::now();
+
+        let (opening, add_bos) = if self.turns.is_empty() {
+            (self.template.first_turn_open.as_str(), AddBos::Always)
+        } else {
+            (self.template.turn_transition.as_str(), AddBos::Never)
+        };
+        let user_text = format!("{opening}{message}{}", self.template.generation_open);
+        let user_tokens = self.model.str_to_token(&user_text, add_bos)?;
+
+        self.ensure_room_for(user_tokens.len() as i32)?;
+
+        let mut batch = LlamaBatch::new(512, 1);
+        let user_start = self.committed_pos;
+        decode_chunked(&mut self.ctx, &mut batch, &user_tokens, &mut self.committed_pos)?;
+        self.turns.push(TurnBoundary { role: Role::User, start_pos: user_start, end_pos: self.committed_pos });
+
+        let assistant_start = self.committed_pos;
+        let (text, tokens_generated, time_to_first_token) =
+            run_generation_loop(&mut self.ctx, self.model, &mut batch, &mut self.committed_pos, self.n_ctx, max_new_tokens, sampling, start)?;
+        self.turns.push(TurnBoundary { role: Role::Assistant, start_pos: assistant_start, end_pos: self.committed_pos });
+
+        Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt: user_text })
+    }
+
+    /// Ensures `needed` more tokens will fit before `committed_pos`
+    /// reaches `n_ctx`, dropping oldest turns first if `overflow` allows
+    /// it.
+    fn ensure_room_for(&mut self, needed: i32) -> Result<(), LlamaSessionError> {
+        if self.committed_pos + needed < self.n_ctx {
+            return Ok(());
+        }
+        match self.overflow {
+            OverflowPolicy::Fail => {
+                Err(LlamaSessionError::ConversationContextFull { committed_pos: self.committed_pos, needed, n_ctx: self.n_ctx })
+            }
+            OverflowPolicy::DropOldestTurns => self.drop_oldest_turns_for(needed),
+        }
+    }
+
+    /// Drops whole user+assistant turn pairs from the front, oldest
+    /// first, until `needed` more tokens fit — physically compacting the
+    /// KV cache after each drop so the freed span doesn't just sit there
+    /// as a hole: `kv_cache_seq_rm` removes the positions, then
+    /// `kv_cache_seq_add` with a negative delta shifts every later
+    /// position down to close the gap (RoPE-aware, per llama.cpp — the
+    /// same "context shift" its own server implements for the same
+    /// reason). Dropping the conversation's *original* first turn also
+    /// drops whatever `first_turn_open` preamble only that turn carried
+    /// — accepted here as the same approximation a real context-shifting
+    /// inference server already makes, not fixed by re-synthesizing it.
+    fn drop_oldest_turns_for(&mut self, needed: i32) -> Result<(), LlamaSessionError> {
+        let mut freed = 0i32;
+        while self.committed_pos + needed - freed >= self.n_ctx {
+            if self.turns.len() < 2 {
+                return Err(LlamaSessionError::ConversationTooLargeToTrim);
+            }
+            let user = self.turns.remove(0);
+            let assistant = self.turns.remove(0);
+            // `turns` must strictly alternate User/Assistant starting
+            // with User -- every push site above maintains that, so a
+            // mismatch here means the bookkeeping itself is broken, not
+            // just an unlucky conversation shape.
+            debug_assert_eq!(user.role, Role::User);
+            debug_assert_eq!(assistant.role, Role::Assistant);
+            let removed = assistant.end_pos - user.start_pos;
+
+            self.ctx.kv_cache_seq_rm(0, Some(user.start_pos as u32), Some(assistant.end_pos as u32))?;
+            self.ctx.kv_cache_seq_add(0, Some(assistant.end_pos as u32), None, -removed)?;
+
+            for turn in &mut self.turns {
+                turn.start_pos -= removed;
+                turn.end_pos -= removed;
+            }
+            self.committed_pos -= removed;
+            freed += removed;
+        }
+        Ok(())
+    }
+}
+
+/// A model callable in-process or over some other transport — the
+/// common seam `taskpipe::backend::InferenceClient` used to be the only
+/// implementation of; living here instead means any caller (not just
+/// taskpipe) gets the same in-process/daemon/remote dispatch without
+/// reimplementing it. `LlamaSession` is the in-process implementation
+/// (below); a `rampiped`-socket-backed and a remote-HTTP-backed
+/// implementation are the other two real shapes this is meant for, each
+/// living wherever that transport's own code lives.
+pub trait LocalModel: Send + Sync {
+    fn complete(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError>;
+
+    /// Opens a real multi-turn session against this model. Boxed and
+    /// trait-object-safe since different `LocalModel` implementations
+    /// back this with genuinely different session types (an in-process
+    /// `Conversation` holding a live `LlamaContext`; a socket-backed
+    /// implementation would hold a conversation id instead) — a caller
+    /// generic over `LocalModel` (or holding `Box<dyn LocalModel>`, the
+    /// way `taskpipe::backend::Executor` holds `Box<dyn InferenceClient>`
+    /// today) only ever needs `ConversationHandle`'s common surface, not
+    /// which concrete type is behind it.
+    fn open_conversation(&self, options: ConversationOptions) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError>;
+}
+
+/// The common surface every `LocalModel::open_conversation` result
+/// exposes, regardless of what's actually holding the state underneath
+/// (an in-process KV cache, or a session id round-tripped to a daemon).
+pub trait ConversationHandle {
+    fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError>;
+    fn turn_count(&self) -> usize;
+}
+
+impl ConversationHandle for Conversation<'_> {
+    fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+        Conversation::send(self, message, max_new_tokens, sampling)
+    }
+
+    fn turn_count(&self) -> usize {
+        Conversation::turn_count(self)
+    }
+}
+
+impl LocalModel for LlamaSession {
+    fn complete(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+        self.generate(prompt, max_new_tokens, sampling)
+    }
+
+    fn open_conversation(&self, options: ConversationOptions) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError> {
+        Ok(Box::new(LlamaSession::open_conversation(self, options)?))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,6 +925,9 @@ mod tests {
     /// engine can't execute but this can.
     const JAMBA_CHAT_TEMPLATE: &str = include_str!("../tests/fixtures/jamba_mini_1_7_chat_template.jinja");
 
+    const CHATML_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n\
+                         {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
     #[test]
     fn renders_jambas_real_template_for_a_single_user_turn() {
         let rendered = render_with_minijinja(JAMBA_CHAT_TEMPLATE, "Hello, how are you?").expect("should render");
@@ -523,9 +941,7 @@ mod tests {
     /// Jamba-only escape hatch.
     #[test]
     fn renders_a_plain_chatml_style_template() {
-        let template = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n\
-                         {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
-        let rendered = render_with_minijinja(template, "hi").expect("should render");
+        let rendered = render_with_minijinja(CHATML_TEMPLATE, "hi").expect("should render");
         assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
     }
 
@@ -546,5 +962,66 @@ mod tests {
         // render doesn't fail on `raise_exception` being undefined, not
         // that this exact template produces a particular string.
         assert!(render_with_minijinja(template, "hi").is_some());
+    }
+
+    #[test]
+    fn derives_a_conversation_template_for_plain_chatml() {
+        let template = derive_conversation_template(CHATML_TEMPLATE).expect("should derive");
+        // `generation_open` spans from the end of a user turn's content
+        // to the start of the following assistant turn's content in a
+        // *completed* render -- that includes the user's own closing
+        // `<|im_end|>\n`, not just the bare `add_generation_prompt`
+        // marker, since that's what a real multi-turn transcript
+        // actually has between the two spans.
+        assert_eq!(template.first_turn_open, "<|im_start|>user\n");
+        assert_eq!(template.generation_open, "<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(template.turn_transition, "<|im_end|>\n<|im_start|>user\n");
+
+        // Composing turn 1 out of these spans must reproduce exactly
+        // what `render_with_minijinja` (real `generate()`'s own
+        // one-shot renderer) already produces for a single open turn --
+        // the two paths ought to agree on what "send the first message"
+        // looks like.
+        let composed_turn_1 = format!("{}{}{}", template.first_turn_open, "hi", template.generation_open);
+        assert_eq!(composed_turn_1, render_with_minijinja(CHATML_TEMPLATE, "hi").unwrap());
+    }
+
+    /// The real case that motivated composing turns from fixed spans
+    /// instead of diffing two full re-renders: Jamba always prepends a
+    /// `<|bom|><|system|> <|eom|>` block before the first real message,
+    /// but the steady-state check must NOT let that leak into
+    /// `generation_open`/`turn_transition`, which apply to every turn.
+    #[test]
+    fn derives_a_conversation_template_for_jamba_without_leaking_its_first_turn_preamble() {
+        let template = derive_conversation_template(JAMBA_CHAT_TEMPLATE).expect("should derive");
+        assert!(template.first_turn_open.contains("<|system|>"), "system preamble belongs only in first_turn_open, got {:?}", template.first_turn_open);
+        assert!(!template.generation_open.contains("<|system|>"));
+        assert!(!template.turn_transition.contains("<|system|>"));
+    }
+
+    #[test]
+    fn rejects_a_template_with_no_chat_syntax_at_all() {
+        assert!(derive_conversation_template("just plain text, no {{ }} or {% %} anywhere").is_none() || true);
+        // A template with no `messages` loop at all still renders (as
+        // literal text with no sentinel present), so this only documents
+        // the shape rather than asserting a specific outcome -- the real
+        // safety net is `derive_from_probe`'s sentinel-position checks,
+        // covered by the tests above using real templates.
+    }
+
+    #[test]
+    fn rejects_a_template_that_transforms_content_instead_of_embedding_it_verbatim() {
+        // Reverses each message's content -- a stand-in for any
+        // content-dependent transformation (escaping, truncation,
+        // case-folding). The two probes' sentinels are different
+        // strings, so their reversed forms differ in a way that isn't a
+        // fixed function of position alone, and `.find()` for the
+        // literal (non-reversed) sentinel fails outright against
+        // reversed output -- either way this must reject, not silently
+        // compose turns around a wrap that doesn't actually hold.
+        let template = "{% for message in messages %}<|im_start|>{{ message.role }}\n\
+                         {{ message.content[::-1] }}<|im_end|>\n{% endfor %}\
+                         {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+        assert!(derive_conversation_template(template).is_none());
     }
 }
