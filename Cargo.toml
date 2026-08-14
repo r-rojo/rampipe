@@ -39,6 +39,10 @@ name = "chat_smoke"
 required-features = ["llama"]
 
 [[example]]
+name = "session_persistence_smoke"
+required-features = ["llama"]
+
+[[example]]
 name = "grammar_smoke"
 required-features = ["llama"]
 

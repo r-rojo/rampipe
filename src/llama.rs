@@ -28,7 +28,7 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,24 @@ pub enum LlamaSessionError {
     ConversationTooLargeToTrim,
     #[error("grammar error: {0}")]
     Grammar(#[from] llama_cpp_2::GrammarError),
+    #[error("saving conversation state: {0}")]
+    SaveState(#[from] llama_cpp_2::context::session::SaveSessionError),
+    #[error("loading conversation state: {0}")]
+    LoadState(#[from] llama_cpp_2::context::session::LoadSessionError),
+    #[error("conversation snapshot metadata (de)serialization: {0}")]
+    SnapshotMeta(#[from] serde_json::Error),
+    #[error("conversation snapshot file I/O: {0}")]
+    SnapshotIo(#[from] std::io::Error),
+    /// Fail-closed rejection when a saved snapshot's own recorded model
+    /// path doesn't match the session it's being reloaded against — a
+    /// state file's KV cache bytes are tied to one specific model's
+    /// architecture/quantization/`n_ctx` (llama.cpp itself will reject a
+    /// mismatch on shape, but a *different model at the same path*, or
+    /// the same model moved to a different path, wouldn't necessarily
+    /// trip that check before doing something worse) -- caught here,
+    /// before ever calling into llama.cpp's own loader.
+    #[error("saved conversation snapshot is for model {saved}, but this session is {current}")]
+    SnapshotModelMismatch { saved: std::path::PathBuf, current: std::path::PathBuf },
 }
 
 /// A manual override for how a prompt is wrapped into a chat turn —
@@ -314,7 +332,7 @@ fn run_generation_loop(
     grammar: Option<&str>,
     grammar_complete: Option<&dyn Fn(&str) -> bool>,
     start: Instant,
-) -> Result<(String, usize, Duration), LlamaSessionError> {
+) -> Result<(String, Vec<LlamaToken>, Duration), LlamaSessionError> {
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     // `Greedy` chains straight to `greedy()` — no `dist()` in front of
     // it, since a sampler chain's *last* stage picks the token, and
@@ -369,7 +387,15 @@ fn run_generation_loop(
     let mut accepted_tokens: Vec<LlamaToken> = Vec::new();
 
     let mut text = String::new();
-    let mut tokens_generated = 0usize;
+    // Every token actually fed back into the KV cache via `ctx.decode`
+    // below, in order -- including the thinking-mode self-feed branch's
+    // own EOG token, which never touches `text` at all. Needs to be
+    // exactly what's physically in the cache, not just what counted as
+    // "real" generated content, so a caller can later hand this to
+    // `LlamaContext::state_save_file` (which pairs a saved KV cache with
+    // the token sequence that produced it) without the two silently
+    // disagreeing.
+    let mut generated_tokens: Vec<LlamaToken> = Vec::new();
     let mut time_to_first_token = None;
     // Thinking-mode models (Qwen3.6, DeepSeek-R1-style) spend an
     // unpredictable, sometimes large chunk of generation on
@@ -444,11 +470,11 @@ fn run_generation_loop(
             batch.add(token, *n_cur, &[0], true)?;
             *n_cur += 1;
             ctx.decode(batch)?;
+            generated_tokens.push(token);
             continue;
         }
 
         text.push_str(&model.token_to_piece(token, &mut decoder, true, None)?);
-        tokens_generated += 1;
 
         if !inside_open_think {
             budget_used += 1;
@@ -478,9 +504,10 @@ fn run_generation_loop(
         batch.add(token, *n_cur, &[0], true)?;
         *n_cur += 1;
         ctx.decode(batch)?;
+        generated_tokens.push(token);
     }
 
-    Ok((text, tokens_generated, time_to_first_token.unwrap_or_default()))
+    Ok((text, generated_tokens, time_to_first_token.unwrap_or_default()))
 }
 
 impl LlamaSession {
@@ -590,8 +617,9 @@ impl LlamaSession {
         let mut n_cur = 0i32;
         let mut batch = LlamaBatch::new(512, 1);
         decode_chunked(&mut ctx, &mut batch, &tokens_list, &mut n_cur)?;
-        let (text, tokens_generated, time_to_first_token) =
+        let (text, generated_tokens, time_to_first_token) =
             run_generation_loop(&mut ctx, &self.model, &mut batch, &mut n_cur, n_ctx, max_new_tokens, sampling, grammar, grammar_complete, start)?;
+        let tokens_generated = generated_tokens.len();
         let text = match assistant_prefill {
             Some(prefill) => format!("{prefill}{text}"),
             None => text,
@@ -637,6 +665,67 @@ impl LlamaSession {
             committed_pos: 0,
             turns: Vec::new(),
             overflow: options.overflow,
+            tokens: Vec::new(),
+        })
+    }
+
+    /// The reverse of [`Conversation::save_state`] — reopens a
+    /// conversation with its KV cache already filled from `state_path`
+    /// (llama.cpp's own state file) instead of starting cold, restoring
+    /// the turn/role bookkeeping from the `meta_path` sidecar that
+    /// accompanies it. `n_ctx` and `overflow` come from the snapshot
+    /// itself, not a caller-supplied `ConversationOptions` -- the saved
+    /// state's byte layout is already tied to the `n_ctx` it was saved
+    /// with, so re-deriving it from the snapshot (rather than trusting a
+    /// caller to pass a matching one) is what turns a possible mismatch
+    /// into an explicit, named error here instead of a confusing failure
+    /// deeper inside llama.cpp's own loader.
+    ///
+    /// Fails closed (`SnapshotModelMismatch`) if the snapshot's own
+    /// recorded model path doesn't match this session's -- see that
+    /// error variant's own doc comment for why that check happens here,
+    /// before ever handing raw bytes to llama.cpp.
+    pub fn open_conversation_from_state(
+        &self,
+        state_path: impl AsRef<Path>,
+        meta_path: impl AsRef<Path>,
+    ) -> Result<Conversation<'_>, LlamaSessionError> {
+        let meta_bytes = std::fs::read(meta_path)?;
+        let meta: ConversationSnapshotMeta = serde_json::from_slice(&meta_bytes)?;
+
+        let current_path = self.path().to_path_buf();
+        if meta.model_path != current_path {
+            return Err(LlamaSessionError::SnapshotModelMismatch { saved: meta.model_path, current: current_path });
+        }
+
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(meta.n_ctx as u32));
+        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let n_ctx = ctx.n_ctx() as i32;
+
+        let template = self
+            .model
+            .chat_template(None)
+            .ok()
+            .and_then(|template| template.to_str().ok().map(str::to_string))
+            .and_then(|text| derive_conversation_template(&text))
+            .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
+
+        // `n_ctx` (the real, freshly-queried context size) rather than
+        // `meta.n_ctx` as the upper bound: they should always agree, but
+        // this is what llama.cpp itself is actually about to fill.
+        let tokens = ctx.state_load_file(state_path, n_ctx as usize)?;
+        let committed_pos = tokens.len() as i32;
+
+        Ok(Conversation {
+            ctx,
+            model: &self.model,
+            _handle: self.handle.clone(),
+            template,
+            n_ctx,
+            committed_pos,
+            turns: meta.turns,
+            overflow: meta.overflow,
+            tokens,
         })
     }
 
@@ -700,8 +789,11 @@ impl LlamaSession {
 
 /// What role a completed [`Conversation`] turn belongs to — tracked per
 /// [`TurnBoundary`] so `Conversation::drop_oldest_turns` only ever drops
-/// a whole user+assistant pair, never half of one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// a whole user+assistant pair, never half of one. `Serialize`/
+/// `Deserialize` for [`Conversation::save_state`]'s sidecar metadata —
+/// llama.cpp's own state file format has no notion of turn/role
+/// boundaries, so that bookkeeping travels separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     User,
     Assistant,
@@ -710,7 +802,7 @@ pub enum Role {
 /// One completed turn's span in the KV cache, `[start_pos, end_pos)`.
 /// `Conversation` never truncates mid-span — `drop_oldest_turns` only
 /// ever removes whole entries from the front.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct TurnBoundary {
     role: Role,
     start_pos: i32,
@@ -719,7 +811,7 @@ struct TurnBoundary {
 
 /// What a [`Conversation`] does when the next turn wouldn't fit in
 /// `n_ctx`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OverflowPolicy {
     /// Refuse the call (`ConversationContextFull`) rather than lose any
     /// history.
@@ -838,6 +930,22 @@ fn derive_from_probe(template_text: &str, u1: &str, a1: &str, u2: &str, a2: &str
     Some(ConversationTemplate { first_turn_open, generation_open, turn_transition })
 }
 
+/// Everything about a [`Conversation`] that llama.cpp's own state file
+/// format doesn't carry -- saved as a small JSON sidecar alongside it by
+/// [`Conversation::save_state`]. `model_path` exists purely so a later
+/// reload can fail closed (`LlamaSessionError::SnapshotModelMismatch`)
+/// against an obviously wrong session *before* ever handing the raw
+/// state bytes to llama.cpp's own loader, which only checks byte-level
+/// shape (`n_ctx`/`n_layer`/quantization), not "is this the model this
+/// snapshot actually came from."
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ConversationSnapshotMeta {
+    model_path: PathBuf,
+    n_ctx: i32,
+    overflow: OverflowPolicy,
+    turns: Vec<TurnBoundary>,
+}
+
 /// A single, still-open multi-turn exchange against one resident model —
 /// see `LlamaSession::open_conversation`. Holds a real `LlamaContext`
 /// (and so a real KV cache) alive for as long as this value lives;
@@ -861,12 +969,47 @@ pub struct Conversation<'a> {
     n_ctx: i32,
     turns: Vec<TurnBoundary>,
     overflow: OverflowPolicy,
+    /// Every token processed so far, in order — kept in lockstep with
+    /// `committed_pos`/the real KV cache (including being trimmed the
+    /// same way `drop_oldest_turns_for` trims the cache itself) so
+    /// [`Conversation::save_state`] always has a token sequence that
+    /// actually matches what's physically resident, not just an
+    /// approximation of it.
+    tokens: Vec<LlamaToken>,
 }
 
 impl<'a> Conversation<'a> {
     /// Number of completed user+assistant exchanges so far.
     pub fn turn_count(&self) -> usize {
         self.turns.len() / 2
+    }
+
+    /// Persists this conversation's full KV cache to `state_path` (via
+    /// llama.cpp's own `state_save_file`) plus everything that format
+    /// doesn't carry (turn/role boundaries, the model this came from) to
+    /// a small JSON sidecar at `meta_path`. Both paths are caller-chosen
+    /// -- no naming convention imposed here -- so a caller managing many
+    /// saved sessions (e.g. evicting an idle resident agent without
+    /// losing its context) can lay them out however its own retention
+    /// policy wants. See [`LlamaSession::open_conversation_from_state`]
+    /// for the reverse direction.
+    ///
+    /// Real, live-relevant cost: the state file is roughly proportional
+    /// to context length used × layers × heads -- easily tens to
+    /// hundreds of MB for an actual conversation, not a token-count-sized
+    /// artifact. A caller doing this routinely needs its own cleanup
+    /// policy for stale snapshots; nothing here expires them.
+    pub fn save_state(&self, state_path: impl AsRef<Path>, meta_path: impl AsRef<Path>) -> Result<(), LlamaSessionError> {
+        self.ctx.state_save_file(state_path, &self.tokens)?;
+        let meta = ConversationSnapshotMeta {
+            model_path: self._handle.path().to_path_buf(),
+            n_ctx: self.n_ctx,
+            overflow: self.overflow,
+            turns: self.turns.clone(),
+        };
+        let json = serde_json::to_vec_pretty(&meta)?;
+        std::fs::write(meta_path, json)?;
+        Ok(())
     }
 
     /// Sends one new user message and returns the model's reply, with
@@ -915,9 +1058,10 @@ impl<'a> Conversation<'a> {
         let user_start = self.committed_pos;
         decode_chunked(&mut self.ctx, &mut batch, &user_tokens, &mut self.committed_pos)?;
         self.turns.push(TurnBoundary { role: Role::User, start_pos: user_start, end_pos: self.committed_pos });
+        self.tokens.extend(user_tokens);
 
         let assistant_start = self.committed_pos;
-        let (text, tokens_generated, time_to_first_token) = run_generation_loop(
+        let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut self.ctx,
             self.model,
             &mut batch,
@@ -930,6 +1074,8 @@ impl<'a> Conversation<'a> {
             start,
         )?;
         self.turns.push(TurnBoundary { role: Role::Assistant, start_pos: assistant_start, end_pos: self.committed_pos });
+        let tokens_generated = generated_tokens.len();
+        self.tokens.extend(generated_tokens);
 
         let text = match assistant_prefill {
             Some(prefill) => format!("{prefill}{text}"),
@@ -989,6 +1135,13 @@ impl<'a> Conversation<'a> {
                 turn.end_pos -= removed;
             }
             self.committed_pos -= removed;
+            // Keeps `self.tokens` in the same lockstep with the real KV
+            // cache the position bookkeeping above maintains -- the
+            // dropped turn is always the front of the cache (nothing
+            // remaining starts before position 0 once every earlier drop
+            // has already shifted things down), so it's always the
+            // front `removed` tokens being trimmed here too.
+            self.tokens.drain(0..removed as usize);
             freed += removed;
         }
         Ok(())
