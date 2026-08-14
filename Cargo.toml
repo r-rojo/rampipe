@@ -38,6 +38,18 @@ required-features = ["llama"]
 name = "chat_smoke"
 required-features = ["llama"]
 
+[[example]]
+name = "grammar_smoke"
+required-features = ["llama"]
+
+[[example]]
+name = "rampiped_grammar_smoke"
+required-features = ["client"]
+
+[[example]]
+name = "rampiped_conversation_smoke"
+required-features = ["client"]
+
 [[bin]]
 name = "rampiped"
 required-features = ["llama"]

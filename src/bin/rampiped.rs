@@ -37,11 +37,15 @@
 
 use anyhow::{Context, Result, bail};
 use llama_cpp_2::llama_backend::LlamaBackend;
-use rampipe::llama::{LlamaSession, Sampling};
-use rampipe::protocol::{GenerateRequest, GenerateResponse, WireSampling};
+use rampipe::llama::{Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Sampling};
+use rampipe::protocol::{
+    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest, GenerateResponse, OpenConversationRequest,
+    WireOverflowPolicy, WireSampling,
+};
 use rampipe::{ModelId, Residency, SwapRegistry};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::num::NonZeroU32;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -91,6 +95,13 @@ fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
     }
 }
 
+fn wire_overflow_to_overflow(overflow: WireOverflowPolicy) -> OverflowPolicy {
+    match overflow {
+        WireOverflowPolicy::Fail => OverflowPolicy::Fail,
+        WireOverflowPolicy::DropOldestTurns => OverflowPolicy::DropOldestTurns,
+    }
+}
+
 /// Everything a load, evict, or generate call touches — bundled into one
 /// struct specifically so it can live behind one `Mutex` (see module doc
 /// comment). `backend` lives in here too, not as a separate `&LlamaBackend`
@@ -103,7 +114,13 @@ fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
 struct SharedState {
     backend: Arc<LlamaBackend>,
     registry: SwapRegistry,
-    sessions: HashMap<PathBuf, LlamaSession>,
+    /// `Arc`-wrapped, not a bare `LlamaSession`, so a conversation
+    /// connection's own thread (see `handle_conversation`) can clone one
+    /// out and keep it alive on its own stack for the conversation's
+    /// whole lifetime, independent of whatever this map does to its own
+    /// entry afterward -- the same `ModelHandle`-pinning mechanism
+    /// `make_room_for`'s eviction skip (below) already relies on.
+    sessions: HashMap<PathBuf, Arc<LlamaSession>>,
     budget_fraction: f64,
 }
 
@@ -141,19 +158,26 @@ impl SharedState {
             .with_context(|| format!("loading model {}", path.display()))?;
         eprintln!("rampiped: loaded {} in {:?} (now {} model(s) resident, {} bytes mapped)",
             path.display(), load_start.elapsed(), self.sessions.len() + 1, self.registry.mapped_bytes());
-        self.sessions.insert(path.to_path_buf(), session);
+        self.sessions.insert(path.to_path_buf(), Arc::new(session));
         Ok(())
     }
 
     /// Evicts least-recently-used resident models, one at a time, until
-    /// loading `new_size_bytes` more would stay within budget. Safe by
-    /// construction, not just by convention: `ensure_loaded` (the only
-    /// caller) already runs inside the one critical section
-    /// `SharedState`'s `Mutex` guards, so nothing else can be mid-`generate()`
-    /// against any resident session while this runs — there is no window
-    /// where a model both has `SwapRegistry::evict`'s `HandleOutstanding`
-    /// check pass *and* is actually in use elsewhere, because "in use"
-    /// only ever happens inside this same lock.
+    /// loading `new_size_bytes` more would stay within budget.
+    ///
+    /// Walks the LRU list (not just the single oldest entry) and skips
+    /// any session a live conversation still holds its own `Arc` clone
+    /// of (`Arc::strong_count(session) > 1` -- the only other place this
+    /// map's `Arc<LlamaSession>` values are ever cloned is
+    /// `handle_conversation`, which keeps its clone alive for exactly as
+    /// long as that conversation's connection stays open) rather than
+    /// removing the entry and then failing outright on
+    /// `EvictError::HandleOutstanding` — a background conversation
+    /// sitting idle shouldn't be able to make an unrelated one-shot
+    /// request against a *different* model fail. Checking the count
+    /// first (instead of removing speculatively and catching the evict
+    /// error) also avoids ever dropping this map's own entry for a
+    /// session eviction that was going to fail anyway.
     fn make_room_for(&mut self, path: &Path) -> Result<()> {
         let new_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         loop {
@@ -166,17 +190,18 @@ impl SharedState {
             }
 
             let lru_ids = self.registry.resident_ids_by_lru();
-            let Some(&evict_id) = lru_ids.first() else {
-                // Over budget but nothing resident to evict -- a single
-                // model bigger than the whole budget must still be
-                // servable, not refused outright, so proceed anyway.
-                return Ok(());
-            };
-            let evict_path = self.path_for_id(evict_id);
-            let Some(evict_path) = evict_path else {
-                // Resident in the registry but not one of this store's
-                // own sessions -- shouldn't happen (this store is the
-                // registry's only caller), but don't loop forever on it.
+            let evictable = lru_ids.into_iter().find_map(|id| {
+                let evict_path = self.path_for_id(id)?;
+                let session = self.sessions.get(&evict_path)?;
+                (Arc::strong_count(session) == 1).then_some((id, evict_path))
+            });
+            let Some((evict_id, evict_path)) = evictable else {
+                // Over budget but nothing evictable -- either nothing's
+                // resident, or everything resident is pinned by a live
+                // conversation. A single model bigger than the whole
+                // budget (or a budget fully consumed by pinned models)
+                // must still be servable, not refused outright, so
+                // proceed anyway.
                 return Ok(());
             };
 
@@ -197,21 +222,31 @@ impl SharedState {
 /// takes. A slow-to-send or slow-to-receive client blocks only its own
 /// thread, never another connection's request from being read or
 /// another already-queued request's turn at the lock.
+///
+/// The first line on every connection is a [`ClientMessage`]:
+/// `Generate` keeps today's exact one-shot shape (read one line, reply
+/// one line, done); `OpenConversation` hands the rest of this
+/// connection's lifetime to [`handle_conversation`], which reads and
+/// replies to any number of further turns on the same connection.
 fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning connection stream")?);
     let mut line = String::new();
     reader.read_line(&mut line).context("reading request")?;
-    let request: GenerateRequest = serde_json::from_str(line.trim()).context("decoding request")?;
+    let message: ClientMessage = serde_json::from_str(line.trim()).context("decoding request")?;
 
-    let response = match handle_request(state, &request) {
-        Ok(response) => response,
-        Err(error) => GenerateResponse::Err { message: format!("{error:#}") },
-    };
-
-    let mut stream = stream;
-    serde_json::to_writer(&mut stream, &response).context("encoding response")?;
-    stream.write_all(b"\n").context("writing response")?;
-    Ok(())
+    match message {
+        ClientMessage::Generate(request) => {
+            let response = match handle_request(state, &request) {
+                Ok(response) => response,
+                Err(error) => GenerateResponse::Err { message: format!("{error:#}") },
+            };
+            let mut stream = stream;
+            serde_json::to_writer(&mut stream, &response).context("encoding response")?;
+            stream.write_all(b"\n").context("writing response")?;
+            Ok(())
+        }
+        ClientMessage::OpenConversation(request) => handle_conversation(stream, reader, state, request),
+    }
 }
 
 /// The one critical section: locks `state` for exactly as long as it
@@ -223,8 +258,16 @@ fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Resu
     state.ensure_loaded(&request.model_path)?;
     let session = state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this");
     let sampling = wire_sampling_to_sampling(request.sampling);
+    let grammar_complete = request.grammar_completion.clone().map(rampipe::protocol::GrammarCompletion::into_predicate);
     let result = session
-        .generate(&request.prompt, request.max_new_tokens, sampling)
+        .generate(
+            &request.prompt,
+            request.max_new_tokens,
+            sampling,
+            request.grammar.as_deref(),
+            request.assistant_prefill.as_deref(),
+            grammar_complete.as_deref(),
+        )
         .with_context(|| format!("generating against {}", request.model_path.display()))?;
 
     Ok(GenerateResponse::Ok {
@@ -233,6 +276,100 @@ fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Resu
         time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
         formatted_prompt: result.formatted_prompt,
     })
+}
+
+/// Serves one whole conversation for as long as its connection stays
+/// open — one thread per connection (same as the accept loop's own
+/// convention), so `session` (an `Arc<LlamaSession>` clone) and the
+/// `Conversation` opened from it both live as plain locals on *this*
+/// thread's own stack for the conversation's entire lifetime. This is
+/// what lets a `Conversation` (which borrows from the `LlamaModel`
+/// inside `session`) be held across many requests without storing it
+/// inside `SharedState` itself, which would need a self-referential
+/// struct (`SharedState.sessions` both owns sessions and would need to
+/// hold something borrowing from one of them at the same time) — an
+/// ordinary function-local owner-and-borrower pair sidesteps that
+/// entirely.
+fn handle_conversation(
+    stream: UnixStream,
+    mut reader: BufReader<UnixStream>,
+    state: &Mutex<SharedState>,
+    request: OpenConversationRequest,
+) -> Result<()> {
+    let mut writer = stream;
+
+    let session = {
+        let mut state = state.lock().expect("rampiped model store lock poisoned");
+        state.ensure_loaded(&request.model_path)?;
+        Arc::clone(state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this"))
+    };
+
+    let n_ctx = NonZeroU32::new(request.n_ctx).context("n_ctx must be nonzero")?;
+    let options = ConversationOptions { n_ctx, overflow: wire_overflow_to_overflow(request.overflow) };
+
+    let mut conversation = match session.open_conversation(options) {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            let response = ConversationResponse::Err { message: format!("{error:#}") };
+            serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+            writer.write_all(b"\n").context("writing response")?;
+            return Ok(());
+        }
+    };
+
+    let response = ConversationResponse::Opened;
+    serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+    writer.write_all(b"\n").context("writing response")?;
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = reader.read_line(&mut line).context("reading conversation turn")?;
+        if bytes_read == 0 {
+            // Client dropped the connection -- ordinary end of this
+            // conversation, not an error. No explicit close message is
+            // needed.
+            return Ok(());
+        }
+
+        let turn_response = match serde_json::from_str::<ConversationTurnRequest>(line.trim()) {
+            Ok(turn) => run_conversation_turn(state, &mut conversation, &turn),
+            Err(error) => ConversationResponse::Err { message: format!("decoding conversation turn: {error:#}") },
+        };
+
+        serde_json::to_writer(&mut writer, &turn_response).context("encoding response")?;
+        writer.write_all(b"\n").context("writing response")?;
+    }
+}
+
+/// The one critical section for a conversation turn: locks `state`
+/// purely as a serialization gate (matching `handle_request`'s own "at
+/// most one decode in flight" invariant, extended to conversation
+/// turns), held only for the duration of this one `send()` call — never
+/// across the idle time between turns while this thread is blocked
+/// reading the next line from its own socket, so a conversation sitting
+/// idle never blocks an unrelated request's turn at the lock.
+fn run_conversation_turn(state: &Mutex<SharedState>, conversation: &mut Conversation<'_>, turn: &ConversationTurnRequest) -> ConversationResponse {
+    let _guard = state.lock().expect("rampiped model store lock poisoned");
+    let sampling = wire_sampling_to_sampling(turn.sampling);
+    let grammar_complete = turn.grammar_completion.clone().map(rampipe::protocol::GrammarCompletion::into_predicate);
+    let result = conversation.send(
+        &turn.message,
+        turn.max_new_tokens,
+        sampling,
+        turn.grammar.as_deref(),
+        turn.assistant_prefill.as_deref(),
+        grammar_complete.as_deref(),
+    );
+    match result {
+        Ok(result) => ConversationResponse::Turn {
+            text: result.text,
+            tokens_generated: result.tokens_generated,
+            time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
+            formatted_prompt: result.formatted_prompt,
+        },
+        Err(error) => ConversationResponse::Err { message: format!("{error:#}") },
+    }
 }
 
 /// Binds `path`, first removing any stale socket file left behind by an

@@ -39,14 +39,14 @@ fn main() -> Result<()> {
 
     println!("\n=== turn 1 ===");
     let turn1 = conversation
-        .send("My favorite number is 7492. Just say OK.", MAX_NEW_TOKENS, Sampling::Greedy)
+        .send("My favorite number is 7492. Just say OK.", MAX_NEW_TOKENS, Sampling::Greedy, None, None, None)
         .context("turn 1")?;
     println!("  decoded this turn (new text only): {:?}", turn1.formatted_prompt);
     println!("  reply: {}", turn1.text.trim());
 
     println!("\n=== turn 2 (no restated context) ===");
     let turn2 = conversation
-        .send("What's my favorite number? Reply with just the digits, nothing else.", MAX_NEW_TOKENS, Sampling::Greedy)
+        .send("What's my favorite number? Reply with just the digits, nothing else.", MAX_NEW_TOKENS, Sampling::Greedy, None, None, None)
         .context("turn 2")?;
     println!("  decoded this turn (new text only): {:?}", turn2.formatted_prompt);
     println!("  reply: {}", turn2.text.trim());

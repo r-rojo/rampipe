@@ -53,7 +53,7 @@ fn run(label: &str, model_path: &PathBuf, backend: &Arc<llama_cpp_2::llama_backe
 
     let metrics = session.metrics();
     let result = session
-        .generate(PROMPT, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy)
+        .generate(PROMPT, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy, None, None, None)
         .with_context(|| format!("generating for {label}"))?;
 
     println!("=== {label} ===");

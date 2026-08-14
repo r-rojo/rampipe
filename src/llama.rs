@@ -68,6 +68,8 @@ pub enum LlamaSessionError {
     ConversationContextFull { committed_pos: i32, needed: i32, n_ctx: i32 },
     #[error("conversation overflowed its context window but has fewer than 2 turns left to drop")]
     ConversationTooLargeToTrim,
+    #[error("grammar error: {0}")]
+    Grammar(#[from] llama_cpp_2::GrammarError),
 }
 
 /// A manual override for how a prompt is wrapped into a chat turn —
@@ -309,6 +311,8 @@ fn run_generation_loop(
     n_ctx: i32,
     max_new_tokens: i32,
     sampling: Sampling,
+    grammar: Option<&str>,
+    grammar_complete: Option<&dyn Fn(&str) -> bool>,
     start: Instant,
 ) -> Result<(String, usize, Duration), LlamaSessionError> {
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -320,13 +324,49 @@ fn run_generation_loop(
     // `top_k` highest-probability candidates, reshapes the
     // distribution by `temperature`, then samples from it via
     // `dist(seed)` as the actual final stage — no `greedy()` after it,
-    // so the sampled draw is what's actually used.
-    let mut sampler = match sampling {
-        Sampling::Greedy => LlamaSampler::chain_simple([LlamaSampler::greedy()]),
-        Sampling::Temperature { temperature, top_k, seed } => {
-            LlamaSampler::chain_simple([LlamaSampler::top_k(top_k), LlamaSampler::temp(temperature), LlamaSampler::dist(seed)])
+    // so the sampled draw is what's actually used. When `grammar` is
+    // `Some`, its stage goes *first* in the chain -- a chain applies
+    // its stages in order, so the grammar must mask the logits down to
+    // grammar-valid tokens before top_k/temp/dist (or greedy) ever see
+    // them, not after a token's already been picked.
+    let build_chain = |grammar: Option<&str>| -> Result<LlamaSampler, LlamaSessionError> {
+        let mut stages: Vec<LlamaSampler> = Vec::new();
+        if let Some(grammar_str) = grammar {
+            stages.push(LlamaSampler::grammar(model, grammar_str, "root")?);
         }
+        match sampling {
+            Sampling::Greedy => stages.push(LlamaSampler::greedy()),
+            Sampling::Temperature { temperature, top_k, seed } => {
+                stages.push(LlamaSampler::top_k(top_k));
+                stages.push(LlamaSampler::temp(temperature));
+                stages.push(LlamaSampler::dist(seed));
+            }
+        }
+        Ok(LlamaSampler::chain_simple(stages))
     };
+
+    // A grammar-constrained chain's `sample()` reliably crashes (a hard
+    // process abort inside llama.cpp's own grammar internals --
+    // `GGML_ASSERT(!stacks.empty())` inside `llama_grammar_reject_
+    // candidates`, not a recoverable Rust `Err`) on the *second*
+    // `sample()` call made against one grammar sampler instance --
+    // reproduced live against even the simplest possible multi-token
+    // grammar (`root ::= "AB"`, two ordinary letters, no alternation, no
+    // repetition, nowhere near a completed match), so this isn't
+    // specific to this crate's own grammars or to reaching the end of
+    // one. The one call shape that *is* reliable: a freshly constructed
+    // grammar sampler's very first `sample()`. So for a grammar-
+    // constrained chain, `run_generation_loop` rebuilds the whole chain
+    // from scratch before every token and replays every token accepted
+    // so far into the fresh instance via `accept()` (cheap -- grammar
+    // state advancement is in-memory bookkeeping, not model inference)
+    // before sampling once and discarding it. More total work than one
+    // persistent chain, but the only shape found that survives a
+    // multi-token grammar-constrained response without crashing the
+    // process. `plain_sampler` is the ordinary persistent-chain path,
+    // unchanged, used whenever there's no grammar to work around.
+    let mut plain_sampler = if grammar.is_none() { Some(build_chain(None)?) } else { None };
+    let mut accepted_tokens: Vec<LlamaToken> = Vec::new();
 
     let mut text = String::new();
     let mut tokens_generated = 0usize;
@@ -358,8 +398,23 @@ fn run_generation_loop(
             break;
         }
 
-        let token = sampler.sample(ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
+        let token = match &mut plain_sampler {
+            Some(sampler) => {
+                let token = sampler.sample(ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+                token
+            }
+            None => {
+                let mut sampler = build_chain(grammar)?;
+                for &prior in &accepted_tokens {
+                    sampler.accept(prior);
+                }
+                let token = sampler.sample(ctx, batch.n_tokens() - 1);
+                sampler.accept(token);
+                accepted_tokens.push(token);
+                token
+            }
+        };
 
         if time_to_first_token.is_none() {
             time_to_first_token = Some(start.elapsed());
@@ -397,6 +452,26 @@ fn run_generation_loop(
 
         if !inside_open_think {
             budget_used += 1;
+        }
+
+        // Grammar-constrained generation has a real, reproducible crash
+        // (a hard process abort -- `GGML_ASSERT(!stacks.empty())` inside
+        // llama.cpp's own `llama_grammar_reject_candidates`, not a
+        // recoverable Rust error) if `sample()` is called again once the
+        // grammar's `root` rule has already fully matched and the model
+        // doesn't itself pick an end-of-generation token on the very
+        // next draw. Reproduced live against even the simplest possible
+        // closed grammar (`root ::= "YES"`, no alternation, nothing
+        // envelope-specific) -- not a bug in this crate's own grammars.
+        // `grammar_complete`, when the caller supplies one, is this
+        // crate's own completion signal in place of relying on
+        // llama.cpp's grammar-driven EOG forcing: check it against the
+        // accumulated text and stop *before* ever sampling again, rather
+        // than after.
+        if let Some(is_complete) = grammar_complete
+            && is_complete(&text)
+        {
+            break;
         }
 
         batch.clear();
@@ -459,7 +534,15 @@ impl LlamaSession {
     /// `open_conversation` for a session that keeps its KV cache alive
     /// across several calls instead of re-prefilling from scratch every
     /// time.
-    pub fn generate(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+    pub fn generate(
+        &self,
+        prompt: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        assistant_prefill: Option<&str>,
+        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<GenerationResult, LlamaSessionError> {
         let start = Instant::now();
 
         // Raised 2048 -> 4096 -> 8192, twice now for the same underlying
@@ -477,7 +560,18 @@ impl LlamaSession {
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(8192));
         let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
 
-        let formatted_prompt = self.formatted_prompt(prompt)?;
+        let mut formatted_prompt = self.formatted_prompt(prompt)?;
+        // Prefilling the assistant turn: `formatted_prompt` already ends
+        // with the assistant's own turn opened (see this method's doc
+        // comment), so appending here before tokenizing makes generation
+        // resume *inside* `assistant_prefill` rather than at the start of
+        // a fresh turn -- e.g. seeding "{" so a grammar-constrained JSON
+        // response never has to open its own object. Prepended back onto
+        // `text` below so the caller sees one complete, self-consistent
+        // string, as if the model had generated it from scratch.
+        if let Some(prefill) = assistant_prefill {
+            formatted_prompt.push_str(prefill);
+        }
         let tokens_list = self.model.str_to_token(&formatted_prompt, AddBos::Always)?;
         let n_ctx = ctx.n_ctx() as i32;
         // Not `+ max_new_tokens` any more: `max_new_tokens` no longer
@@ -497,7 +591,11 @@ impl LlamaSession {
         let mut batch = LlamaBatch::new(512, 1);
         decode_chunked(&mut ctx, &mut batch, &tokens_list, &mut n_cur)?;
         let (text, tokens_generated, time_to_first_token) =
-            run_generation_loop(&mut ctx, &self.model, &mut batch, &mut n_cur, n_ctx, max_new_tokens, sampling, start)?;
+            run_generation_loop(&mut ctx, &self.model, &mut batch, &mut n_cur, n_ctx, max_new_tokens, sampling, grammar, grammar_complete, start)?;
+        let text = match assistant_prefill {
+            Some(prefill) => format!("{prefill}{text}"),
+            None => text,
+        };
 
         Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt })
     }
@@ -776,7 +874,22 @@ impl<'a> Conversation<'a> {
     /// `LlamaSession::generate`, only *this* call's own new text is
     /// tokenized and decoded — every earlier turn is already resident in
     /// the context from a prior `send()`.
-    pub fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+    ///
+    /// `grammar`/`assistant_prefill`/`grammar_complete` mirror
+    /// `LlamaSession::generate`'s own parameters of the same names —
+    /// see that method's doc comment for what each does. Grammar
+    /// constraint and prefill both apply to this turn's assistant reply
+    /// only; they don't persist to later `send()` calls on the same
+    /// conversation.
+    pub fn send(
+        &mut self,
+        message: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        assistant_prefill: Option<&str>,
+        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<GenerationResult, LlamaSessionError> {
         let start = Instant::now();
 
         let (opening, add_bos) = if self.turns.is_empty() {
@@ -784,7 +897,16 @@ impl<'a> Conversation<'a> {
         } else {
             (self.template.turn_transition.as_str(), AddBos::Never)
         };
-        let user_text = format!("{opening}{message}{}", self.template.generation_open);
+        let mut user_text = format!("{opening}{message}{}", self.template.generation_open);
+        // Prefilling the assistant turn: same technique as
+        // `LlamaSession::generate`'s own `assistant_prefill` handling —
+        // appending here before tokenizing makes generation resume
+        // *inside* the prefill rather than at the start of a fresh turn.
+        // Prepended back onto `text` below so the caller sees one
+        // complete, self-consistent string.
+        if let Some(prefill) = assistant_prefill {
+            user_text.push_str(prefill);
+        }
         let user_tokens = self.model.str_to_token(&user_text, add_bos)?;
 
         self.ensure_room_for(user_tokens.len() as i32)?;
@@ -795,9 +917,24 @@ impl<'a> Conversation<'a> {
         self.turns.push(TurnBoundary { role: Role::User, start_pos: user_start, end_pos: self.committed_pos });
 
         let assistant_start = self.committed_pos;
-        let (text, tokens_generated, time_to_first_token) =
-            run_generation_loop(&mut self.ctx, self.model, &mut batch, &mut self.committed_pos, self.n_ctx, max_new_tokens, sampling, start)?;
+        let (text, tokens_generated, time_to_first_token) = run_generation_loop(
+            &mut self.ctx,
+            self.model,
+            &mut batch,
+            &mut self.committed_pos,
+            self.n_ctx,
+            max_new_tokens,
+            sampling,
+            grammar,
+            grammar_complete,
+            start,
+        )?;
         self.turns.push(TurnBoundary { role: Role::Assistant, start_pos: assistant_start, end_pos: self.committed_pos });
+
+        let text = match assistant_prefill {
+            Some(prefill) => format!("{prefill}{text}"),
+            None => text,
+        };
 
         Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt: user_text })
     }
@@ -885,13 +1022,29 @@ pub trait LocalModel: Send + Sync {
 /// exposes, regardless of what's actually holding the state underneath
 /// (an in-process KV cache, or a session id round-tripped to a daemon).
 pub trait ConversationHandle {
-    fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError>;
+    fn send(
+        &mut self,
+        message: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        assistant_prefill: Option<&str>,
+        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<GenerationResult, LlamaSessionError>;
     fn turn_count(&self) -> usize;
 }
 
 impl ConversationHandle for Conversation<'_> {
-    fn send(&mut self, message: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
-        Conversation::send(self, message, max_new_tokens, sampling)
+    fn send(
+        &mut self,
+        message: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        assistant_prefill: Option<&str>,
+        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<GenerationResult, LlamaSessionError> {
+        Conversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_complete)
     }
 
     fn turn_count(&self) -> usize {
@@ -901,7 +1054,7 @@ impl ConversationHandle for Conversation<'_> {
 
 impl LocalModel for LlamaSession {
     fn complete(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
-        self.generate(prompt, max_new_tokens, sampling)
+        self.generate(prompt, max_new_tokens, sampling, None, None, None)
     }
 
     fn open_conversation(&self, options: ConversationOptions) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError> {
