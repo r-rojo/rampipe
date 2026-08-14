@@ -122,11 +122,40 @@ struct SharedState {
     /// `make_room_for`'s eviction skip (below) already relies on.
     sessions: HashMap<PathBuf, Arc<LlamaSession>>,
     budget_fraction: f64,
+    /// This process's own executable path and its mtime *at the moment
+    /// this struct was built* (i.e. daemon startup) — not re-derived on
+    /// every `Status` request, which would just reflect whatever
+    /// happens to be on disk right now regardless of what code this
+    /// already-running process actually loaded. See
+    /// `protocol::StatusResponse::exe_modified_unix_secs`'s own doc
+    /// comment for why that distinction is the entire point of this
+    /// field.
+    exe_snapshot: (Option<PathBuf>, Option<u64>),
+}
+
+/// `std::env::current_exe()` plus that file's own mtime, in Unix
+/// seconds — best-effort: `None` for either half just means this
+/// platform or environment didn't have an answer, not an error worth
+/// failing startup over.
+fn current_exe_snapshot() -> (Option<PathBuf>, Option<u64>) {
+    let Ok(path) = std::env::current_exe() else { return (None, None) };
+    let modified = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    (Some(path), modified)
 }
 
 impl SharedState {
     fn new(backend: LlamaBackend, budget_fraction: f64) -> Self {
-        Self { backend: Arc::new(backend), registry: SwapRegistry::new(), sessions: HashMap::new(), budget_fraction }
+        Self {
+            backend: Arc::new(backend),
+            registry: SwapRegistry::new(),
+            sessions: HashMap::new(),
+            budget_fraction,
+            exe_snapshot: current_exe_snapshot(),
+        }
     }
 
     /// Ensures `path` is resident in `self.sessions`, loading it (and
@@ -246,6 +275,27 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
             Ok(())
         }
         ClientMessage::OpenConversation(request) => handle_conversation(stream, reader, state, request),
+        ClientMessage::Status => {
+            let response = handle_status(state);
+            let mut stream = stream;
+            serde_json::to_writer(&mut stream, &response).context("encoding response")?;
+            stream.write_all(b"\n").context("writing response")?;
+            Ok(())
+        }
+    }
+}
+
+/// Builds a [`StatusResponse`] from this process's own pid, its
+/// startup-time exe snapshot (see [`current_exe_snapshot`]), and
+/// whatever's currently resident — locked only long enough to read
+/// `sessions`' keys, not for the duration of any generation.
+fn handle_status(state: &Mutex<SharedState>) -> rampipe::protocol::StatusResponse {
+    let state = state.lock().expect("rampiped model store lock poisoned");
+    rampipe::protocol::StatusResponse {
+        pid: std::process::id(),
+        exe_path: state.exe_snapshot.0.clone(),
+        exe_modified_unix_secs: state.exe_snapshot.1,
+        resident_model_paths: state.sessions.keys().cloned().collect(),
     }
 }
 
@@ -298,10 +348,29 @@ fn handle_conversation(
 ) -> Result<()> {
     let mut writer = stream;
 
+    // Caught and turned into a real `ConversationResponse::Err` here,
+    // not propagated via `?` -- unlike a request that fails to *decode*
+    // at all (nothing meaningful to reply with in that case), this is a
+    // request that parsed fine but failed during processing, same as
+    // `handle_request`'s own `Err -> GenerateResponse::Err` conversion
+    // for the one-shot path. Letting this propagate instead left a
+    // client's `RampipedConversation::open` staring at a silently closed
+    // connection -- a real, live-reproduced failure that surfaced as a
+    // confusing "EOF while parsing a value" decode error instead of the
+    // actual problem.
     let session = {
         let mut state = state.lock().expect("rampiped model store lock poisoned");
-        state.ensure_loaded(&request.model_path)?;
-        Arc::clone(state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this"))
+        let loaded = state.ensure_loaded(&request.model_path);
+        match loaded {
+            Ok(()) => Arc::clone(state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this")),
+            Err(error) => {
+                drop(state);
+                let response = ConversationResponse::Err { message: format!("{error:#}") };
+                serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+                writer.write_all(b"\n").context("writing response")?;
+                return Ok(());
+            }
+        }
     };
 
     let n_ctx = NonZeroU32::new(request.n_ctx).context("n_ctx must be nonzero")?;

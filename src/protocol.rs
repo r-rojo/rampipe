@@ -122,6 +122,32 @@ pub enum GenerateResponse {
 pub enum ClientMessage {
     Generate(GenerateRequest),
     OpenConversation(OpenConversationRequest),
+    /// Asks for [`StatusResponse`] — a one-shot request/reply, connection
+    /// closes after, same shape as `Generate`.
+    Status,
+}
+
+/// What `rampiped` reports about itself for a `ClientMessage::Status`
+/// request — the daemon-side half of a stale-binary check: a client that
+/// also knows its own configured `rampiped_path` can stat that file
+/// itself and compare against `exe_modified_unix_secs` here to tell
+/// "reachable" apart from "reachable, but running code built before the
+/// binary on disk was last rebuilt" (a real, live-reproduced failure
+/// mode — a `rampiped` process that outlived a rebuild silently kept
+/// serving the *old* wire protocol, closing every connection using the
+/// new one with no response at all).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatusResponse {
+    pub pid: u32,
+    pub exe_path: Option<PathBuf>,
+    /// Unix seconds since epoch of the running binary's own mtime,
+    /// captured once at daemon startup — deliberately *not* a live
+    /// re-stat of `exe_path` on every status request, which would just
+    /// reflect whatever happens to be on disk right now regardless of
+    /// what code this already-running process actually has loaded (the
+    /// exact trap this field exists to let a client detect).
+    pub exe_modified_unix_secs: Option<u64>,
+    pub resident_model_paths: Vec<PathBuf>,
 }
 
 /// Mirrors `llama::OverflowPolicy` field-for-field, same reason

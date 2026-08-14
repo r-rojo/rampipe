@@ -11,7 +11,7 @@
 
 use crate::protocol::{
     ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest, GenerateResponse, GrammarCompletion,
-    OpenConversationRequest, WireOverflowPolicy, WireSampling,
+    OpenConversationRequest, StatusResponse, WireOverflowPolicy, WireSampling,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -107,6 +107,29 @@ impl RampipedClient {
             }
             GenerateResponse::Err { message } => Err(RampipedError::Remote(message)),
         }
+    }
+
+    /// Asks the daemon about itself -- pid, its own executable's path
+    /// and startup-time mtime, and what's currently resident. See
+    /// [`StatusResponse`]'s own doc comment for why `exe_modified_unix_secs`
+    /// specifically is the useful part: a caller that also knows the
+    /// `rampiped` binary's path can stat that file itself and compare,
+    /// telling "reachable" apart from "reachable, but running code from
+    /// before the last rebuild."
+    pub fn status(&self) -> Result<StatusResponse, RampipedError> {
+        let request = ClientMessage::Status;
+        let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
+        payload.push(b'\n');
+
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect { path: self.socket_path.clone(), source })?;
+        stream.write_all(&payload).map_err(RampipedError::Send)?;
+        stream.shutdown(std::net::Shutdown::Write).map_err(RampipedError::Send)?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(RampipedError::Read)?;
+        serde_json::from_str(line.trim()).map_err(RampipedError::Decode)
     }
 }
 
