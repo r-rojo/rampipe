@@ -54,6 +54,26 @@ use std::time::Instant;
 
 const DEFAULT_BUDGET_FRACTION: f64 = 0.8;
 
+const USAGE: &str = "\
+rampiped: a daemon that holds GGUF model(s) resident in memory and
+serves generation requests from local clients over a Unix socket.
+
+USAGE:
+    rampiped [--socket <path>] [--budget-fraction <0.0-1.0>]
+
+OPTIONS:
+    --socket <path>            Unix socket to listen on
+                                (default: ~/.rampipe/rampiped.sock)
+    --budget-fraction <float>  fraction of available memory the swap
+                                registry may use before evicting
+                                (default: 0.8)
+    -h, --help                 print this message and exit";
+
+enum ParsedArgs {
+    Help,
+    Run(Args),
+}
+
 struct Args {
     socket: PathBuf,
     budget_fraction: f64,
@@ -68,8 +88,12 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>>
     Ok(Some(args.remove(pos)))
 }
 
-fn parse_args() -> Result<Args> {
+fn parse_args() -> Result<ParsedArgs> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(pos) = args.iter().position(|a| a == "-h" || a == "--help") {
+        args.remove(pos);
+        return Ok(ParsedArgs::Help);
+    }
     let socket = take_flag_value(&mut args, "--socket")?.map(PathBuf::from);
     let budget_fraction = take_flag_value(&mut args, "--budget-fraction")?
         .map(|s| s.parse::<f64>().map_err(|_| anyhow::anyhow!("--budget-fraction must be a number, got {s:?}")))
@@ -85,7 +109,7 @@ fn parse_args() -> Result<Args> {
         // function's own doc comment), not a value re-derived here.
         None => rampipe::protocol::default_socket_path().context("--socket not given, and could not determine a default (~/.rampipe/rampiped.sock) -- HOME not set")?,
     };
-    Ok(Args { socket, budget_fraction })
+    Ok(ParsedArgs::Run(Args { socket, budget_fraction }))
 }
 
 fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
@@ -455,7 +479,13 @@ fn bind_fresh(path: &Path) -> Result<UnixListener> {
 }
 
 fn main() -> Result<()> {
-    let args = parse_args()?;
+    let args = match parse_args()? {
+        ParsedArgs::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        ParsedArgs::Run(args) => args,
+    };
     println!("rampiped: socket {}", args.socket.display());
     println!("rampiped: budget_fraction {}", args.budget_fraction);
 
