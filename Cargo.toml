@@ -47,6 +47,10 @@ name = "grammar_smoke"
 required-features = ["llama"]
 
 [[example]]
+name = "rampiped_status_smoke"
+required-features = ["client"]
+
+[[example]]
 name = "rampiped_grammar_smoke"
 required-features = ["client"]
 
