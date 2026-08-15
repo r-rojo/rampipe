@@ -24,6 +24,11 @@ mach2 = "0.6.0"
 
 [features]
 llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs", "dep:minijinja"]
+# GPU offload via llama.cpp's CUDA backend. Requires the CUDA toolkit
+# (`nvcc`) on the build machine -- the driver alone (`nvidia-smi`
+# working) is not enough, since this compiles GPU kernels at build
+# time rather than just linking against a runtime.
+cuda = ["llama", "llama-cpp-2/cuda"]
 client = []
 
 [[example]]
