@@ -155,6 +155,23 @@ struct SharedState {
     /// comment for why that distinction is the entire point of this
     /// field.
     exe_snapshot: (Option<PathBuf>, Option<u64>),
+    started_at: Instant,
+    requests_served: u64,
+    requests_failed: u64,
+    total_tokens_generated: u64,
+    /// Per-model counters, keyed the same way `sessions` is and with the
+    /// same lifetime: removed in `make_room_for` whenever its `sessions`
+    /// entry is evicted, so these describe the model's *current*
+    /// residency, not a lifetime history that would otherwise persist
+    /// across an evict-and-later-reload as if it were one continuous stay.
+    model_stats: HashMap<PathBuf, ModelStats>,
+}
+
+#[derive(Default)]
+struct ModelStats {
+    requests_served: u64,
+    tokens_generated: u64,
+    last_used_unix_secs: u64,
 }
 
 /// `std::env::current_exe()` plus that file's own mtime, in Unix
@@ -179,6 +196,30 @@ impl SharedState {
             sessions: HashMap::new(),
             budget_fraction,
             exe_snapshot: current_exe_snapshot(),
+            started_at: Instant::now(),
+            requests_served: 0,
+            requests_failed: 0,
+            total_tokens_generated: 0,
+            model_stats: HashMap::new(),
+        }
+    }
+
+    /// Records the outcome of one request/turn against `path` -- the one
+    /// place every success/failure counter (daemon-level and per-model)
+    /// gets updated, called with the state lock already held by the
+    /// caller (matching every other mutation on this type).
+    fn record_outcome(&mut self, path: &Path, tokens_generated: Option<usize>) {
+        match tokens_generated {
+            Some(tokens) => {
+                self.requests_served += 1;
+                self.total_tokens_generated += tokens as u64;
+                let stats = self.model_stats.entry(path.to_path_buf()).or_default();
+                stats.requests_served += 1;
+                stats.tokens_generated += tokens as u64;
+                stats.last_used_unix_secs =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            }
+            None => self.requests_failed += 1,
         }
     }
 
@@ -260,6 +301,7 @@ impl SharedState {
 
             eprintln!("rampiped: evicting {} (LRU) to make room for {}", evict_path.display(), path.display());
             self.sessions.remove(&evict_path); // drops LlamaSession -> drops its ModelHandle
+            self.model_stats.remove(&evict_path);
             self.registry.evict(evict_id).context("evicting LRU model")?;
         }
     }
@@ -293,6 +335,11 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
                 Ok(response) => response,
                 Err(error) => GenerateResponse::Err { message: format!("{error:#}") },
             };
+            let tokens_generated = match &response {
+                GenerateResponse::Ok { tokens_generated, .. } => Some(*tokens_generated),
+                GenerateResponse::Err { .. } => None,
+            };
+            state.lock().expect("rampiped model store lock poisoned").record_outcome(&request.model_path, tokens_generated);
             let mut stream = stream;
             serde_json::to_writer(&mut stream, &response).context("encoding response")?;
             stream.write_all(b"\n").context("writing response")?;
@@ -315,11 +362,35 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
 /// `sessions`' keys, not for the duration of any generation.
 fn handle_status(state: &Mutex<SharedState>) -> rampipe::protocol::StatusResponse {
     let state = state.lock().expect("rampiped model store lock poisoned");
+    let (gpu_free_bytes, gpu_total_bytes) = match rampipe::llama::gpu_memory_bytes() {
+        Some((free, total)) => (Some(free), Some(total)),
+        None => (None, None),
+    };
+    let models = state
+        .sessions
+        .keys()
+        .map(|path| {
+            let stats = state.model_stats.get(path);
+            rampipe::protocol::ModelStatus {
+                path: path.clone(),
+                requests_served: stats.map_or(0, |s| s.requests_served),
+                tokens_generated: stats.map_or(0, |s| s.tokens_generated),
+                last_used_unix_secs: stats.map_or(0, |s| s.last_used_unix_secs),
+            }
+        })
+        .collect();
     rampipe::protocol::StatusResponse {
         pid: std::process::id(),
         exe_path: state.exe_snapshot.0.clone(),
         exe_modified_unix_secs: state.exe_snapshot.1,
-        resident_model_paths: state.sessions.keys().cloned().collect(),
+        uptime_secs: state.started_at.elapsed().as_secs(),
+        requests_served: state.requests_served,
+        requests_failed: state.requests_failed,
+        total_tokens_generated: state.total_tokens_generated,
+        resident_bytes: state.registry.mapped_bytes(),
+        gpu_free_bytes,
+        gpu_total_bytes,
+        models,
     }
 }
 
@@ -426,7 +497,19 @@ fn handle_conversation(
         }
 
         let turn_response = match serde_json::from_str::<ConversationTurnRequest>(line.trim()) {
-            Ok(turn) => run_conversation_turn(state, &mut conversation, &turn),
+            Ok(turn) => {
+                let response = run_conversation_turn(state, &mut conversation, &turn);
+                let tokens_generated = match &response {
+                    ConversationResponse::Turn { tokens_generated, .. } => Some(*tokens_generated),
+                    ConversationResponse::Opened | ConversationResponse::Err { .. } => None,
+                };
+                state.lock().expect("rampiped model store lock poisoned").record_outcome(&request.model_path, tokens_generated);
+                response
+            }
+            // A turn that never decoded never touched the model at all --
+            // nothing to record against it, same reasoning as `Ok(())`
+            // never being reached in `handle_request` when the model
+            // itself fails to load before generation is ever attempted.
             Err(error) => ConversationResponse::Err { message: format!("decoding conversation turn: {error:#}") },
         };
 

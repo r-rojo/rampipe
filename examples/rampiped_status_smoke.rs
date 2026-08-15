@@ -26,7 +26,12 @@ fn main() -> Result<()> {
     println!("  pid: {}", status.pid);
     println!("  exe path: {:?}", status.exe_path);
     println!("  exe modified (unix secs): {:?}", status.exe_modified_unix_secs);
-    println!("  resident models: {:?}", status.resident_model_paths);
+    println!("  uptime: {}s", status.uptime_secs);
+    println!("  requests served: {} (failed: {})", status.requests_served, status.requests_failed);
+    println!("  total tokens generated: {}", status.total_tokens_generated);
+    println!("  resident bytes: {}", status.resident_bytes);
+    println!("  gpu free/total bytes: {:?}/{:?}", status.gpu_free_bytes, status.gpu_total_bytes);
+    println!("  resident models: {:?}", status.models.iter().map(|m| &m.path).collect::<Vec<_>>());
 
     if status.pid == 0 {
         bail!("daemon reported pid 0 -- that's not a real process");

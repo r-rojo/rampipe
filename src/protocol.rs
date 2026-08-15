@@ -147,7 +147,46 @@ pub struct StatusResponse {
     /// what code this already-running process actually has loaded (the
     /// exact trap this field exists to let a client detect).
     pub exe_modified_unix_secs: Option<u64>,
-    pub resident_model_paths: Vec<PathBuf>,
+    /// Seconds since this process started -- lets a caller tell "long-
+    /// running, seen real traffic" apart from "just restarted" without
+    /// needing its own separate liveness tracking.
+    pub uptime_secs: u64,
+    /// Successful `Generate` requests and conversation turns combined,
+    /// since daemon startup. Cumulative, not a rate -- a caller wanting
+    /// throughput derives it from two samples' delta over their own
+    /// elapsed time, same as any other counter-style metric.
+    pub requests_served: u64,
+    /// Requests/turns that reached `rampiped` but failed (model load
+    /// error, decode error, etc.) -- counted separately from
+    /// `requests_served` rather than folded in, so a caller can compute
+    /// an error rate directly instead of needing to infer it.
+    pub requests_failed: u64,
+    /// Sum of `tokens_generated` across every successful request/turn
+    /// since startup.
+    pub total_tokens_generated: u64,
+    /// Total bytes currently mapped across every resident model, per
+    /// `SwapRegistry::mapped_bytes()` -- system RAM, not VRAM.
+    pub resident_bytes: usize,
+    /// Free/total VRAM in bytes, per whatever GPU backend device is
+    /// actually present (CUDA or Metal) -- `None` on a CPU-only build or
+    /// if no GPU device was found. Queried live at `Status`-request time,
+    /// not cached, since free VRAM is exactly the number that changes
+    /// moment to moment.
+    pub gpu_free_bytes: Option<u64>,
+    pub gpu_total_bytes: Option<u64>,
+    pub models: Vec<ModelStatus>,
+}
+
+/// Per-model counters, one entry per currently-resident model. Reset if a
+/// model is evicted and later reloaded -- these describe the *current*
+/// residency, not a model's lifetime history across evictions.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelStatus {
+    pub path: PathBuf,
+    pub requests_served: u64,
+    pub tokens_generated: u64,
+    /// Unix seconds of this model's most recent successful request/turn.
+    pub last_used_unix_secs: u64,
 }
 
 /// Mirrors `llama::OverflowPolicy` field-for-field, same reason

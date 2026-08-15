@@ -577,6 +577,29 @@ fn resolve_model_params(path: &Path, gpu_layers: GpuLayers) -> Result<Pin<Box<Ll
     }
 }
 
+/// Free/total VRAM in bytes, per whichever GPU backend device is actually
+/// present -- `ggml_backend_dev_by_type`/`ggml_backend_dev_memory` are the
+/// same backend-agnostic ggml calls `resolve_model_params`'s `fit_params`
+/// path relies on internally, so this reports exactly what auto-fitting
+/// itself sees, not a separate/inconsistent measurement. `None` if no GPU
+/// device is registered (CPU-only build, or none found at runtime).
+pub fn gpu_memory_bytes() -> Option<(u64, u64)> {
+    // Safety: `ggml_backend_dev_by_type` returns a null pointer (not a
+    // dangling one) when no device of that type is registered, checked
+    // below before the device handle is used for anything.
+    let device = unsafe { llama_cpp_sys_2::ggml_backend_dev_by_type(llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU) };
+    if device.is_null() {
+        return None;
+    }
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    // Safety: `device` was just checked non-null; `ggml_backend_dev_memory`
+    // writes exactly these two `usize` out-params, both valid local
+    // `&mut` targets.
+    unsafe { llama_cpp_sys_2::ggml_backend_dev_memory(device, &raw mut free, &raw mut total) };
+    Some((free as u64, total as u64))
+}
+
 impl LlamaSession {
     /// Loads `path` into `registry` (for residency accounting/eviction
     /// safety) and into llama.cpp (for actual inference), against
