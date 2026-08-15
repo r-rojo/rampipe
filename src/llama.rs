@@ -27,8 +27,10 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -58,6 +60,12 @@ pub enum LlamaSessionError {
     ApplyChatTemplate(#[from] llama_cpp_2::ApplyChatTemplateError),
     #[error("kv cache operation failed: {0}")]
     KvCache(#[from] llama_cpp_2::context::kv_cache::KvCacheConversionError),
+    #[error("model path is not valid UTF-8: {0}")]
+    PathNotUtf8(PathBuf),
+    #[error("model path contains a NUL byte: {0}")]
+    PathHasNul(#[from] std::ffi::NulError),
+    #[error("fitting model params to device memory: {0}")]
+    Fit(#[from] llama_cpp_2::model::params::FitError),
     #[error(
         "model has no chat template this crate can safely reuse turn-by-turn (either no \
          template at all, or its rendering isn't provably steady-state per turn) -- \
@@ -510,21 +518,98 @@ fn run_generation_loop(
     Ok((text, generated_tokens, time_to_first_token.unwrap_or_default()))
 }
 
+/// How many of a model's transformer layers to put on GPU. A fixed count
+/// baked into per-model config doesn't work for `rampiped`'s actual job:
+/// `SwapRegistry` keeps several models resident under one shared memory
+/// budget, so how many layers of *this* model fit depends on what else is
+/// already resident on the GPU right now, not on the model alone.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum GpuLayers {
+    /// Ask llama.cpp's own `common_fit_params` to decide, from actual free
+    /// device memory at load time (works for CUDA, Metal, or CPU-only --
+    /// it queries whatever backend device is present). The default.
+    #[default]
+    Auto,
+    /// Force exactly this many layers onto GPU, skipping the fit step --
+    /// escape hatch for when the auto estimate is wrong for a given model.
+    Fixed(u32),
+}
+
+/// Per-device memory margin `fit_params` leaves unused, and the minimum
+/// context size it tries to preserve when shrinking allocations to fit --
+/// same values llama.cpp's own CLI defaults to (`common/common.h`), kept
+/// in step rather than picked fresh, since fitting is inherently a "guess
+/// well" problem, not one this crate has a better answer to than upstream.
+const GPU_FIT_MARGIN_BYTES: usize = 1024 * 1024 * 1024;
+const GPU_FIT_MIN_CTX: u32 = 4096;
+
+/// Resolves `gpu_layers` into ready-to-load `LlamaModelParams`. Returned
+/// pinned because a successful `fit_params` call leaves raw pointers
+/// inside `LlamaModelParams` pointing at its own `tensor_split`/
+/// `tensor_buft_overrides` buffers -- moving the value afterward would
+/// invalidate them, so it must stay behind `Pin` all the way through the
+/// `load_from_file` call that actually reads it.
+fn resolve_model_params(path: &Path, gpu_layers: GpuLayers) -> Result<Pin<Box<LlamaModelParams>>, LlamaSessionError> {
+    match gpu_layers {
+        GpuLayers::Fixed(n) => Ok(Box::pin(LlamaModelParams::default().with_n_gpu_layers(n))),
+        GpuLayers::Auto => {
+            let path_str = path.to_str().ok_or_else(|| LlamaSessionError::PathNotUtf8(path.to_path_buf()))?;
+            let path_c = CString::new(path_str)?;
+            let mut params = Box::pin(LlamaModelParams::default());
+            // n_ctx=0 (via `with_n_ctx(None)`) tells `fit_params` to pick
+            // its own context size, floored at `GPU_FIT_MIN_CTX` -- using
+            // this crate's own default of 512 here would let it offload
+            // more layers than actually fit once a real conversation later
+            // opens a much larger context.
+            let mut cparams = LlamaContextParams::default().with_n_ctx(None);
+            let mut margins = vec![GPU_FIT_MARGIN_BYTES; unsafe { llama_cpp_sys_2::llama_max_devices() }];
+            match params.as_mut().fit_params(&path_c, &mut cparams, &mut margins, GPU_FIT_MIN_CTX, llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR) {
+                Ok(_) => Ok(params),
+                // No allocation was projected to fit within the memory
+                // margin -- fall back to CPU-only rather than failing the
+                // whole load; matches `common_fit_params`'s own "assumes
+                // system memory is unlimited" contract for the non-GPU
+                // side.
+                Err(llama_cpp_2::model::params::FitError::Failure) => Ok(Box::pin(LlamaModelParams::default().with_n_gpu_layers(0))),
+                Err(err) => Err(LlamaSessionError::Fit(err)),
+            }
+        }
+    }
+}
+
 impl LlamaSession {
     /// Loads `path` into `registry` (for residency accounting/eviction
     /// safety) and into llama.cpp (for actual inference), against
     /// `backend` — shared via `Arc` so several sessions (and any
     /// `Conversation`s opened from them) can outlive a single call
     /// without each needing `backend` handed to them again.
+    ///
+    /// GPU offload is decided automatically (see [`GpuLayers::Auto`]) --
+    /// use [`Self::load_with_gpu_layers`] to force a specific layer count
+    /// instead.
     pub fn load(
         registry: &SwapRegistry,
         backend: Arc<LlamaBackend>,
         path: impl AsRef<Path>,
         residency: Residency,
     ) -> Result<Self, LlamaSessionError> {
+        Self::load_with_gpu_layers(registry, backend, path, residency, GpuLayers::Auto)
+    }
+
+    /// Same as [`Self::load`], but with explicit control over how many
+    /// layers to offload to GPU instead of always auto-fitting. See
+    /// [`GpuLayers`].
+    pub fn load_with_gpu_layers(
+        registry: &SwapRegistry,
+        backend: Arc<LlamaBackend>,
+        path: impl AsRef<Path>,
+        residency: Residency,
+        gpu_layers: GpuLayers,
+    ) -> Result<Self, LlamaSessionError> {
         let path = path.as_ref();
         let handle = registry.load(path, residency)?;
-        let model = LlamaModel::load_from_file(&backend, path, &LlamaModelParams::default())?;
+        let params = resolve_model_params(path, gpu_layers)?;
+        let model = LlamaModel::load_from_file(&backend, path, &params)?;
         Ok(Self { handle, model, backend, chat_wrap: None })
     }
 
