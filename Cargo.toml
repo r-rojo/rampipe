@@ -67,6 +67,10 @@ required-features = ["client"]
 name = "rampiped_conversation_smoke"
 required-features = ["client"]
 
+[[example]]
+name = "model_stress_test"
+required-features = ["client"]
+
 [[bin]]
 name = "rampiped"
 required-features = ["llama"]
