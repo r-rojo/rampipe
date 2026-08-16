@@ -16,6 +16,14 @@
 //!   querying `Status` after each request so the resident set and free
 //!   VRAM are visible changing in response to real eviction.
 //!
+//! Every scenario, regardless of mode, also writes
+//! `stress-test-output/<hostname>/<scenario-name>.json` -- structured
+//! metrics (timing, tokens, residency) *and* each request's generated
+//! text in one file, so results from different machines can be diffed
+//! or scripted against instead of only read from scrollback. Sequential
+//! mode additionally keeps its plain per-model `.txt` files, for quick
+//! `cat`-and-read without parsing JSON.
+//!
 //! See `examples/stress_test_scenarios.yaml` for the default scenarios
 //! (YAML anchors keep the shared model list and prompt defined once).
 //!
@@ -30,12 +38,12 @@ use anyhow::{Context, Result};
 use hf_hub::HFClientSync;
 use rampipe::client::RampipedClient;
 use rampipe::protocol::WireSampling;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CONFIG_PATH: &str = "examples/stress_test_scenarios.yaml";
 const DEFAULT_OUT_DIR: &str = "stress-test-output";
@@ -64,7 +72,7 @@ struct Scenario {
     models: Vec<ModelSpec>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Mode {
     Sequential,
@@ -78,6 +86,47 @@ struct ModelSpec {
     repo_owner: String,
     repo_name: String,
     filename: String,
+}
+
+/// One request's full outcome -- shared across all three modes, which
+/// each populate only the fields relevant to them (`round`/`gpu_free_bytes`/
+/// `resident_models` for churn, `queued_at_ms`/`done_at_ms` for concurrent,
+/// `wall_ms` for sequential/churn) and leave the rest `None`, omitted
+/// from the JSON via `skip_serializing_if` rather than serialized as
+/// null noise for fields that mode never produces.
+#[derive(Debug, Serialize, Default)]
+struct RequestRecord {
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    round: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_at_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    done_at_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wall_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_generated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_to_first_token_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_free_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resident_models: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunRecord {
+    scenario: String,
+    mode: Mode,
+    hostname: String,
+    started_at_unix_secs: u64,
+    prompt: String,
+    results: Vec<RequestRecord>,
 }
 
 fn download_model(spec: &ModelSpec) -> Result<PathBuf> {
@@ -107,14 +156,14 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     if pos < args.len() { Some(args.remove(pos)) } else { None }
 }
 
-/// This machine's hostname, for tagging sequential-mode output paths so
-/// results from different machines (e.g. a Mac and genie, both writing
-/// to the same relative `stress-test-output/`) never collide if copied
-/// into one place for comparison -- std has no cross-platform hostname
-/// getter, and this is example/dev tooling, so shelling out to the
-/// `hostname` command (present on both macOS and Linux) is simpler than
-/// adding a dependency for it. Falls back to a fixed placeholder rather
-/// than failing the whole run if that's ever unavailable.
+/// This machine's hostname, for tagging output paths so results from
+/// different machines (e.g. a Mac and genie, both writing to the same
+/// relative `stress-test-output/`) never collide if copied into one
+/// place for comparison -- std has no cross-platform hostname getter,
+/// and this is example/dev tooling, so shelling out to the `hostname`
+/// command (present on both macOS and Linux) is simpler than adding a
+/// dependency for it. Falls back to a fixed placeholder rather than
+/// failing the whole run if that's ever unavailable.
 fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
@@ -126,28 +175,38 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown-host".to_string())
 }
 
+/// Writes `results` (plus scenario metadata) to
+/// `<out_dir>/<scenario-name>.json` -- the one place, across all three
+/// modes, that both structured metrics and the generated text end up
+/// persisted rather than only printed.
+fn write_json_results(out_dir: &Path, scenario: &Scenario, results: Vec<RequestRecord>) -> Result<()> {
+    let record = RunRecord {
+        scenario: scenario.name.clone(),
+        mode: scenario.mode,
+        hostname: hostname(),
+        started_at_unix_secs: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        prompt: scenario.prompt.clone(),
+        results,
+    };
+    let json_path = out_dir.join(format!("{}.json", scenario.name));
+    let json_text = serde_json::to_string_pretty(&record).context("serializing results to JSON")?;
+    fs::write(&json_path, json_text).with_context(|| format!("writing {}", json_path.display()))?;
+    println!("  results (metrics + text) written to {}", json_path.display());
+    Ok(())
+}
+
 /// Sequential mode: one prompt through every model, one after another,
 /// each model's own download/generate failure caught and reported
 /// inline rather than aborting the rest -- unlike concurrent/churn,
 /// there's no shared "all models must already be present" setup step
 /// here, so there's nothing lost by handling failures per-model instead
 /// of failing the whole scenario up front.
-fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
+fn run_sequential(client: &RampipedClient, scenario: &Scenario, out_dir: &Path) -> Result<()> {
     let max_new_tokens = scenario.max_new_tokens.unwrap_or(DEFAULT_SEQUENTIAL_MAX_NEW_TOKENS);
-    let out_dir = PathBuf::from(scenario.out_dir.as_deref().unwrap_or(DEFAULT_OUT_DIR)).join(hostname());
-    fs::create_dir_all(&out_dir).with_context(|| format!("creating output directory {}", out_dir.display()))?;
 
     println!("=== prompt ===\n{}\n", scenario.prompt);
 
-    struct Outcome {
-        label: String,
-        tokens_generated: usize,
-        time_to_first_token_ms: u64,
-        wall_ms: u128,
-        out_path: PathBuf,
-    }
-    let mut results: Vec<Outcome> = Vec::new();
-    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+    let mut records: Vec<RequestRecord> = Vec::new();
 
     for spec in &scenario.models {
         println!("--- {} ---", spec.label);
@@ -156,7 +215,7 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
             Ok(p) => p,
             Err(err) => {
                 eprintln!("  download failed: {err:#}");
-                failures.push((spec.label.clone(), err));
+                records.push(RequestRecord { label: spec.label.clone(), error: Some(format!("{err:#}")), ..Default::default() });
                 continue;
             }
         };
@@ -167,7 +226,7 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
             Ok(o) => o,
             Err(err) => {
                 eprintln!("  generate failed: {err:#}");
-                failures.push((spec.label.clone(), err.into()));
+                records.push(RequestRecord { label: spec.label.clone(), error: Some(format!("{err:#}")), ..Default::default() });
                 continue;
             }
         };
@@ -183,27 +242,30 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
             wall_ms,
             out_path.display()
         );
-        results.push(Outcome {
+        records.push(RequestRecord {
             label: spec.label.clone(),
-            tokens_generated: outcome.tokens_generated,
-            time_to_first_token_ms: outcome.time_to_first_token_ms,
-            wall_ms,
-            out_path,
+            wall_ms: Some(wall_ms),
+            tokens_generated: Some(outcome.tokens_generated),
+            time_to_first_token_ms: Some(outcome.time_to_first_token_ms),
+            text: Some(outcome.text),
+            ..Default::default()
         });
     }
 
     println!("\n=== summary ===");
-    println!("{:<20} {:>10} {:>12} {:>12} {}", "model", "tokens", "ttft (ms)", "wall (ms)", "output file");
-    for r in &results {
-        println!("{:<20} {:>10} {:>12} {:>12} {}", r.label, r.tokens_generated, r.time_to_first_token_ms, r.wall_ms, r.out_path.display());
+    println!("{:<20} {:>10} {:>12} {:>12}", "model", "tokens", "ttft (ms)", "wall (ms)");
+    let failures: Vec<&RequestRecord> = records.iter().filter(|r| r.error.is_some()).collect();
+    for r in records.iter().filter(|r| r.error.is_none()) {
+        println!("{:<20} {:>10} {:>12} {:>12}", r.label, r.tokens_generated.unwrap_or(0), r.time_to_first_token_ms.unwrap_or(0), r.wall_ms.unwrap_or(0));
     }
     if !failures.is_empty() {
         println!("\n{} of {} models failed:", failures.len(), scenario.models.len());
-        for (label, err) in &failures {
-            println!("  {label}: {err:#}");
+        for r in &failures {
+            println!("  {}: {}", r.label, r.error.as_deref().unwrap_or("unknown error"));
         }
     }
-    Ok(())
+
+    write_json_results(out_dir, scenario, records)
 }
 
 /// Concurrent mode: fire one request per model at (as close to) the
@@ -211,7 +273,7 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
 /// call starts only once every thread has connected -- otherwise an
 /// early thread's request could finish before a slow-to-connect one
 /// even started, defeating the point of testing concurrent arrival.
-fn run_concurrent_phase(socket_path: &Path, scenario: &Scenario, models: &[(String, PathBuf)]) -> Result<()> {
+fn run_concurrent_phase(socket_path: &Path, scenario: &Scenario, models: &[(String, PathBuf)], out_dir: &Path) -> Result<()> {
     let max_new_tokens = scenario.max_new_tokens.unwrap_or(DEFAULT_TIMING_MAX_NEW_TOKENS);
     let barrier = Arc::new(Barrier::new(models.len()));
     let start = Instant::now();
@@ -227,58 +289,66 @@ fn run_concurrent_phase(socket_path: &Path, scenario: &Scenario, models: &[(Stri
             let socket_path = socket_path.to_path_buf();
             let barrier = Arc::clone(&barrier);
             let prompt = prompt.clone();
-            thread::spawn(move || -> (String, Result<(u128, u128, usize)>) {
-                let result = (|| -> Result<(u128, u128, usize)> {
+            thread::spawn(move || -> RequestRecord {
+                let result = (|| -> Result<(u128, u128, usize, String)> {
                     let client = RampipedClient::connect(&socket_path).context("connecting")?;
                     barrier.wait();
                     let queued_at_ms = start.elapsed().as_millis();
                     let outcome =
                         client.generate(&model_path, &prompt, max_new_tokens, WireSampling::Greedy, None, None, None).context("generate")?;
                     let done_at_ms = start.elapsed().as_millis();
-                    Ok((queued_at_ms, done_at_ms, outcome.tokens_generated))
+                    Ok((queued_at_ms, done_at_ms, outcome.tokens_generated, outcome.text))
                 })();
-                (label, result)
+                match result {
+                    Ok((queued_at_ms, done_at_ms, tokens, text)) => RequestRecord {
+                        label,
+                        queued_at_ms: Some(queued_at_ms),
+                        done_at_ms: Some(done_at_ms),
+                        tokens_generated: Some(tokens),
+                        text: Some(text),
+                        ..Default::default()
+                    },
+                    Err(err) => RequestRecord { label, error: Some(format!("{err:#}")), ..Default::default() },
+                }
             })
         })
         .collect();
 
-    let mut results: Vec<(String, u128, u128, usize)> = Vec::new();
-    let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
-    for handle in handles {
-        let (label, result) = handle.join().expect("thread panicked");
-        match result {
-            Ok((queued_at_ms, done_at_ms, tokens)) => results.push((label, queued_at_ms, done_at_ms, tokens)),
-            Err(err) => failures.push((label, err)),
-        }
-    }
-    results.sort_by_key(|&(_, _, done_at_ms, _)| done_at_ms);
+    let mut records: Vec<RequestRecord> = handles.into_iter().map(|h| h.join().expect("thread panicked")).collect();
+    records.sort_by_key(|r| r.done_at_ms.unwrap_or(u128::MAX));
 
     println!("{:<20} {:>12} {:>12} {:>8}", "model", "queued (ms)", "done (ms)", "tokens");
-    for (label, queued_at_ms, done_at_ms, tokens) in &results {
-        println!("{label:<20} {queued_at_ms:>12} {done_at_ms:>12} {tokens:>8}");
+    let mut failure_count = 0;
+    for r in &records {
+        match &r.error {
+            None => println!("{:<20} {:>12} {:>12} {:>8}", r.label, r.queued_at_ms.unwrap_or(0), r.done_at_ms.unwrap_or(0), r.tokens_generated.unwrap_or(0)),
+            Some(err) => {
+                failure_count += 1;
+                println!("{:<20}  failed: {err}", r.label);
+            }
+        }
     }
     println!(
         "  (all queued near t=0; staggered \"done\" times are rampiped's single-decode-at-a-time \
          lock serializing them, not a bug -- see bin/rampiped.rs's own module doc comment)"
     );
-    if !failures.is_empty() {
-        println!("  {} of {} models failed:", failures.len(), models.len());
-        for (label, err) in &failures {
-            println!("    {label}: {err:#}");
-        }
+    if failure_count > 0 {
+        println!("  {failure_count} of {} models failed", records.len());
     }
-    Ok(())
+
+    write_json_results(out_dir, scenario, records)
 }
 
 /// Churn mode: sequentially cycle through every model, `rounds` times,
 /// querying `Status` after each request so the resident set and free
 /// VRAM are visible changing in response to real eviction, not inferred
 /// from timing alone.
-fn run_churn_phase(client: &RampipedClient, scenario: &Scenario, models: &[(String, PathBuf)]) -> Result<()> {
+fn run_churn_phase(client: &RampipedClient, scenario: &Scenario, models: &[(String, PathBuf)], out_dir: &Path) -> Result<()> {
     let max_new_tokens = scenario.max_new_tokens.unwrap_or(DEFAULT_TIMING_MAX_NEW_TOKENS);
     let rounds = scenario.rounds.unwrap_or(DEFAULT_ROUNDS);
 
     println!("{:<20} {:>6} {:>10} {:>8}  {:<15} resident models", "model", "round", "wall (ms)", "tokens", "gpu free");
+    let mut records: Vec<RequestRecord> = Vec::new();
     let mut failure_count = 0;
     for round in 1..=rounds {
         for (label, model_path) in models {
@@ -290,6 +360,7 @@ fn run_churn_phase(client: &RampipedClient, scenario: &Scenario, models: &[(Stri
                 Err(err) => {
                     failure_count += 1;
                     println!("{label:<20} {round:>6}  generate failed: {err:#}");
+                    records.push(RequestRecord { label: label.clone(), round: Some(round), error: Some(format!("{err:#}")), ..Default::default() });
                     continue;
                 }
             };
@@ -297,14 +368,25 @@ fn run_churn_phase(client: &RampipedClient, scenario: &Scenario, models: &[(Stri
             let status = client.status().context("status")?;
             let resident: Vec<String> =
                 status.models.iter().filter_map(|m| m.path.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
-            let gpu_free = status.gpu_free_bytes.map(|b| format!("{:.1}GB", b as f64 / 1e9)).unwrap_or_else(|| "n/a".to_string());
-            println!("{label:<20} {round:>6} {wall_ms:>10} {:>8}  {gpu_free:<15} {resident:?}", outcome.tokens_generated);
+            let gpu_free_display = status.gpu_free_bytes.map(|b| format!("{:.1}GB", b as f64 / 1e9)).unwrap_or_else(|| "n/a".to_string());
+            println!("{label:<20} {round:>6} {wall_ms:>10} {:>8}  {gpu_free_display:<15} {resident:?}", outcome.tokens_generated);
+            records.push(RequestRecord {
+                label: label.clone(),
+                round: Some(round),
+                wall_ms: Some(wall_ms),
+                tokens_generated: Some(outcome.tokens_generated),
+                gpu_free_bytes: status.gpu_free_bytes,
+                resident_models: Some(resident),
+                text: Some(outcome.text),
+                ..Default::default()
+            });
         }
     }
     if failure_count > 0 {
         println!("  {failure_count} request(s) failed across all rounds");
     }
-    Ok(())
+
+    write_json_results(out_dir, scenario, records)
 }
 
 fn main() -> Result<()> {
@@ -330,17 +412,20 @@ fn main() -> Result<()> {
 
     for scenario in scenarios {
         println!("\n########## scenario: {} ({:?}) ##########", scenario.name, scenario.mode);
+        let out_dir = PathBuf::from(scenario.out_dir.as_deref().unwrap_or(DEFAULT_OUT_DIR)).join(hostname());
+        fs::create_dir_all(&out_dir).with_context(|| format!("creating output directory {}", out_dir.display()))?;
+
         match scenario.mode {
-            Mode::Sequential => run_sequential(&client, scenario)?,
+            Mode::Sequential => run_sequential(&client, scenario, &out_dir)?,
             Mode::Concurrent => {
                 println!("=== downloading/locating models (cached after first run) ===");
                 let models = download_all(&scenario.models)?;
-                run_concurrent_phase(&socket_path, scenario, &models)?;
+                run_concurrent_phase(&socket_path, scenario, &models, &out_dir)?;
             }
             Mode::Churn => {
                 println!("=== downloading/locating models (cached after first run) ===");
                 let models = download_all(&scenario.models)?;
-                run_churn_phase(&client, scenario, &models)?;
+                run_churn_phase(&client, scenario, &models, &out_dir)?;
             }
         }
     }
