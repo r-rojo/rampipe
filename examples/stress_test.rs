@@ -107,6 +107,25 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
     if pos < args.len() { Some(args.remove(pos)) } else { None }
 }
 
+/// This machine's hostname, for tagging sequential-mode output paths so
+/// results from different machines (e.g. a Mac and genie, both writing
+/// to the same relative `stress-test-output/`) never collide if copied
+/// into one place for comparison -- std has no cross-platform hostname
+/// getter, and this is example/dev tooling, so shelling out to the
+/// `hostname` command (present on both macOS and Linux) is simpler than
+/// adding a dependency for it. Falls back to a fixed placeholder rather
+/// than failing the whole run if that's ever unavailable.
+fn hostname() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
 /// Sequential mode: one prompt through every model, one after another,
 /// each model's own download/generate failure caught and reported
 /// inline rather than aborting the rest -- unlike concurrent/churn,
@@ -115,7 +134,7 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
 /// of failing the whole scenario up front.
 fn run_sequential(client: &RampipedClient, scenario: &Scenario) -> Result<()> {
     let max_new_tokens = scenario.max_new_tokens.unwrap_or(DEFAULT_SEQUENTIAL_MAX_NEW_TOKENS);
-    let out_dir = PathBuf::from(scenario.out_dir.as_deref().unwrap_or(DEFAULT_OUT_DIR));
+    let out_dir = PathBuf::from(scenario.out_dir.as_deref().unwrap_or(DEFAULT_OUT_DIR)).join(hostname());
     fs::create_dir_all(&out_dir).with_context(|| format!("creating output directory {}", out_dir.display()))?;
 
     println!("=== prompt ===\n{}\n", scenario.prompt);
