@@ -1,3 +1,5 @@
 /target
 /modelswap-from-claude.zip
 /.claude
+/stress-test-output
+/nohup.out

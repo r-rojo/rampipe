@@ -1,0 +1,56 @@
+# Scenarios for examples/stress_test.rs. Run all of them:
+#   cargo run --release --features client --example stress_test -- <socket-path>
+# or just one:
+#   cargo run --release --features client --example stress_test -- <socket-path> --scenario pubsub-sequential
+
+models: &pubsub-models
+  - label: qwen2.5-coder-7b
+    repo_owner: Qwen
+    repo_name: Qwen2.5-Coder-7B-Instruct-GGUF
+    filename: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+  - label: qwen2.5-coder-14b
+    repo_owner: Qwen
+    repo_name: Qwen2.5-Coder-14B-Instruct-GGUF
+    filename: qwen2.5-coder-14b-instruct-q4_k_m.gguf
+  - label: llama-3.1-8b
+    repo_owner: bartowski
+    repo_name: Meta-Llama-3.1-8B-Instruct-GGUF
+    filename: Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+  # ~18.5GB, single file -- doesn't fit genie's 16GB VRAM at all (runs
+  # mostly on CPU there), but fits a Mac with real headroom for KV
+  # cache/compute buffers on top. Q6_K_L (~25.4GB) was tried first and
+  # failed decode on a 32GB Mac (Metal's own GPU working-set ceiling
+  # there is ~25GB total, not free -- a model that size alone left
+  # nothing for anything else). Q4_K_M leaves several GB of margin, same
+  # quant level used for every other model here.
+  - label: qwen2.5-32b
+    repo_owner: bartowski
+    repo_name: Qwen2.5-32B-Instruct-GGUF
+    filename: Qwen2.5-32B-Instruct-Q4_K_M.gguf
+
+prompt: &pubsub-prompt >-
+  write a program in rust that serves as a multi-client pub/sub messaging
+  framework, call the project mpipe. acceptance criteria: multiple clients
+  can publish and subscribe to differnet topics and send messages to each
+  topic and every subscriber receives them. Unit tests pass.
+
+scenarios:
+  - name: pubsub-sequential
+    mode: sequential
+    prompt: *pubsub-prompt
+    max_new_tokens: 4096
+    out_dir: stress-test-output
+    models: *pubsub-models
+
+  - name: pubsub-concurrent
+    mode: concurrent
+    prompt: *pubsub-prompt
+    max_new_tokens: 200
+    models: *pubsub-models
+
+  - name: pubsub-churn
+    mode: churn
+    prompt: *pubsub-prompt
+    max_new_tokens: 200
+    rounds: 2
+    models: *pubsub-models

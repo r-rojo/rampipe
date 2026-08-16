@@ -18,6 +18,7 @@ anyhow = "1"
 [dev-dependencies]
 tempfile = "3.27.0"
 hf-hub = { version = "1.0", features = ["blocking"] }
+serde_yaml = "0.9"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 mach2 = "0.6.0"
@@ -68,11 +69,7 @@ name = "rampiped_conversation_smoke"
 required-features = ["client"]
 
 [[example]]
-name = "model_stress_test"
-required-features = ["client"]
-
-[[example]]
-name = "model_concurrency_stress_test"
+name = "stress_test"
 required-features = ["client"]
 
 [[bin]]
