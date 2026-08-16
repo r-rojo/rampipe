@@ -71,6 +71,10 @@ required-features = ["client"]
 name = "model_stress_test"
 required-features = ["client"]
 
+[[example]]
+name = "model_concurrency_stress_test"
+required-features = ["client"]
+
 [[bin]]
 name = "rampiped"
 required-features = ["llama"]
