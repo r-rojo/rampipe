@@ -275,27 +275,53 @@ impl SharedState {
     fn make_room_for(&mut self, path: &Path) -> Result<()> {
         let new_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         loop {
-            match self.registry.fits_within_budget(new_size_bytes, self.budget_fraction) {
+            let host_fits = match self.registry.fits_within_budget(new_size_bytes, self.budget_fraction) {
                 // `None`: can't measure free memory on this platform --
                 // best-effort proceed rather than refuse a request over
-                // something unmeasurable. `Some(true)`: already fits.
-                None | Some(true) => return Ok(()),
-                Some(false) => {}
+                // something unmeasurable.
+                None => true,
+                Some(fits) => fits,
+            };
+            // `new_size_bytes` (the file's on-disk size) doubles as the
+            // device-memory estimate too, same "file size as a stand-in
+            // for what full residency would cost" reasoning
+            // `fits_within_budget` already applies to host memory -- see
+            // that call's own precedent, not a separately invented
+            // number. `None` (no GPU device present) means there's no
+            // device budget to violate.
+            let device_fits = match rampipe::llama::gpu_memory_bytes() {
+                Some((free, _total)) => self.registry.fits_within_device_budget(new_size_bytes, free, self.budget_fraction),
+                None => true,
+            };
+            if host_fits && device_fits {
+                return Ok(());
             }
 
             let lru_ids = self.registry.resident_ids_by_lru();
             let evictable = lru_ids.into_iter().find_map(|id| {
                 let evict_path = self.path_for_id(id)?;
                 let session = self.sessions.get(&evict_path)?;
-                (Arc::strong_count(session) == 1).then_some((id, evict_path))
+                if Arc::strong_count(session) != 1 {
+                    return None;
+                }
+                // Host memory is already fine and only device memory is
+                // under pressure: evicting a model that never touched the
+                // GPU (no recorded device bytes) wouldn't free any VRAM,
+                // so skip it and look further down the LRU list for one
+                // that actually holds device memory.
+                if host_fits && !device_fits && session.device_bytes().is_none() {
+                    return None;
+                }
+                Some((id, evict_path))
             });
             let Some((evict_id, evict_path)) = evictable else {
                 // Over budget but nothing evictable -- either nothing's
-                // resident, or everything resident is pinned by a live
-                // conversation. A single model bigger than the whole
-                // budget (or a budget fully consumed by pinned models)
-                // must still be servable, not refused outright, so
-                // proceed anyway.
+                // resident, everything resident is pinned by a live
+                // conversation, or (device-only pressure) nothing
+                // resident actually holds GPU memory to reclaim. A single
+                // model bigger than the whole budget (or a budget fully
+                // consumed by pinned models) must still be servable, not
+                // refused outright, so proceed anyway.
                 return Ok(());
             };
 

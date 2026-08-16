@@ -242,6 +242,74 @@ fn fits_within_budget_counts_already_resident_bytes_toward_the_ceiling() {
 }
 
 #[test]
+fn device_bytes_is_none_until_recorded() {
+    let f = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+    let handle = registry.load(f.path(), Residency::Lazy).expect("load");
+
+    assert_eq!(handle.device_bytes(), None, "nothing has reported a GPU measurement yet");
+    registry.record_device_bytes(handle.id(), 12_345);
+    assert_eq!(handle.device_bytes(), Some(12_345), "a handle obtained before recording still sees the update, via the shared Resident");
+}
+
+#[test]
+fn record_device_bytes_is_a_noop_for_an_id_that_was_evicted() {
+    let f = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+    let handle = registry.load(f.path(), Residency::Lazy).expect("load");
+    let id = handle.id();
+    drop(handle);
+    registry.evict(id).expect("evict");
+
+    // Must not panic -- the whole point of this being a no-op rather than
+    // an error is that a caller measuring a GPU load that raced with an
+    // eviction shouldn't have to handle a new failure mode for it.
+    registry.record_device_bytes(id, 999);
+    assert_eq!(registry.device_resident_bytes(), 0);
+}
+
+#[test]
+fn device_resident_bytes_sums_only_models_with_recorded_bytes() {
+    let cpu_only = gguf_fixture(4096);
+    let gpu_backed = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+    registry.load(cpu_only.path(), Residency::Lazy).expect("load");
+    let gpu_handle = registry.load(gpu_backed.path(), Residency::Lazy).expect("load");
+    registry.record_device_bytes(gpu_handle.id(), 500);
+
+    assert_eq!(registry.device_resident_bytes(), 500, "the CPU-only model should contribute nothing");
+}
+
+#[test]
+fn fits_within_device_budget_is_true_for_a_tiny_model_at_a_generous_budget() {
+    let registry = SwapRegistry::new();
+    assert!(registry.fits_within_device_budget(1024, 16 * 1024 * 1024 * 1024, 1.0), "1KB should trivially fit in 16GB free at a 100% budget");
+}
+
+#[test]
+fn fits_within_device_budget_is_false_when_little_device_memory_is_free() {
+    let registry = SwapRegistry::new();
+    assert!(
+        !registry.fits_within_device_budget(8 * 1024 * 1024 * 1024, 1024, 0.8),
+        "an 8GB model can't fit in 1KB of free device memory"
+    );
+}
+
+#[test]
+fn fits_within_device_budget_counts_recorded_device_bytes_toward_the_ceiling() {
+    // A budget of 0.0 means "nothing may ever fit, including what's
+    // already resident" -- proves recorded device bytes are actually
+    // counted in the ceiling, not just free device memory alone, mirroring
+    // `fits_within_budget_counts_already_resident_bytes_toward_the_ceiling`.
+    let f = gguf_fixture(4096);
+    let registry = SwapRegistry::new();
+    let handle = registry.load(f.path(), Residency::Lazy).expect("load");
+    registry.record_device_bytes(handle.id(), 4 * 1024 * 1024 * 1024);
+
+    assert!(!registry.fits_within_device_budget(1, 16 * 1024 * 1024 * 1024, 0.0), "a 0.0 budget fraction should never fit anything");
+}
+
+#[test]
 fn resident_fraction_is_populated_regardless_of_residency_mode() {
     // Whether or not this platform has a working mincore, the field itself
     // should be computed the same way for every mode -- it's not something

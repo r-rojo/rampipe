@@ -632,7 +632,20 @@ impl LlamaSession {
         let path = path.as_ref();
         let handle = registry.load(path, residency)?;
         let params = resolve_model_params(path, gpu_layers)?;
+        // Free-device-bytes immediately before/after the one call that
+        // actually touches the GPU -- the delta is this model's real GPU
+        // footprint, same before/after-measurement shape
+        // `SwapMetrics::rss_delta_bytes` already uses for host memory.
+        // Only reported to the registry on success: a failed load never
+        // makes it into `SharedState.sessions` (see `ensure_loaded`), so
+        // there'd be nothing meaningful to attribute the measurement to.
+        let gpu_free_before = gpu_memory_bytes().map(|(free, _)| free);
         let model = LlamaModel::load_from_file(&backend, path, &params)?;
+        if let Some(free_before) = gpu_free_before
+            && let Some((free_after, _)) = gpu_memory_bytes()
+        {
+            registry.record_device_bytes(handle.id(), free_before.saturating_sub(free_after));
+        }
         Ok(Self { handle, model, backend, chat_wrap: None })
     }
 
@@ -662,6 +675,12 @@ impl LlamaSession {
     /// when deciding what to evict.
     pub fn id(&self) -> crate::ModelId {
         self.handle.id()
+    }
+
+    /// GPU/device memory this session's model is using, if any -- see
+    /// `ModelHandle::device_bytes`. `None` for a model that ran CPU-only.
+    pub fn device_bytes(&self) -> Option<u64> {
+        self.handle.device_bytes()
     }
 
     /// Runs a real generation, using a fresh context each call — no

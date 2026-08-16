@@ -110,6 +110,16 @@ struct Resident {
     path: PathBuf,
     mmap: Mmap,
     metrics: SwapMetrics,
+    /// GPU/device memory this model is using, if any -- `None` until a
+    /// caller reports it via `SwapRegistry::record_device_bytes` (unknown
+    /// at `load()` time: mapping the file and touching a GPU are separate
+    /// steps, done by different layers -- see that method's own doc
+    /// comment), and always `None` for a model that only ever ran on
+    /// CPU/host memory. `Mutex`, not a plain field, because `Resident`
+    /// is shared via `Arc` between the registry's own table and every
+    /// `ModelHandle` clone, all of which need to see an update made after
+    /// the fact through any of them.
+    device_bytes: Mutex<Option<u64>>,
 }
 
 /// A live reference to a mapped model. While any handle for a given model is
@@ -137,6 +147,14 @@ impl ModelHandle {
 
     pub fn metrics(&self) -> SwapMetrics {
         self.inner.metrics
+    }
+
+    /// GPU/device memory this model is using, per the most recent
+    /// `SwapRegistry::record_device_bytes` call for its id -- `None` if
+    /// that's never been called (e.g. a CPU-only load, or a GPU-touching
+    /// load that hasn't reported its measurement yet).
+    pub fn device_bytes(&self) -> Option<u64> {
+        *self.inner.device_bytes.lock().expect("rampipe registry lock poisoned")
     }
 }
 
@@ -245,7 +263,7 @@ impl SwapRegistry {
 
         let id = ModelId(state.next_id);
         state.next_id += 1;
-        let inner = Arc::new(Resident { path: path.clone(), mmap, metrics });
+        let inner = Arc::new(Resident { path: path.clone(), mmap, metrics, device_bytes: Mutex::new(None) });
         state.resident.insert(id, inner.clone());
         state.by_path.insert(path, id);
         state.last_accessed.insert(id, Instant::now());
@@ -330,6 +348,59 @@ impl SwapRegistry {
         let mapped = self.mapped_bytes() as u64;
         let available_for_models = free + mapped;
         Some((mapped + new_size_bytes) as f64 <= budget_fraction * available_for_models as f64)
+    }
+
+    /// Records `bytes` as the GPU/device memory footprint of the resident
+    /// model `id` -- by convention, free-device-memory immediately before
+    /// its GPU-touching load minus free-device-memory immediately after,
+    /// the same before/after-delta shape `SwapMetrics::rss_delta_bytes`
+    /// already uses for host memory. Not measured by this crate directly:
+    /// on unified-memory hardware (Apple Silicon) host and device memory
+    /// are the same physical pool, so `fits_within_budget` alone already
+    /// modeled the real constraint correctly -- CUDA is what introduced a
+    /// second, genuinely separate pool this registry needs to track, and
+    /// querying it needs backend-specific FFI (CUDA/Metal) this crate's
+    /// core deliberately stays free of (see the module doc comment on
+    /// `llama` being an optional, heavier feature). A caller that has
+    /// that FFI available (`rampipe::llama::gpu_memory_bytes`) reports the
+    /// measurement here after the fact instead.
+    ///
+    /// A no-op if `id` isn't resident (e.g. evicted between its `load()`
+    /// returning and this being called) -- rare, not a caller error worth
+    /// failing over.
+    pub fn record_device_bytes(&self, id: ModelId, bytes: u64) {
+        let state = self.state.lock().expect("rampipe registry lock poisoned");
+        if let Some(resident) = state.resident.get(&id) {
+            *resident.device_bytes.lock().expect("rampipe registry lock poisoned") = Some(bytes);
+        }
+    }
+
+    /// Total device bytes recorded across resident models (models with no
+    /// recorded device bytes -- CPU-only, or not yet reported -- count as
+    /// zero). Mirrors `mapped_bytes()`'s "ceiling, not current cost"
+    /// framing, just for the device-memory dimension.
+    pub fn device_resident_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("rampipe registry lock poisoned")
+            .resident
+            .values()
+            .filter_map(|r| *r.device_bytes.lock().expect("rampipe registry lock poisoned"))
+            .sum()
+    }
+
+    /// Device-memory sibling of `fits_within_budget`: whether a model
+    /// estimated to need `new_device_bytes` would keep total device-
+    /// resident bytes within `budget_fraction` of what's available.
+    /// `free_device_bytes` is supplied by the caller rather than measured
+    /// here -- see `record_device_bytes`'s doc comment for why. Always
+    /// `Some`, unlike `fits_within_budget`: a caller that can supply
+    /// `free_device_bytes` at all already has an answer, there's no
+    /// platform-can't-measure-it case to represent here.
+    pub fn fits_within_device_budget(&self, new_device_bytes: u64, free_device_bytes: u64, budget_fraction: f64) -> bool {
+        let resident = self.device_resident_bytes();
+        let available = free_device_bytes + resident;
+        (resident + new_device_bytes) as f64 <= budget_fraction * available as f64
     }
 }
 
