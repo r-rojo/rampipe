@@ -42,6 +42,12 @@ const MODELS: &[ModelSpec] = &[
     ModelSpec { label: "qwen2.5-coder-7b", repo_owner: "Qwen", repo_name: "Qwen2.5-Coder-7B-Instruct-GGUF", filename: "qwen2.5-coder-7b-instruct-q4_k_m.gguf" },
     ModelSpec { label: "qwen2.5-coder-14b", repo_owner: "Qwen", repo_name: "Qwen2.5-Coder-14B-Instruct-GGUF", filename: "qwen2.5-coder-14b-instruct-q4_k_m.gguf" },
     ModelSpec { label: "llama-3.1-8b", repo_owner: "bartowski", repo_name: "Meta-Llama-3.1-8B-Instruct-GGUF", filename: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf" },
+    // ~25.4GB, single file -- doesn't fit genie's 16GB VRAM at all (runs
+    // mostly on CPU there), but fits comfortably in a Mac's unified
+    // memory. Included to exercise the large end of what fit_params has
+    // to size for, not because every machine running this test can run
+    // it well.
+    ModelSpec { label: "qwen2.5-32b-q6kl", repo_owner: "bartowski", repo_name: "Qwen2.5-32B-Instruct-GGUF", filename: "Qwen2.5-32B-Instruct-Q6_K_L.gguf" },
 ];
 
 fn download_model(spec: &ModelSpec) -> Result<PathBuf> {
