@@ -86,6 +86,15 @@ pub enum LlamaSessionError {
     SnapshotMeta(#[from] serde_json::Error),
     #[error("conversation snapshot file I/O: {0}")]
     SnapshotIo(#[from] std::io::Error),
+    /// A non-in-process [`ConversationHandle`] implementation's own
+    /// transport/remote failure, flattened to a message so the trait can
+    /// keep one error type across in-process and socket-backed (and,
+    /// later, cross-machine) conversations. Never produced by anything in
+    /// this module — see `crate::client::RampipedConversation`'s own
+    /// `ConversationHandle` impl, which is what maps a `RampipedError`
+    /// onto this.
+    #[error("conversation backend error: {0}")]
+    Backend(String),
     /// Fail-closed rejection when a saved snapshot's own recorded model
     /// path doesn't match the session it's being reloaded against — a
     /// state file's KV cache bytes are tied to one specific model's
@@ -1301,6 +1310,15 @@ pub trait LocalModel: Send + Sync {
 /// The common surface every `LocalModel::open_conversation` result
 /// exposes, regardless of what's actually holding the state underneath
 /// (an in-process KV cache, or a session id round-tripped to a daemon).
+///
+/// `grammar_completion` is the *serializable* [`crate::protocol::
+/// GrammarCompletion`] rather than the `&dyn Fn(&str) -> bool` predicate
+/// `Conversation::send` itself takes, because a closure can't cross a
+/// socket: any implementation that isn't in-process has to receive this
+/// as data. The in-process implementation below converts it back into a
+/// predicate with [`crate::protocol::GrammarCompletion::into_predicate`],
+/// which is exactly what every caller was already doing by hand at its
+/// own call site.
 pub trait ConversationHandle {
     fn send(
         &mut self,
@@ -1309,7 +1327,7 @@ pub trait ConversationHandle {
         sampling: Sampling,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
-        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+        grammar_completion: Option<crate::protocol::GrammarCompletion>,
     ) -> Result<GenerationResult, LlamaSessionError>;
     fn turn_count(&self) -> usize;
 }
@@ -1322,9 +1340,10 @@ impl ConversationHandle for Conversation<'_> {
         sampling: Sampling,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
-        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+        grammar_completion: Option<crate::protocol::GrammarCompletion>,
     ) -> Result<GenerationResult, LlamaSessionError> {
-        Conversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_complete)
+        let grammar_complete = grammar_completion.map(crate::protocol::GrammarCompletion::into_predicate);
+        Conversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_complete.as_deref())
     }
 
     fn turn_count(&self) -> usize {
