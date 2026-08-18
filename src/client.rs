@@ -142,6 +142,14 @@ impl RampipedClient {
 pub struct RampipedConversation {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// Completed user/assistant exchanges on this conversation, counted
+    /// client-side. The daemon owns the real KV cache and its own turn
+    /// boundaries; nothing in the wire protocol reports them back, so
+    /// this is a local tally incremented per successful `send` purely to
+    /// satisfy `llama::ConversationHandle::turn_count`. Matches
+    /// `llama::Conversation::turn_count`'s own unit (exchanges, not
+    /// individual messages).
+    turns: usize,
 }
 
 impl RampipedConversation {
@@ -165,7 +173,7 @@ impl RampipedConversation {
         reader.read_line(&mut line).map_err(RampipedError::Read)?;
         let response: ConversationResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
         match response {
-            ConversationResponse::Opened => Ok(Self { reader, writer }),
+            ConversationResponse::Opened => Ok(Self { reader, writer, turns: 0 }),
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
             ConversationResponse::Turn { .. } => {
                 Err(RampipedError::Remote("rampiped sent a turn response before the conversation was opened".to_string()))
@@ -202,10 +210,59 @@ impl RampipedConversation {
         let response: ConversationResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
         match response {
             ConversationResponse::Turn { text, tokens_generated, time_to_first_token_ms, formatted_prompt } => {
+                self.turns += 1;
                 Ok(GenerateOutcome { text, tokens_generated, time_to_first_token_ms, formatted_prompt })
             }
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
             ConversationResponse::Opened => Err(RampipedError::Remote("rampiped re-sent Opened mid-conversation".to_string())),
         }
+    }
+}
+
+/// Makes a daemon-backed conversation usable through the same
+/// `llama::ConversationHandle` seam an in-process `llama::Conversation`
+/// already implements, so a caller holding `Box<dyn ConversationHandle>`
+/// no longer needs to know which backend it got — the case
+/// `llama::LocalModel`'s own doc comment already named ("a
+/// `rampiped`-socket-backed... implementation") but nothing provided.
+///
+/// Gated on `llama` as well as `client` because the trait itself lives
+/// behind the `llama` feature: a client-only build (the whole point of
+/// the `client` feature — talking to an already-running daemon without
+/// linking `llama-cpp-2`) still gets `RampipedConversation`'s own
+/// inherent `send`, just not this impl.
+#[cfg(feature = "llama")]
+impl crate::llama::ConversationHandle for RampipedConversation {
+    fn send(
+        &mut self,
+        message: &str,
+        max_new_tokens: i32,
+        sampling: crate::llama::Sampling,
+        grammar: Option<&str>,
+        assistant_prefill: Option<&str>,
+        grammar_completion: Option<GrammarCompletion>,
+    ) -> Result<crate::llama::GenerationResult, crate::llama::LlamaSessionError> {
+        let sampling = match sampling {
+            crate::llama::Sampling::Greedy => WireSampling::Greedy,
+            crate::llama::Sampling::Temperature { temperature, top_k, seed } => {
+                WireSampling::Temperature { temperature, top_k, seed }
+            }
+        };
+        let outcome = RampipedConversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_completion)
+            .map_err(|e| crate::llama::LlamaSessionError::Backend(e.to_string()))?;
+        Ok(crate::llama::GenerationResult {
+            text: outcome.text,
+            // Back to a `Duration` from the milliseconds the wire format
+            // flattens it to (see `GenerateOutcome`'s own doc comment) --
+            // sub-millisecond precision is already gone by this point, so
+            // this restores the shape, not the lost resolution.
+            time_to_first_token: std::time::Duration::from_millis(outcome.time_to_first_token_ms),
+            tokens_generated: outcome.tokens_generated,
+            formatted_prompt: outcome.formatted_prompt,
+        })
+    }
+
+    fn turn_count(&self) -> usize {
+        self.turns
     }
 }
