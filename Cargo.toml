@@ -2,6 +2,13 @@
 name = "rampipe"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Memory-residency scheduler for keeping multiple LLMs mapped under a hard RAM ceiling"
+repository = "https://github.com/r-rojo/rampipe"
+readme = "README.md"
+keywords = ["llm", "mmap", "gguf", "inference", "memory"]
+categories = ["memory-management", "science"]
 
 [dependencies]
 llama-cpp-2 = { version = "0.1.154", optional = true }
@@ -34,6 +41,10 @@ client = []
 
 [[example]]
 name = "residency_vs_ttft"
+required-features = ["llama"]
+
+[[example]]
+name = "determinism_probe"
 required-features = ["llama"]
 
 [[example]]

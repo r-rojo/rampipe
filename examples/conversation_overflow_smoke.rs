@@ -38,21 +38,36 @@ const TURNS: usize = 60;
 fn download_model() -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating Hugging Face Hub client")?;
     let repo = client.model(REPO_OWNER, REPO_NAME);
-    repo.download_file().filename(FILENAME).send().context("downloading GGUF file")
+    repo.download_file()
+        .filename(FILENAME)
+        .send()
+        .context("downloading GGUF file")
 }
 
 fn main() -> Result<()> {
-    println!("Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (cached after first run)...");
+    println!(
+        "Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (cached after first run)..."
+    );
     let model_path = download_model()?;
 
-    let backend = Arc::new(llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?);
+    let backend = Arc::new(
+        llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?,
+    );
     let registry = SwapRegistry::new();
-    let session = LlamaSession::load(&registry, backend, &model_path, Residency::Lazy).context("loading session")?;
+    let session = LlamaSession::load(&registry, backend, &model_path, Residency::Lazy)
+        .context("loading session")?;
 
-    let options = ConversationOptions { n_ctx: NonZeroU32::new(N_CTX).unwrap(), overflow: OverflowPolicy::DropOldestTurns };
-    let mut conversation = session.open_conversation(options).context("opening conversation")?;
+    let options = ConversationOptions {
+        n_ctx: NonZeroU32::new(N_CTX).unwrap(),
+        overflow: OverflowPolicy::DropOldestTurns,
+    };
+    let mut conversation = session
+        .open_conversation(options)
+        .context("opening conversation")?;
 
-    println!("=== sending {TURNS} short turns against a {N_CTX}-token context (forces many drop-and-shift cycles) ===");
+    println!(
+        "=== sending {TURNS} short turns against a {N_CTX}-token context (forces many drop-and-shift cycles) ==="
+    );
     for i in 0..TURNS {
         let prompt = format!("Say the number {i} and nothing else.");
         let turn = conversation
@@ -61,6 +76,8 @@ fn main() -> Result<()> {
         println!("  turn {i:>2}: {:?}", turn.text.trim());
     }
 
-    println!("\nOK: all {TURNS} turns completed with no NoKvCacheSlot error -- defrag is doing its job.");
+    println!(
+        "\nOK: all {TURNS} turns completed with no NoKvCacheSlot error -- defrag is doing its job."
+    );
     Ok(())
 }

@@ -22,7 +22,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum WireSampling {
     Greedy,
-    Temperature { temperature: f32, top_k: i32, seed: u32 },
+    Temperature {
+        temperature: f32,
+        top_k: i32,
+        seed: u32,
+    },
 }
 
 /// How a caller's own generation loop should decide "the grammar-
@@ -53,16 +57,18 @@ impl GrammarCompletion {
     /// description.
     pub fn into_predicate(self) -> Box<dyn Fn(&str) -> bool> {
         match self {
-            GrammarCompletion::ExactMatch(options) => Box::new(move |text: &str| options.iter().any(|option| option == text)),
-            GrammarCompletion::ValidJson { prefill } => {
-                Box::new(move |text: &str| serde_json::from_str::<serde_json::Value>(&format!("{prefill}{text}")).is_ok())
+            GrammarCompletion::ExactMatch(options) => {
+                Box::new(move |text: &str| options.iter().any(|option| option == text))
             }
+            GrammarCompletion::ValidJson { prefill } => Box::new(move |text: &str| {
+                serde_json::from_str::<serde_json::Value>(&format!("{prefill}{text}")).is_ok()
+            }),
         }
     }
 }
 
 /// A request to generate against one model. `model_path` is a real,
-/// already-resolved local file path — HF repo resolution/download stays
+/// already-resolved local file path -- HF repo resolution/download stays
 /// entirely a client-side concern (taskpipe already does this), not
 /// something the daemon or this protocol need to know about.
 #[derive(Debug, Serialize, Deserialize)]
@@ -72,12 +78,12 @@ pub struct GenerateRequest {
     pub max_new_tokens: i32,
     pub sampling: WireSampling,
     /// A GBNF grammar to constrain generation to, applied on the daemon's
-    /// own sampler chain — see `rampipe::llama::LlamaSession::generate`'s
+    /// own sampler chain -- see `rampipe::llama::LlamaSession::generate`'s
     /// `grammar` parameter, which this mirrors. `None` behaves exactly as
     /// before this field existed: unconstrained generation.
     #[serde(default)]
     pub grammar: Option<String>,
-    /// Text to seed the assistant's turn with before generation resumes —
+    /// Text to seed the assistant's turn with before generation resumes --
     /// see `LlamaSession::generate`'s `assistant_prefill` parameter.
     #[serde(default)]
     pub assistant_prefill: Option<String>,
@@ -88,7 +94,7 @@ pub struct GenerateRequest {
     pub grammar_completion: Option<GrammarCompletion>,
 }
 
-/// One line back per request — an enum (not a bare struct + separate
+/// One line back per request -- an enum (not a bare struct + separate
 /// error channel) so a caller can never observe a response that's
 /// simultaneously a success and a failure; matches `taskpipe::daemon::
 /// QueryResponse`'s own shape.
@@ -99,7 +105,7 @@ pub enum GenerateResponse {
         tokens_generated: usize,
         time_to_first_token_ms: u64,
         /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
-        /// comment — the same value, carried across the socket so a
+        /// comment -- the same value, carried across the socket so a
         /// daemon-backed caller has the same visibility into what the
         /// model actually saw as an in-process caller already does.
         formatted_prompt: String,
@@ -109,11 +115,11 @@ pub enum GenerateResponse {
     },
 }
 
-/// The first message a client sends on every fresh connection —
+/// The first message a client sends on every fresh connection --
 /// distinguishes today's one-shot `Generate` (connection closes after
 /// one reply, unchanged from before this enum existed) from
 /// `OpenConversation` (the connection stays open for a whole multi-turn
-/// session — see `ConversationTurnRequest`/`ConversationResponse` for
+/// session -- see `ConversationTurnRequest`/`ConversationResponse` for
 /// what follows on that same connection once it's open). Wrapping the
 /// request this way, rather than changing `GenerateRequest`'s own
 /// shape, means the one-shot path's fields and behavior don't change at
@@ -122,18 +128,18 @@ pub enum GenerateResponse {
 pub enum ClientMessage {
     Generate(GenerateRequest),
     OpenConversation(OpenConversationRequest),
-    /// Asks for [`StatusResponse`] — a one-shot request/reply, connection
+    /// Asks for [`StatusResponse`] -- a one-shot request/reply, connection
     /// closes after, same shape as `Generate`.
     Status,
 }
 
 /// What `rampiped` reports about itself for a `ClientMessage::Status`
-/// request — the daemon-side half of a stale-binary check: a client that
+/// request -- the daemon-side half of a stale-binary check: a client that
 /// also knows its own configured `rampiped_path` can stat that file
 /// itself and compare against `exe_modified_unix_secs` here to tell
 /// "reachable" apart from "reachable, but running code built before the
 /// binary on disk was last rebuilt" (a real, live-reproduced failure
-/// mode — a `rampiped` process that outlived a rebuild silently kept
+/// mode -- a `rampiped` process that outlived a rebuild silently kept
 /// serving the *old* wire protocol, closing every connection using the
 /// new one with no response at all).
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,7 +147,7 @@ pub struct StatusResponse {
     pub pid: u32,
     pub exe_path: Option<PathBuf>,
     /// Unix seconds since epoch of the running binary's own mtime,
-    /// captured once at daemon startup — deliberately *not* a live
+    /// captured once at daemon startup -- deliberately *not* a live
     /// re-stat of `exe_path` on every status request, which would just
     /// reflect whatever happens to be on disk right now regardless of
     /// what code this already-running process actually has loaded (the
@@ -190,7 +196,7 @@ pub struct ModelStatus {
 }
 
 /// Mirrors `llama::OverflowPolicy` field-for-field, same reason
-/// [`WireSampling`] mirrors `Sampling` — keeps this module independent
+/// [`WireSampling`] mirrors `Sampling` -- keeps this module independent
 /// of the `llama` feature.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum WireOverflowPolicy {
@@ -203,7 +209,7 @@ pub enum WireOverflowPolicy {
 /// with one [`ConversationResponse::Opened`] (or `Err`), then the
 /// connection stays open for any number of subsequent
 /// [`ConversationTurnRequest`]/[`ConversationResponse`] round trips,
-/// one per line each way, until the client drops the connection — no
+/// one per line each way, until the client drops the connection -- no
 /// explicit close message needed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenConversationRequest {
@@ -213,7 +219,7 @@ pub struct OpenConversationRequest {
 }
 
 /// One turn sent into an already-open conversation (see
-/// [`OpenConversationRequest`]) — same fields as [`GenerateRequest`]
+/// [`OpenConversationRequest`]) -- same fields as [`GenerateRequest`]
 /// minus `model_path`/`prompt` (the conversation itself already fixes
 /// the model; `message` stands in for `prompt`, scoped to just this
 /// turn's new text).
@@ -230,7 +236,7 @@ pub struct ConversationTurnRequest {
     pub grammar_completion: Option<GrammarCompletion>,
 }
 
-/// One line back per conversation-mode message — `Opened` acknowledges
+/// One line back per conversation-mode message -- `Opened` acknowledges
 /// [`OpenConversationRequest`], `Turn` answers a
 /// [`ConversationTurnRequest`], `Err` can follow either.
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +246,7 @@ pub enum ConversationResponse {
         text: String,
         tokens_generated: usize,
         time_to_first_token_ms: u64,
-        /// See `GenerateResponse::Ok::formatted_prompt` — here, just
+        /// See `GenerateResponse::Ok::formatted_prompt` -- here, just
         /// this turn's own new text (mirrors
         /// `rampipe::llama::Conversation::send`'s `GenerationResult::
         /// formatted_prompt`, which is scoped to the turn, not the whole
@@ -252,7 +258,7 @@ pub enum ConversationResponse {
     },
 }
 
-/// `~/.rampipe/rampiped.sock` — the one real source of truth for
+/// `~/.rampipe/rampiped.sock` -- the one real source of truth for
 /// "where's the daemon," so `rampiped`'s own `main()` and every client
 /// (`rampipe::client`, or an external caller like taskpipe) fall back to
 /// the same path instead of each hardcoding it independently. Without
@@ -260,10 +266,10 @@ pub enum ConversationResponse {
 /// daemon required a human to type the identical path on both command
 /// lines; with it, doing nothing on either side already agrees. `--socket`
 /// (`rampiped`) and an explicit client-supplied path still override this,
-/// same as before — this is only ever the fallback when neither says
+/// same as before -- this is only ever the fallback when neither says
 /// otherwise.
 ///
-/// `None` only when `$HOME` isn't set — matches `system_free_bytes`'s own
+/// `None` only when `$HOME` isn't set -- matches `system_free_bytes`'s own
 /// "can't determine, never guess" convention (`crate::lib`) rather than
 /// falling back to something like `/tmp`, which would silently put the
 /// socket somewhere no other process's own unset-`$HOME` fallback would

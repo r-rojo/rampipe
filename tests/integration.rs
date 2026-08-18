@@ -39,7 +39,9 @@ fn rejects_empty_files() {
 fn loads_a_valid_gguf_file() {
     let f = gguf_fixture(4096);
     let registry = SwapRegistry::new();
-    let handle = registry.load(f.path(), Residency::Lazy).expect("load should succeed");
+    let handle = registry
+        .load(f.path(), Residency::Lazy)
+        .expect("load should succeed");
 
     assert_eq!(&handle.as_bytes()[..4], b"GGUF");
     assert_eq!(handle.metrics().mapped_bytes, 4 + 4096);
@@ -81,8 +83,12 @@ fn repeated_load_of_same_path_dedups_to_one_mapping() {
     let f = gguf_fixture(4096);
     let registry = SwapRegistry::new();
 
-    let first = registry.load(f.path(), Residency::Lazy).expect("first load");
-    let second = registry.load(f.path(), Residency::Lazy).expect("second load");
+    let first = registry
+        .load(f.path(), Residency::Lazy)
+        .expect("first load");
+    let second = registry
+        .load(f.path(), Residency::Lazy)
+        .expect("second load");
 
     assert_eq!(first.id(), second.id());
     assert_eq!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());
@@ -98,13 +104,23 @@ fn eviction_fails_while_a_handle_is_outstanding_then_succeeds_after_drop() {
     let handle = registry.load(f.path(), Residency::Lazy).expect("load");
     let id = handle.id();
 
-    let err = registry.evict(id).expect_err("evict should refuse while handle is live");
-    assert!(matches!(err, EvictError::HandleOutstanding { outstanding: 1 }));
-    assert!(registry.is_resident(id), "must still be resident after a refused evict");
+    let err = registry
+        .evict(id)
+        .expect_err("evict should refuse while handle is live");
+    assert!(matches!(
+        err,
+        EvictError::HandleOutstanding { outstanding: 1 }
+    ));
+    assert!(
+        registry.is_resident(id),
+        "must still be resident after a refused evict"
+    );
 
     drop(handle);
 
-    registry.evict(id).expect("evict should succeed once the handle is dropped");
+    registry
+        .evict(id)
+        .expect("evict should succeed once the handle is dropped");
     assert!(!registry.is_resident(id));
 }
 
@@ -129,7 +145,9 @@ fn prefault_latency_is_attributed_to_eager_residency_modes_only() {
     let advise_file = gguf_fixture(4096 * 16);
     let registry = SwapRegistry::new();
 
-    let lazy = registry.load(lazy_file.path(), Residency::Lazy).expect("lazy load");
+    let lazy = registry
+        .load(lazy_file.path(), Residency::Lazy)
+        .expect("lazy load");
     assert!(lazy.metrics().prefault_latency.is_none());
 
     let prefaulted = registry
@@ -148,12 +166,12 @@ fn mincore_result_is_structurally_valid_after_prefault() {
     // NOT asserting "prefault forces ~full residency" here, on purpose.
     // Empirically (this repo, Darwin, 2026-07-25): mincore(2) reports a
     // consistent ~25% resident fraction for a file-backed mmap regardless
-    // of file size (verified at 32 pages and 500 pages), and — the
-    // decisive test — the fraction doesn't move even after mlock(2), which
+    // of file size (verified at 32 pages and 500 pages), and -- the
+    // decisive test -- the fraction doesn't move even after mlock(2), which
     // *guarantees* every page is resident and pinned. A plain anonymous
     // (non-file-backed) mmap'd page reports correctly via the same mincore
     // call. This points at Apple deliberately returning imprecise mincore
-    // results specifically for file-backed mappings — plausibly the same
+    // results specifically for file-backed mappings -- plausibly the same
     // mitigation class as published page-cache side-channel research (using
     // mincore to fingerprint what's in the shared page cache leaks
     // information about other processes' file access). Whatever the exact
@@ -164,12 +182,21 @@ fn mincore_result_is_structurally_valid_after_prefault() {
     let f = gguf_fixture(4096 * 32);
     let registry = SwapRegistry::new();
 
-    let handle = registry.load(f.path(), Residency::Prefault).expect("prefault load");
+    let handle = registry
+        .load(f.path(), Residency::Prefault)
+        .expect("prefault load");
     let metrics = handle.metrics();
 
     if let Some(fraction) = metrics.resident_fraction {
-        assert!((0.0..=1.0).contains(&fraction), "resident_fraction {fraction} out of range");
-        assert_eq!(metrics.warm, fraction >= 0.99, "warm should follow directly from the fraction");
+        assert!(
+            (0.0..=1.0).contains(&fraction),
+            "resident_fraction {fraction} out of range"
+        );
+        assert_eq!(
+            metrics.warm,
+            fraction >= 0.99,
+            "warm should follow directly from the fraction"
+        );
     }
 }
 
@@ -180,16 +207,32 @@ fn resident_ids_by_lru_orders_by_most_recent_access() {
     let file_c = gguf_fixture(4096);
     let registry = SwapRegistry::new();
 
-    let a = registry.load(file_a.path(), Residency::Lazy).expect("load a");
-    let b = registry.load(file_b.path(), Residency::Lazy).expect("load b");
-    let c = registry.load(file_c.path(), Residency::Lazy).expect("load c");
+    let a = registry
+        .load(file_a.path(), Residency::Lazy)
+        .expect("load a");
+    let b = registry
+        .load(file_b.path(), Residency::Lazy)
+        .expect("load b");
+    let c = registry
+        .load(file_c.path(), Residency::Lazy)
+        .expect("load c");
 
-    assert_eq!(registry.resident_ids_by_lru(), vec![a.id(), b.id(), c.id()], "load order is access order with nothing re-touched yet");
+    assert_eq!(
+        registry.resident_ids_by_lru(),
+        vec![a.id(), b.id(), c.id()],
+        "load order is access order with nothing re-touched yet"
+    );
 
     // Re-loading `a` (a cache hit, same path) counts as an access too --
     // it should move to the most-recently-used end, not stay oldest.
-    registry.load(file_a.path(), Residency::Lazy).expect("re-load a");
-    assert_eq!(registry.resident_ids_by_lru(), vec![b.id(), c.id(), a.id()], "re-touching a should move it to most-recently-used");
+    registry
+        .load(file_a.path(), Residency::Lazy)
+        .expect("re-load a");
+    assert_eq!(
+        registry.resident_ids_by_lru(),
+        vec![b.id(), c.id(), a.id()],
+        "re-touching a should move it to most-recently-used"
+    );
 }
 
 #[test]
@@ -198,8 +241,12 @@ fn resident_ids_by_lru_drops_an_evicted_model() {
     let file_b = gguf_fixture(4096);
     let registry = SwapRegistry::new();
 
-    let a = registry.load(file_a.path(), Residency::Lazy).expect("load a");
-    let b = registry.load(file_b.path(), Residency::Lazy).expect("load b");
+    let a = registry
+        .load(file_a.path(), Residency::Lazy)
+        .expect("load a");
+    let b = registry
+        .load(file_b.path(), Residency::Lazy)
+        .expect("load b");
     drop(a);
     let a_id = registry.resident_ids_by_lru()[0];
     registry.evict(a_id).expect("evict a");
@@ -214,7 +261,10 @@ fn fits_within_budget_is_true_for_a_tiny_model_at_a_generous_budget() {
     // implementation (see that function's own doc comment) -- `None`
     // elsewhere is itself the correct, honest answer, not a failure.
     if let Some(fits) = registry.fits_within_budget(1024, 1.0) {
-        assert!(fits, "1KB should trivially fit under a 100% budget on any real machine");
+        assert!(
+            fits,
+            "1KB should trivially fit under a 100% budget on any real machine"
+        );
     }
 }
 
@@ -222,7 +272,10 @@ fn fits_within_budget_is_true_for_a_tiny_model_at_a_generous_budget() {
 fn fits_within_budget_is_false_for_an_absurdly_large_model() {
     let registry = SwapRegistry::new();
     if let Some(fits) = registry.fits_within_budget(u64::MAX / 2, 0.8) {
-        assert!(!fits, "no real machine has ~9 exabytes of free+resident memory to spare");
+        assert!(
+            !fits,
+            "no real machine has ~9 exabytes of free+resident memory to spare"
+        );
     }
 }
 
@@ -247,9 +300,17 @@ fn device_bytes_is_none_until_recorded() {
     let registry = SwapRegistry::new();
     let handle = registry.load(f.path(), Residency::Lazy).expect("load");
 
-    assert_eq!(handle.device_bytes(), None, "nothing has reported a GPU measurement yet");
+    assert_eq!(
+        handle.device_bytes(),
+        None,
+        "nothing has reported a GPU measurement yet"
+    );
     registry.record_device_bytes(handle.id(), 12_345);
-    assert_eq!(handle.device_bytes(), Some(12_345), "a handle obtained before recording still sees the update, via the shared Resident");
+    assert_eq!(
+        handle.device_bytes(),
+        Some(12_345),
+        "a handle obtained before recording still sees the update, via the shared Resident"
+    );
 }
 
 #[test]
@@ -273,17 +334,28 @@ fn device_resident_bytes_sums_only_models_with_recorded_bytes() {
     let cpu_only = gguf_fixture(4096);
     let gpu_backed = gguf_fixture(4096);
     let registry = SwapRegistry::new();
-    registry.load(cpu_only.path(), Residency::Lazy).expect("load");
-    let gpu_handle = registry.load(gpu_backed.path(), Residency::Lazy).expect("load");
+    registry
+        .load(cpu_only.path(), Residency::Lazy)
+        .expect("load");
+    let gpu_handle = registry
+        .load(gpu_backed.path(), Residency::Lazy)
+        .expect("load");
     registry.record_device_bytes(gpu_handle.id(), 500);
 
-    assert_eq!(registry.device_resident_bytes(), 500, "the CPU-only model should contribute nothing");
+    assert_eq!(
+        registry.device_resident_bytes(),
+        500,
+        "the CPU-only model should contribute nothing"
+    );
 }
 
 #[test]
 fn fits_within_device_budget_is_true_for_a_tiny_model_at_a_generous_budget() {
     let registry = SwapRegistry::new();
-    assert!(registry.fits_within_device_budget(1024, 16 * 1024 * 1024 * 1024, 1.0), "1KB should trivially fit in 16GB free at a 100% budget");
+    assert!(
+        registry.fits_within_device_budget(1024, 16 * 1024 * 1024 * 1024, 1.0),
+        "1KB should trivially fit in 16GB free at a 100% budget"
+    );
 }
 
 #[test]
@@ -306,7 +378,10 @@ fn fits_within_device_budget_counts_recorded_device_bytes_toward_the_ceiling() {
     let handle = registry.load(f.path(), Residency::Lazy).expect("load");
     registry.record_device_bytes(handle.id(), 4 * 1024 * 1024 * 1024);
 
-    assert!(!registry.fits_within_device_budget(1, 16 * 1024 * 1024 * 1024, 0.0), "a 0.0 budget fraction should never fit anything");
+    assert!(
+        !registry.fits_within_device_budget(1, 16 * 1024 * 1024 * 1024, 0.0),
+        "a 0.0 budget fraction should never fit anything"
+    );
 }
 
 #[test]
@@ -318,12 +393,23 @@ fn resident_fraction_is_populated_regardless_of_residency_mode() {
     let advise_file = gguf_fixture(4096 * 8);
     let registry = SwapRegistry::new();
 
-    let lazy = registry.load(lazy_file.path(), Residency::Lazy).expect("lazy load");
-    let advised = registry.load(advise_file.path(), Residency::Advise).expect("advise load");
+    let lazy = registry
+        .load(lazy_file.path(), Residency::Lazy)
+        .expect("lazy load");
+    let advised = registry
+        .load(advise_file.path(), Residency::Advise)
+        .expect("advise load");
 
-    for fraction in [lazy.metrics().resident_fraction, advised.metrics().resident_fraction] {
-        if let Some(f) = fraction {
-            assert!((0.0..=1.0).contains(&f), "resident_fraction {f} out of range");
-        }
+    for f in [
+        lazy.metrics().resident_fraction,
+        advised.metrics().resident_fraction,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(
+            (0.0..=1.0).contains(&f),
+            "resident_fraction {f} out of range"
+        );
     }
 }

@@ -38,12 +38,23 @@ fn main() -> Result<()> {
 
     println!("=== turn 1: context carryover over the wire ===");
     let mut conversation =
-        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail).context("opening conversation")?;
+        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail)
+            .context("opening conversation")?;
 
     let turn1 = conversation
-        .send("My favorite number is 7492. Just say OK.", MAX_NEW_TOKENS, WireSampling::Greedy, None, None, None)
+        .send(
+            "My favorite number is 7492. Just say OK.",
+            MAX_NEW_TOKENS,
+            WireSampling::Greedy,
+            None,
+            None,
+            None,
+        )
         .context("turn 1")?;
-    println!("  decoded this turn (new text only): {:?}", turn1.formatted_prompt);
+    println!(
+        "  decoded this turn (new text only): {:?}",
+        turn1.formatted_prompt
+    );
     println!("  reply: {}", turn1.text.trim());
 
     println!("\n=== turn 2 (no restated context) ===");
@@ -57,13 +68,21 @@ fn main() -> Result<()> {
             None,
         )
         .context("turn 2")?;
-    println!("  decoded this turn (new text only): {:?}", turn2.formatted_prompt);
+    println!(
+        "  decoded this turn (new text only): {:?}",
+        turn2.formatted_prompt
+    );
     println!("  reply: {}", turn2.text.trim());
 
     if !turn2.text.contains("7492") {
-        bail!("turn 2 didn't recall the number from turn 1 -- conversation context isn't actually persisting: {:?}", turn2.text);
+        bail!(
+            "turn 2 didn't recall the number from turn 1 -- conversation context isn't actually persisting: {:?}",
+            turn2.text
+        );
     }
-    println!("\nOK: turn 2 correctly recalled context from turn 1 with no restated history in the prompt.");
+    println!(
+        "\nOK: turn 2 correctly recalled context from turn 1 with no restated history in the prompt."
+    );
 
     println!("\n=== grammar + assistant_prefill on a conversation turn ===");
     let grammar_turn = conversation
@@ -73,22 +92,44 @@ fn main() -> Result<()> {
             WireSampling::Greedy,
             Some("root ::= \"YES\" | \"NO\"\n"),
             None,
-            Some(rampipe::protocol::GrammarCompletion::ExactMatch(vec!["YES".to_string(), "NO".to_string()])),
+            Some(rampipe::protocol::GrammarCompletion::ExactMatch(vec![
+                "YES".to_string(),
+                "NO".to_string(),
+            ])),
         )
         .context("grammar-constrained turn")?;
     println!("  reply: {:?}", grammar_turn.text);
     if grammar_turn.text.trim() != "YES" {
-        bail!("expected the grammar-constrained turn to answer exactly \"YES\" (7492 is even), got {:?}", grammar_turn.text);
+        bail!(
+            "expected the grammar-constrained turn to answer exactly \"YES\" (7492 is even), got {:?}",
+            grammar_turn.text
+        );
     }
-    println!("  OK: grammar constraint applied on a conversation turn, not just one-shot generate().");
+    println!(
+        "  OK: grammar constraint applied on a conversation turn, not just one-shot generate()."
+    );
 
-    println!("\n=== concurrency: unrelated one-shot generate() while this conversation is still open ===");
+    println!(
+        "\n=== concurrency: unrelated one-shot generate() while this conversation is still open ==="
+    );
     let client = RampipedClient::connect(&socket_path).context("connecting one-shot client")?;
     let outcome = client
-        .generate(&model_b, "Say hello in exactly one word.", 10, WireSampling::Greedy, None, None, None)
-        .context("one-shot generate against a different model while a conversation pins the first")?;
+        .generate(
+            &model_b,
+            "Say hello in exactly one word.",
+            10,
+            WireSampling::Greedy,
+            None,
+            None,
+            None,
+        )
+        .context(
+            "one-shot generate against a different model while a conversation pins the first",
+        )?;
     println!("  reply: {}", outcome.text.trim());
-    println!("  OK: one-shot request completed without wedging/deadlocking despite an unrelated pinned conversation.");
+    println!(
+        "  OK: one-shot request completed without wedging/deadlocking despite an unrelated pinned conversation."
+    );
 
     println!("\n=== conversation is still usable after the concurrent request ===");
     let turn3 = conversation
@@ -103,7 +144,10 @@ fn main() -> Result<()> {
         .context("turn 3")?;
     println!("  reply: {}", turn3.text.trim());
     if !turn3.text.contains("7492") {
-        bail!("turn 3 lost context after the concurrent request: {:?}", turn3.text);
+        bail!(
+            "turn 3 lost context after the concurrent request: {:?}",
+            turn3.text
+        );
     }
     println!("  OK: conversation state survived the concurrent unrelated request.");
 

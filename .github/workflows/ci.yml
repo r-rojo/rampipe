@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    # The `llama` and `cuda` features link against llama.cpp and need a C++
+    # toolchain (and, for `cuda`, nvcc), so CI covers the backend-independent
+    # surface only. The `client` feature is pure Rust and is included.
+    name: fmt / clippy / test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --features client
+
+      - name: Test
+        run: cargo test --all-targets --features client
+
+      - name: Docs
+        run: cargo doc --no-deps --features client
+        env:
+          RUSTDOCFLAGS: -D warnings
