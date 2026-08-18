@@ -39,8 +39,8 @@ use anyhow::{Context, Result, bail};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use rampipe::llama::{Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Sampling};
 use rampipe::protocol::{
-    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest, GenerateResponse, OpenConversationRequest,
-    WireOverflowPolicy, WireSampling,
+    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest,
+    GenerateResponse, OpenConversationRequest, WireOverflowPolicy, WireSampling,
 };
 use rampipe::{ModelId, Residency, SwapRegistry};
 use std::collections::HashMap;
@@ -80,7 +80,9 @@ struct Args {
 }
 
 fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
-    let Some(pos) = args.iter().position(|a| a == flag) else { return Ok(None) };
+    let Some(pos) = args.iter().position(|a| a == flag) else {
+        return Ok(None);
+    };
     if pos + 1 >= args.len() {
         bail!("{flag} requires a value");
     }
@@ -96,7 +98,10 @@ fn parse_args() -> Result<ParsedArgs> {
     }
     let socket = take_flag_value(&mut args, "--socket")?.map(PathBuf::from);
     let budget_fraction = take_flag_value(&mut args, "--budget-fraction")?
-        .map(|s| s.parse::<f64>().map_err(|_| anyhow::anyhow!("--budget-fraction must be a number, got {s:?}")))
+        .map(|s| {
+            s.parse::<f64>()
+                .map_err(|_| anyhow::anyhow!("--budget-fraction must be a number, got {s:?}"))
+        })
         .transpose()?
         .unwrap_or(DEFAULT_BUDGET_FRACTION);
     if !args.is_empty() {
@@ -109,13 +114,24 @@ fn parse_args() -> Result<ParsedArgs> {
         // function's own doc comment), not a value re-derived here.
         None => rampipe::protocol::default_socket_path().context("--socket not given, and could not determine a default (~/.rampipe/rampiped.sock) -- HOME not set")?,
     };
-    Ok(ParsedArgs::Run(Args { socket, budget_fraction }))
+    Ok(ParsedArgs::Run(Args {
+        socket,
+        budget_fraction,
+    }))
 }
 
 fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
     match sampling {
         WireSampling::Greedy => Sampling::Greedy,
-        WireSampling::Temperature { temperature, top_k, seed } => Sampling::Temperature { temperature, top_k, seed },
+        WireSampling::Temperature {
+            temperature,
+            top_k,
+            seed,
+        } => Sampling::Temperature {
+            temperature,
+            top_k,
+            seed,
+        },
     }
 }
 
@@ -179,7 +195,9 @@ struct ModelStats {
 /// platform or environment didn't have an answer, not an error worth
 /// failing startup over.
 fn current_exe_snapshot() -> (Option<PathBuf>, Option<u64>) {
-    let Ok(path) = std::env::current_exe() else { return (None, None) };
+    let Ok(path) = std::env::current_exe() else {
+        return (None, None);
+    };
     let modified = std::fs::metadata(&path)
         .and_then(|meta| meta.modified())
         .ok()
@@ -216,8 +234,10 @@ impl SharedState {
                 let stats = self.model_stats.entry(path.to_path_buf()).or_default();
                 stats.requests_served += 1;
                 stats.tokens_generated += tokens as u64;
-                stats.last_used_unix_secs =
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                stats.last_used_unix_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
             }
             None => self.requests_failed += 1,
         }
@@ -240,7 +260,9 @@ impl SharedState {
             // touch (see `RegistryState::last_accessed`'s doc comment),
             // so re-calling it here (cheap: no new mmap, no reload) is
             // what keeps `resident_ids_by_lru` honest.
-            self.registry.load(path, Residency::Lazy).context("touching cached model for LRU accounting")?;
+            self.registry
+                .load(path, Residency::Lazy)
+                .context("touching cached model for LRU accounting")?;
             return Ok(());
         }
 
@@ -248,10 +270,20 @@ impl SharedState {
 
         eprintln!("rampiped: loading {}", path.display());
         let load_start = Instant::now();
-        let session = LlamaSession::load(&self.registry, Arc::clone(&self.backend), path, Residency::Lazy)
-            .with_context(|| format!("loading model {}", path.display()))?;
-        eprintln!("rampiped: loaded {} in {:?} (now {} model(s) resident, {} bytes mapped)",
-            path.display(), load_start.elapsed(), self.sessions.len() + 1, self.registry.mapped_bytes());
+        let session = LlamaSession::load(
+            &self.registry,
+            Arc::clone(&self.backend),
+            path,
+            Residency::Lazy,
+        )
+        .with_context(|| format!("loading model {}", path.display()))?;
+        eprintln!(
+            "rampiped: loaded {} in {:?} (now {} model(s) resident, {} bytes mapped)",
+            path.display(),
+            load_start.elapsed(),
+            self.sessions.len() + 1,
+            self.registry.mapped_bytes()
+        );
         self.sessions.insert(path.to_path_buf(), Arc::new(session));
         Ok(())
     }
@@ -275,7 +307,10 @@ impl SharedState {
     fn make_room_for(&mut self, path: &Path) -> Result<()> {
         let new_size_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
         loop {
-            let host_fits = match self.registry.fits_within_budget(new_size_bytes, self.budget_fraction) {
+            let host_fits = match self
+                .registry
+                .fits_within_budget(new_size_bytes, self.budget_fraction)
+            {
                 // `None`: can't measure free memory on this platform --
                 // best-effort proceed rather than refuse a request over
                 // something unmeasurable.
@@ -290,7 +325,11 @@ impl SharedState {
             // number. `None` (no GPU device present) means there's no
             // device budget to violate.
             let device_fits = match rampipe::llama::gpu_memory_bytes() {
-                Some((free, _total)) => self.registry.fits_within_device_budget(new_size_bytes, free, self.budget_fraction),
+                Some((free, _total)) => self.registry.fits_within_device_budget(
+                    new_size_bytes,
+                    free,
+                    self.budget_fraction,
+                ),
                 None => true,
             };
             if host_fits && device_fits {
@@ -325,15 +364,24 @@ impl SharedState {
                 return Ok(());
             };
 
-            eprintln!("rampiped: evicting {} (LRU) to make room for {}", evict_path.display(), path.display());
+            eprintln!(
+                "rampiped: evicting {} (LRU) to make room for {}",
+                evict_path.display(),
+                path.display()
+            );
             self.sessions.remove(&evict_path); // drops LlamaSession -> drops its ModelHandle
             self.model_stats.remove(&evict_path);
-            self.registry.evict(evict_id).context("evicting LRU model")?;
+            self.registry
+                .evict(evict_id)
+                .context("evicting LRU model")?;
         }
     }
 
     fn path_for_id(&self, id: ModelId) -> Option<PathBuf> {
-        self.sessions.iter().find(|(_, session)| session.id() == id).map(|(path, _)| path.clone())
+        self.sessions
+            .iter()
+            .find(|(_, session)| session.id() == id)
+            .map(|(path, _)| path.clone())
     }
 }
 
@@ -359,19 +407,28 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
         ClientMessage::Generate(request) => {
             let response = match handle_request(state, &request) {
                 Ok(response) => response,
-                Err(error) => GenerateResponse::Err { message: format!("{error:#}") },
+                Err(error) => GenerateResponse::Err {
+                    message: format!("{error:#}"),
+                },
             };
             let tokens_generated = match &response {
-                GenerateResponse::Ok { tokens_generated, .. } => Some(*tokens_generated),
+                GenerateResponse::Ok {
+                    tokens_generated, ..
+                } => Some(*tokens_generated),
                 GenerateResponse::Err { .. } => None,
             };
-            state.lock().expect("rampiped model store lock poisoned").record_outcome(&request.model_path, tokens_generated);
+            state
+                .lock()
+                .expect("rampiped model store lock poisoned")
+                .record_outcome(&request.model_path, tokens_generated);
             let mut stream = stream;
             serde_json::to_writer(&mut stream, &response).context("encoding response")?;
             stream.write_all(b"\n").context("writing response")?;
             Ok(())
         }
-        ClientMessage::OpenConversation(request) => handle_conversation(stream, reader, state, request),
+        ClientMessage::OpenConversation(request) => {
+            handle_conversation(stream, reader, state, request)
+        }
         ClientMessage::Status => {
             let response = handle_status(state);
             let mut stream = stream;
@@ -424,12 +481,21 @@ fn handle_status(state: &Mutex<SharedState>) -> rampipe::protocol::StatusRespons
 /// takes to ensure the requested model is resident (loading/evicting if
 /// needed) and run one generation against it, then releases before
 /// `handle_connection` writes the response.
-fn handle_request(state: &Mutex<SharedState>, request: &GenerateRequest) -> Result<GenerateResponse> {
+fn handle_request(
+    state: &Mutex<SharedState>,
+    request: &GenerateRequest,
+) -> Result<GenerateResponse> {
     let mut state = state.lock().expect("rampiped model store lock poisoned");
     state.ensure_loaded(&request.model_path)?;
-    let session = state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this");
+    let session = state
+        .sessions
+        .get(&request.model_path)
+        .expect("ensure_loaded just guaranteed this");
     let sampling = wire_sampling_to_sampling(request.sampling);
-    let grammar_complete = request.grammar_completion.clone().map(rampipe::protocol::GrammarCompletion::into_predicate);
+    let grammar_complete = request
+        .grammar_completion
+        .clone()
+        .map(rampipe::protocol::GrammarCompletion::into_predicate);
     let result = session
         .generate(
             &request.prompt,
@@ -483,10 +549,17 @@ fn handle_conversation(
         let mut state = state.lock().expect("rampiped model store lock poisoned");
         let loaded = state.ensure_loaded(&request.model_path);
         match loaded {
-            Ok(()) => Arc::clone(state.sessions.get(&request.model_path).expect("ensure_loaded just guaranteed this")),
+            Ok(()) => Arc::clone(
+                state
+                    .sessions
+                    .get(&request.model_path)
+                    .expect("ensure_loaded just guaranteed this"),
+            ),
             Err(error) => {
                 drop(state);
-                let response = ConversationResponse::Err { message: format!("{error:#}") };
+                let response = ConversationResponse::Err {
+                    message: format!("{error:#}"),
+                };
                 serde_json::to_writer(&mut writer, &response).context("encoding response")?;
                 writer.write_all(b"\n").context("writing response")?;
                 return Ok(());
@@ -495,12 +568,17 @@ fn handle_conversation(
     };
 
     let n_ctx = NonZeroU32::new(request.n_ctx).context("n_ctx must be nonzero")?;
-    let options = ConversationOptions { n_ctx, overflow: wire_overflow_to_overflow(request.overflow) };
+    let options = ConversationOptions {
+        n_ctx,
+        overflow: wire_overflow_to_overflow(request.overflow),
+    };
 
     let mut conversation = match session.open_conversation(options) {
         Ok(conversation) => conversation,
         Err(error) => {
-            let response = ConversationResponse::Err { message: format!("{error:#}") };
+            let response = ConversationResponse::Err {
+                message: format!("{error:#}"),
+            };
             serde_json::to_writer(&mut writer, &response).context("encoding response")?;
             writer.write_all(b"\n").context("writing response")?;
             return Ok(());
@@ -514,7 +592,9 @@ fn handle_conversation(
     let mut line = String::new();
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).context("reading conversation turn")?;
+        let bytes_read = reader
+            .read_line(&mut line)
+            .context("reading conversation turn")?;
         if bytes_read == 0 {
             // Client dropped the connection -- ordinary end of this
             // conversation, not an error. No explicit close message is
@@ -526,17 +606,24 @@ fn handle_conversation(
             Ok(turn) => {
                 let response = run_conversation_turn(state, &mut conversation, &turn);
                 let tokens_generated = match &response {
-                    ConversationResponse::Turn { tokens_generated, .. } => Some(*tokens_generated),
+                    ConversationResponse::Turn {
+                        tokens_generated, ..
+                    } => Some(*tokens_generated),
                     ConversationResponse::Opened | ConversationResponse::Err { .. } => None,
                 };
-                state.lock().expect("rampiped model store lock poisoned").record_outcome(&request.model_path, tokens_generated);
+                state
+                    .lock()
+                    .expect("rampiped model store lock poisoned")
+                    .record_outcome(&request.model_path, tokens_generated);
                 response
             }
             // A turn that never decoded never touched the model at all --
             // nothing to record against it, same reasoning as `Ok(())`
             // never being reached in `handle_request` when the model
             // itself fails to load before generation is ever attempted.
-            Err(error) => ConversationResponse::Err { message: format!("decoding conversation turn: {error:#}") },
+            Err(error) => ConversationResponse::Err {
+                message: format!("decoding conversation turn: {error:#}"),
+            },
         };
 
         serde_json::to_writer(&mut writer, &turn_response).context("encoding response")?;
@@ -551,10 +638,17 @@ fn handle_conversation(
 /// across the idle time between turns while this thread is blocked
 /// reading the next line from its own socket, so a conversation sitting
 /// idle never blocks an unrelated request's turn at the lock.
-fn run_conversation_turn(state: &Mutex<SharedState>, conversation: &mut Conversation<'_>, turn: &ConversationTurnRequest) -> ConversationResponse {
+fn run_conversation_turn(
+    state: &Mutex<SharedState>,
+    conversation: &mut Conversation<'_>,
+    turn: &ConversationTurnRequest,
+) -> ConversationResponse {
     let _guard = state.lock().expect("rampiped model store lock poisoned");
     let sampling = wire_sampling_to_sampling(turn.sampling);
-    let grammar_complete = turn.grammar_completion.clone().map(rampipe::protocol::GrammarCompletion::into_predicate);
+    let grammar_complete = turn
+        .grammar_completion
+        .clone()
+        .map(rampipe::protocol::GrammarCompletion::into_predicate);
     let result = conversation.send(
         &turn.message,
         turn.max_new_tokens,
@@ -570,7 +664,9 @@ fn run_conversation_turn(state: &Mutex<SharedState>, conversation: &mut Conversa
             time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
             formatted_prompt: result.formatted_prompt,
         },
-        Err(error) => ConversationResponse::Err { message: format!("{error:#}") },
+        Err(error) => ConversationResponse::Err {
+            message: format!("{error:#}"),
+        },
     }
 }
 
@@ -579,10 +675,12 @@ fn run_conversation_turn(state: &Mutex<SharedState>, conversation: &mut Conversa
 /// otherwise fails outright) -- matches `taskpipe::daemon::bind_fresh`.
 fn bind_fresh(path: &Path) -> Result<UnixListener> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating socket directory {}", parent.display()))?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating socket directory {}", parent.display()))?;
     }
     if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("removing stale socket {}", path.display()))?;
+        std::fs::remove_file(path)
+            .with_context(|| format!("removing stale socket {}", path.display()))?;
     }
     UnixListener::bind(path).with_context(|| format!("binding socket {}", path.display()))
 }

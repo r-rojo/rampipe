@@ -41,10 +41,14 @@ fn download_model() -> Result<PathBuf> {
 }
 
 fn main() -> Result<()> {
-    println!("Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (~4.7GB, cached after first run)...");
+    println!(
+        "Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (~4.7GB, cached after first run)..."
+    );
     let model_path = download_model()?;
 
-    let backend = std::sync::Arc::new(llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?);
+    let backend = std::sync::Arc::new(
+        llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?,
+    );
     let registry = SwapRegistry::new();
 
     println!("Loading (Residency::Prefault)...");
@@ -57,22 +61,42 @@ fn main() -> Result<()> {
     println!("\n=== SwapRegistry metrics ===");
     println!("  map_latency:       {:?}", metrics.map_latency);
     println!("  prefault_latency:  {:?}", metrics.prefault_latency);
-    println!("  mapped_bytes:      {} ({:.2} GB)", metrics.mapped_bytes, metrics.mapped_bytes as f64 / 1e9);
+    println!(
+        "  mapped_bytes:      {} ({:.2} GB)",
+        metrics.mapped_bytes,
+        metrics.mapped_bytes as f64 / 1e9
+    );
     println!("  rss_delta_bytes:   {:?}", metrics.rss_delta_bytes);
-    println!("  resident_fraction: {:?} (untrustworthy on Darwin, see doc comment)", metrics.resident_fraction);
-    println!("  total load() wall time (registry.load + LlamaModel::load_from_file): {load_wall_time:?}");
+    println!(
+        "  resident_fraction: {:?} (untrustworthy on Darwin, see doc comment)",
+        metrics.resident_fraction
+    );
+    println!(
+        "  total load() wall time (registry.load + LlamaModel::load_from_file): {load_wall_time:?}"
+    );
 
     for (label, prompt) in [
         ("request 1", "The old lighthouse keeper"),
-        ("request 2 (same session)", "Explain what a ring buffer is in one paragraph."),
+        (
+            "request 2 (same session)",
+            "Explain what a ring buffer is in one paragraph.",
+        ),
     ] {
         println!("\n=== {label} ===");
         let gen_start = Instant::now();
         let result = session
-            .generate(prompt, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy, None, None, None)
+            .generate(
+                prompt,
+                MAX_NEW_TOKENS,
+                rampipe::llama::Sampling::Greedy,
+                None,
+                None,
+                None,
+            )
             .with_context(|| format!("generating for {label}"))?;
         let total_wall_time = gen_start.elapsed();
-        let tok_per_sec = result.tokens_generated as f64 / total_wall_time.as_secs_f64().max(f64::EPSILON);
+        let tok_per_sec =
+            result.tokens_generated as f64 / total_wall_time.as_secs_f64().max(f64::EPSILON);
         println!("  time_to_first_token: {:?}", result.time_to_first_token);
         println!("  total generate() wall time: {total_wall_time:?}");
         println!("  tokens_generated:    {}", result.tokens_generated);

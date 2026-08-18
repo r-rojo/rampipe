@@ -10,8 +10,9 @@
 //! call rather than holding one open across calls.
 
 use crate::protocol::{
-    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest, GenerateResponse, GrammarCompletion,
-    OpenConversationRequest, StatusResponse, WireOverflowPolicy, WireSampling,
+    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest,
+    GenerateResponse, GrammarCompletion, OpenConversationRequest, StatusResponse,
+    WireOverflowPolicy, WireSampling,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -25,7 +26,10 @@ pub use crate::protocol::default_socket_path;
 #[derive(Debug, thiserror::Error)]
 pub enum RampipedError {
     #[error("connecting to rampiped socket {path} (is rampiped running?): {source}")]
-    Connect { path: PathBuf, source: std::io::Error },
+    Connect {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("encoding request to rampiped: {0}")]
     Encode(#[source] serde_json::Error),
     #[error("sending request to rampiped: {0}")]
@@ -65,10 +69,16 @@ impl RampipedClient {
     /// request per connection (see module doc comment).
     pub fn connect(socket_path: impl Into<PathBuf>) -> Result<Self, RampipedError> {
         let socket_path = socket_path.into();
-        UnixStream::connect(&socket_path).map_err(|source| RampipedError::Connect { path: socket_path.clone(), source })?;
+        UnixStream::connect(&socket_path).map_err(|source| RampipedError::Connect {
+            path: socket_path.clone(),
+            source,
+        })?;
         Ok(Self { socket_path })
     }
 
+    // The parameters mirror `GenerateRequest`'s fields one-for-one; a params
+    // struct here would only duplicate the wire type it serializes into.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         model_path: &Path,
@@ -92,19 +102,33 @@ impl RampipedClient {
         payload.push(b'\n');
 
         let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect { path: self.socket_path.clone(), source })?;
+            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect {
+                path: self.socket_path.clone(),
+                source,
+            })?;
         stream.write_all(&payload).map_err(RampipedError::Send)?;
-        stream.shutdown(std::net::Shutdown::Write).map_err(RampipedError::Send)?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(RampipedError::Send)?;
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
         reader.read_line(&mut line).map_err(RampipedError::Read)?;
-        let response: GenerateResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
+        let response: GenerateResponse =
+            serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
 
         match response {
-            GenerateResponse::Ok { text, tokens_generated, time_to_first_token_ms, formatted_prompt } => {
-                Ok(GenerateOutcome { text, tokens_generated, time_to_first_token_ms, formatted_prompt })
-            }
+            GenerateResponse::Ok {
+                text,
+                tokens_generated,
+                time_to_first_token_ms,
+                formatted_prompt,
+            } => Ok(GenerateOutcome {
+                text,
+                tokens_generated,
+                time_to_first_token_ms,
+                formatted_prompt,
+            }),
             GenerateResponse::Err { message } => Err(RampipedError::Remote(message)),
         }
     }
@@ -122,9 +146,14 @@ impl RampipedClient {
         payload.push(b'\n');
 
         let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect { path: self.socket_path.clone(), source })?;
+            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect {
+                path: self.socket_path.clone(),
+                source,
+            })?;
         stream.write_all(&payload).map_err(RampipedError::Send)?;
-        stream.shutdown(std::net::Shutdown::Write).map_err(RampipedError::Send)?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(RampipedError::Send)?;
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -157,27 +186,49 @@ impl RampipedConversation {
     /// waits for the daemon's `Opened` ack before returning — a caller
     /// that gets `Ok` back knows the daemon has already loaded (or is
     /// already loading) `model_path` and is ready for `send()`.
-    pub fn open(socket_path: impl Into<PathBuf>, model_path: &Path, n_ctx: u32, overflow: WireOverflowPolicy) -> Result<Self, RampipedError> {
+    pub fn open(
+        socket_path: impl Into<PathBuf>,
+        model_path: &Path,
+        n_ctx: u32,
+        overflow: WireOverflowPolicy,
+    ) -> Result<Self, RampipedError> {
         let socket_path = socket_path.into();
-        let stream = UnixStream::connect(&socket_path).map_err(|source| RampipedError::Connect { path: socket_path.clone(), source })?;
-        let mut writer = stream.try_clone().map_err(|source| RampipedError::Connect { path: socket_path.clone(), source })?;
+        let stream =
+            UnixStream::connect(&socket_path).map_err(|source| RampipedError::Connect {
+                path: socket_path.clone(),
+                source,
+            })?;
+        let mut writer = stream
+            .try_clone()
+            .map_err(|source| RampipedError::Connect {
+                path: socket_path.clone(),
+                source,
+            })?;
         let mut reader = BufReader::new(stream);
 
-        let request =
-            ClientMessage::OpenConversation(OpenConversationRequest { model_path: model_path.to_path_buf(), n_ctx, overflow });
+        let request = ClientMessage::OpenConversation(OpenConversationRequest {
+            model_path: model_path.to_path_buf(),
+            n_ctx,
+            overflow,
+        });
         let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
         writer.write_all(&payload).map_err(RampipedError::Send)?;
 
         let mut line = String::new();
         reader.read_line(&mut line).map_err(RampipedError::Read)?;
-        let response: ConversationResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
+        let response: ConversationResponse =
+            serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
         match response {
-            ConversationResponse::Opened => Ok(Self { reader, writer, turns: 0 }),
+            ConversationResponse::Opened => Ok(Self {
+                reader,
+                writer,
+                turns: 0,
+            }),
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Turn { .. } => {
-                Err(RampipedError::Remote("rampiped sent a turn response before the conversation was opened".to_string()))
-            }
+            ConversationResponse::Turn { .. } => Err(RampipedError::Remote(
+                "rampiped sent a turn response before the conversation was opened".to_string(),
+            )),
         }
     }
 
@@ -203,18 +254,35 @@ impl RampipedConversation {
         };
         let mut payload = serde_json::to_vec(&turn).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
-        self.writer.write_all(&payload).map_err(RampipedError::Send)?;
+        self.writer
+            .write_all(&payload)
+            .map_err(RampipedError::Send)?;
 
         let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(RampipedError::Read)?;
-        let response: ConversationResponse = serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
+        self.reader
+            .read_line(&mut line)
+            .map_err(RampipedError::Read)?;
+        let response: ConversationResponse =
+            serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
         match response {
-            ConversationResponse::Turn { text, tokens_generated, time_to_first_token_ms, formatted_prompt } => {
+            ConversationResponse::Turn {
+                text,
+                tokens_generated,
+                time_to_first_token_ms,
+                formatted_prompt,
+            } => {
                 self.turns += 1;
-                Ok(GenerateOutcome { text, tokens_generated, time_to_first_token_ms, formatted_prompt })
+                Ok(GenerateOutcome {
+                    text,
+                    tokens_generated,
+                    time_to_first_token_ms,
+                    formatted_prompt,
+                })
             }
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Opened => Err(RampipedError::Remote("rampiped re-sent Opened mid-conversation".to_string())),
+            ConversationResponse::Opened => Err(RampipedError::Remote(
+                "rampiped re-sent Opened mid-conversation".to_string(),
+            )),
         }
     }
 }
@@ -244,12 +312,26 @@ impl crate::llama::ConversationHandle for RampipedConversation {
     ) -> Result<crate::llama::GenerationResult, crate::llama::LlamaSessionError> {
         let sampling = match sampling {
             crate::llama::Sampling::Greedy => WireSampling::Greedy,
-            crate::llama::Sampling::Temperature { temperature, top_k, seed } => {
-                WireSampling::Temperature { temperature, top_k, seed }
-            }
+            crate::llama::Sampling::Temperature {
+                temperature,
+                top_k,
+                seed,
+            } => WireSampling::Temperature {
+                temperature,
+                top_k,
+                seed,
+            },
         };
-        let outcome = RampipedConversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_completion)
-            .map_err(|e| crate::llama::LlamaSessionError::Backend(e.to_string()))?;
+        let outcome = RampipedConversation::send(
+            self,
+            message,
+            max_new_tokens,
+            sampling,
+            grammar,
+            assistant_prefill,
+            grammar_completion,
+        )
+        .map_err(|e| crate::llama::LlamaSessionError::Backend(e.to_string()))?;
         Ok(crate::llama::GenerationResult {
             text: outcome.text,
             // Back to a `Duration` from the milliseconds the wire format

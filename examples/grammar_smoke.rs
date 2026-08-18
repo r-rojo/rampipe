@@ -53,7 +53,10 @@ bool   ::= "true" | "false"
 fn download_model() -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating Hugging Face Hub client")?;
     let repo = client.model(REPO_OWNER, REPO_NAME);
-    repo.download_file().filename(FILENAME).send().context("downloading GGUF file")
+    repo.download_file()
+        .filename(FILENAME)
+        .send()
+        .context("downloading GGUF file")
 }
 
 fn main() -> Result<()> {
@@ -67,8 +70,13 @@ fn main() -> Result<()> {
     let model_path = download_model()?;
     let backend = rampipe::llama::LlamaBackend::init().context("initializing llama.cpp backend")?;
     let registry = SwapRegistry::new();
-    let session = LlamaSession::load(&registry, std::sync::Arc::new(backend), &model_path, Residency::Lazy)
-        .context("loading session")?;
+    let session = LlamaSession::load(
+        &registry,
+        std::sync::Arc::new(backend),
+        &model_path,
+        Residency::Lazy,
+    )
+    .context("loading session")?;
 
     println!("=== 1. classifier grammar (YES|NO) ===");
     let classify_grammar = "root ::= \"YES\" | \"NO\"\n";
@@ -76,11 +84,22 @@ fn main() -> Result<()> {
                   running a shell command. Answer with exactly one word: YES or NO.\n\nMessage: what is the \
                   capital of France?\nAnswer:";
     let is_complete = |text: &str| text == "YES" || text == "NO";
-    let result =
-        session.generate(prompt, 5, Sampling::Greedy, Some(classify_grammar), None, Some(&is_complete)).context("classifier generation")?;
+    let result = session
+        .generate(
+            prompt,
+            5,
+            Sampling::Greedy,
+            Some(classify_grammar),
+            None,
+            Some(&is_complete),
+        )
+        .context("classifier generation")?;
     println!("  raw output: {:?}", result.text);
     if result.text.trim() != "YES" && result.text.trim() != "NO" {
-        bail!("classifier grammar failed to constrain output to an exact YES/NO match: {:?}", result.text);
+        bail!(
+            "classifier grammar failed to constrain output to an exact YES/NO match: {:?}",
+            result.text
+        );
     }
     println!("  OK: exact match");
 
@@ -92,22 +111,43 @@ fn main() -> Result<()> {
          Example -- response: {\"steps\":[{\"op\":\"write\",\"path\":\"autumn.txt\",\"content\":\"leaves \
          fall\\nquiet gold drifting down\\nautumn takes its bow\\n\"}],\"reply\":\"Wrote autumn.txt.\"}\n\n\
          Write a 3-line poem about the ocean to a file named poem.txt.";
-    let is_complete = |generated: &str| serde_json::from_str::<serde_json::Value>(&format!("{{{generated}")).is_ok();
+    let is_complete = |generated: &str| {
+        serde_json::from_str::<serde_json::Value>(&format!("{{{generated}")).is_ok()
+    };
     let result = session
-        .generate(envelope_prompt, 300, Sampling::Greedy, Some(ENVELOPE_GRAMMAR), Some("{"), Some(&is_complete))
+        .generate(
+            envelope_prompt,
+            300,
+            Sampling::Greedy,
+            Some(ENVELOPE_GRAMMAR),
+            Some("{"),
+            Some(&is_complete),
+        )
         .context("envelope generation")?;
     println!("  raw output: {}", result.text);
-    let value: serde_json::Value = serde_json::from_str(result.text.trim()).context("envelope output failed to parse as JSON")?;
-    let content = value["steps"][0]["content"].as_str().context("no steps[0].content in envelope output")?;
+    let value: serde_json::Value = serde_json::from_str(result.text.trim())
+        .context("envelope output failed to parse as JSON")?;
+    let content = value["steps"][0]["content"]
+        .as_str()
+        .context("no steps[0].content in envelope output")?;
     println!("  parsed content field: {content:?}");
     if !content.contains('\n') {
-        bail!("expected a multi-line content field (real embedded newlines after JSON unescaping), got: {content:?}");
+        bail!(
+            "expected a multi-line content field (real embedded newlines after JSON unescaping), got: {content:?}"
+        );
     }
     println!("  OK: valid JSON, content round-trips with real embedded newlines");
 
     println!("\n=== 3. malformed grammar surfaces a real error ===");
     let broken_grammar = "root ::= \"unterminated";
-    match session.generate("hello", 5, Sampling::Greedy, Some(broken_grammar), None, None) {
+    match session.generate(
+        "hello",
+        5,
+        Sampling::Greedy,
+        Some(broken_grammar),
+        None,
+        None,
+    ) {
         Ok(_) => bail!("expected malformed grammar to error, but generation succeeded"),
         Err(e) => println!("  OK: got expected error: {e}"),
     }

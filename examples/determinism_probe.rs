@@ -40,7 +40,10 @@ const BODY: &str = "## Goal\nDefine core ECS structs (Position, Velocity, Transf
 fn download_model() -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating Hugging Face Hub client")?;
     let repo = client.model(REPO_OWNER, REPO_NAME);
-    repo.download_file().filename(FILENAME).send().context("resolving model file (should be a cache hit)")
+    repo.download_file()
+        .filename(FILENAME)
+        .send()
+        .context("resolving model file (should be a cache hit)")
 }
 
 fn main() -> Result<()> {
@@ -48,8 +51,13 @@ fn main() -> Result<()> {
     let model_path = download_model()?;
 
     let backend = LlamaBackend::init().context("llama.cpp backend init")?;
-    let model_params = if cpu_only { LlamaModelParams::default().with_n_gpu_layers(0) } else { LlamaModelParams::default() };
-    let model = LlamaModel::load_from_file(&backend, &model_path, &model_params).context("model load")?;
+    let model_params = if cpu_only {
+        LlamaModelParams::default().with_n_gpu_layers(0)
+    } else {
+        LlamaModelParams::default()
+    };
+    let model =
+        LlamaModel::load_from_file(&backend, &model_path, &model_params).context("model load")?;
 
     // Byte-for-byte the same prompt `LocalBackend::execute` builds for a
     // task with no dependencies and no plan (dependency_api_section and
@@ -69,10 +77,15 @@ fn main() -> Result<()> {
     let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));
     let mut ctx = model.new_context(&backend, ctx_params).context("context")?;
 
-    let tokens_list = model.str_to_token(&prompt, AddBos::Always).context("tokenize")?;
+    let tokens_list = model
+        .str_to_token(&prompt, AddBos::Always)
+        .context("tokenize")?;
     let n_ctx = ctx.n_ctx() as i32;
     let requested = tokens_list.len() as i32 + MAX_NEW_TOKENS;
-    anyhow::ensure!(requested <= n_ctx, "prompt plus max_new_tokens ({requested}) exceeds context size ({n_ctx})");
+    anyhow::ensure!(
+        requested <= n_ctx,
+        "prompt plus max_new_tokens ({requested}) exceeds context size ({n_ctx})"
+    );
 
     let mut batch = LlamaBatch::new(512, 1);
     let last_index = (tokens_list.len() - 1) as i32;
@@ -87,7 +100,8 @@ fn main() -> Result<()> {
     }
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
-    let mut sampler = LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
+    let mut sampler =
+        LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
 
     let mut n_cur = tokens_list.len() as i32;
     let end = tokens_list.len() as i32 + MAX_NEW_TOKENS;
@@ -111,7 +125,10 @@ fn main() -> Result<()> {
         ctx.decode(&mut batch)?;
     }
 
-    println!("===PROBE_MODE=== {}", if cpu_only { "cpu-only" } else { "metal" });
+    println!(
+        "===PROBE_MODE=== {}",
+        if cpu_only { "cpu-only" } else { "metal" }
+    );
     println!("===PROBE_OUTPUT_START===");
     println!("{text}");
     println!("===PROBE_OUTPUT_END===");

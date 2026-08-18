@@ -46,14 +46,26 @@ fn download_model() -> Result<PathBuf> {
         .context("downloading GGUF file")
 }
 
-fn run(label: &str, model_path: &PathBuf, backend: &Arc<llama_cpp_2::llama_backend::LlamaBackend>, residency: Residency) -> Result<()> {
+fn run(
+    label: &str,
+    model_path: &PathBuf,
+    backend: &Arc<llama_cpp_2::llama_backend::LlamaBackend>,
+    residency: Residency,
+) -> Result<()> {
     let registry = SwapRegistry::new();
     let session = LlamaSession::load(&registry, Arc::clone(backend), model_path, residency)
         .with_context(|| format!("loading session for {label}"))?;
 
     let metrics = session.metrics();
     let result = session
-        .generate(PROMPT, MAX_NEW_TOKENS, rampipe::llama::Sampling::Greedy, None, None, None)
+        .generate(
+            PROMPT,
+            MAX_NEW_TOKENS,
+            rampipe::llama::Sampling::Greedy,
+            None,
+            None,
+            None,
+        )
         .with_context(|| format!("generating for {label}"))?;
 
     println!("=== {label} ===");
@@ -61,7 +73,10 @@ fn run(label: &str, model_path: &PathBuf, backend: &Arc<llama_cpp_2::llama_backe
     println!("  prefault_latency:  {:?}", metrics.prefault_latency);
     println!("  mapped_bytes:      {}", metrics.mapped_bytes);
     println!("  rss_delta_bytes:   {:?}", metrics.rss_delta_bytes);
-    println!("  resident_fraction: {:?} (see caveat in module docs)", metrics.resident_fraction);
+    println!(
+        "  resident_fraction: {:?} (see caveat in module docs)",
+        metrics.resident_fraction
+    );
     println!("  warm:              {} (same caveat)", metrics.warm);
     println!("  time_to_first_token: {:?}", result.time_to_first_token);
     println!("  tokens_generated:  {}", result.tokens_generated);
@@ -72,10 +87,14 @@ fn run(label: &str, model_path: &PathBuf, backend: &Arc<llama_cpp_2::llama_backe
 }
 
 fn main() -> Result<()> {
-    println!("Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (cached after first run)...");
+    println!(
+        "Downloading/locating {REPO_OWNER}/{REPO_NAME}/{FILENAME} (cached after first run)..."
+    );
     let model_path = download_model()?;
 
-    let backend = Arc::new(llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?);
+    let backend = Arc::new(
+        llama_cpp_2::llama_backend::LlamaBackend::init().context("llama.cpp backend init")?,
+    );
 
     run("Lazy", &model_path, &backend, Residency::Lazy)?;
     run("Prefault", &model_path, &backend, Residency::Prefault)?;

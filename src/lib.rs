@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "llama")]
-pub mod llama;
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "llama")]
+pub mod llama;
 pub mod protocol;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
@@ -154,7 +154,11 @@ impl ModelHandle {
     /// that's never been called (e.g. a CPU-only load, or a GPU-touching
     /// load that hasn't reported its measurement yet).
     pub fn device_bytes(&self) -> Option<u64> {
-        *self.inner.device_bytes.lock().expect("rampipe registry lock poisoned")
+        *self
+            .inner
+            .device_bytes
+            .lock()
+            .expect("rampipe registry lock poisoned")
     }
 }
 
@@ -198,12 +202,20 @@ impl SwapRegistry {
     /// Maps `path` into memory and validates it as a GGUF file. If `path` is
     /// already resident, hands out another handle to the existing mapping
     /// (same `ModelId`) instead of mapping it again.
-    pub fn load(&self, path: impl AsRef<Path>, residency: Residency) -> Result<ModelHandle, LoadError> {
+    pub fn load(
+        &self,
+        path: impl AsRef<Path>,
+        residency: Residency,
+    ) -> Result<ModelHandle, LoadError> {
         let path = path.as_ref().to_path_buf();
         let mut state = self.state.lock().expect("rampipe registry lock poisoned");
 
         if let Some(&id) = state.by_path.get(&path) {
-            let inner = state.resident.get(&id).expect("by_path/resident desync").clone();
+            let inner = state
+                .resident
+                .get(&id)
+                .expect("by_path/resident desync")
+                .clone();
             state.last_accessed.insert(id, Instant::now());
             return Ok(ModelHandle { id, inner });
         }
@@ -263,7 +275,12 @@ impl SwapRegistry {
 
         let id = ModelId(state.next_id);
         state.next_id += 1;
-        let inner = Arc::new(Resident { path: path.clone(), mmap, metrics, device_bytes: Mutex::new(None) });
+        let inner = Arc::new(Resident {
+            path: path.clone(),
+            mmap,
+            metrics,
+            device_bytes: Mutex::new(None),
+        });
         state.resident.insert(id, inner.clone());
         state.by_path.insert(path, id);
         state.last_accessed.insert(id, Instant::now());
@@ -302,7 +319,11 @@ impl SwapRegistry {
     }
 
     pub fn resident_count(&self) -> usize {
-        self.state.lock().expect("rampipe registry lock poisoned").resident.len()
+        self.state
+            .lock()
+            .expect("rampipe registry lock poisoned")
+            .resident
+            .len()
     }
 
     /// Total mapped bytes across resident models. Not RSS — this is the
@@ -326,8 +347,11 @@ impl SwapRegistry {
     /// own doc comment.
     pub fn resident_ids_by_lru(&self) -> Vec<ModelId> {
         let state = self.state.lock().expect("rampipe registry lock poisoned");
-        let mut ids: Vec<(ModelId, Instant)> =
-            state.last_accessed.iter().map(|(&id, &accessed)| (id, accessed)).collect();
+        let mut ids: Vec<(ModelId, Instant)> = state
+            .last_accessed
+            .iter()
+            .map(|(&id, &accessed)| (id, accessed))
+            .collect();
         ids.sort_by_key(|&(_, accessed)| accessed);
         ids.into_iter().map(|(id, _)| id).collect()
     }
@@ -371,7 +395,10 @@ impl SwapRegistry {
     pub fn record_device_bytes(&self, id: ModelId, bytes: u64) {
         let state = self.state.lock().expect("rampipe registry lock poisoned");
         if let Some(resident) = state.resident.get(&id) {
-            *resident.device_bytes.lock().expect("rampipe registry lock poisoned") = Some(bytes);
+            *resident
+                .device_bytes
+                .lock()
+                .expect("rampipe registry lock poisoned") = Some(bytes);
         }
     }
 
@@ -385,7 +412,11 @@ impl SwapRegistry {
             .expect("rampipe registry lock poisoned")
             .resident
             .values()
-            .filter_map(|r| *r.device_bytes.lock().expect("rampipe registry lock poisoned"))
+            .filter_map(|r| {
+                *r.device_bytes
+                    .lock()
+                    .expect("rampipe registry lock poisoned")
+            })
             .sum()
     }
 
@@ -397,7 +428,12 @@ impl SwapRegistry {
     /// `Some`, unlike `fits_within_budget`: a caller that can supply
     /// `free_device_bytes` at all already has an answer, there's no
     /// platform-can't-measure-it case to represent here.
-    pub fn fits_within_device_budget(&self, new_device_bytes: u64, free_device_bytes: u64, budget_fraction: f64) -> bool {
+    pub fn fits_within_device_budget(
+        &self,
+        new_device_bytes: u64,
+        free_device_bytes: u64,
+        budget_fraction: f64,
+    ) -> bool {
         let resident = self.device_resident_bytes();
         let available = free_device_bytes + resident;
         (resident + new_device_bytes) as f64 <= budget_fraction * available as f64
@@ -434,7 +470,11 @@ fn advise_willneed(mmap: &Mmap) {
     // hint (non-zero return) just means no readahead benefit, not a
     // correctness problem, so the result is intentionally ignored.
     unsafe {
-        libc::madvise(mmap.as_ptr() as *mut libc::c_void, mmap.len(), libc::MADV_WILLNEED);
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_WILLNEED,
+        );
     }
 }
 
@@ -453,7 +493,13 @@ fn mincore_resident_fraction(mmap: &Mmap) -> Option<f64> {
     let mut vec = vec![0u8; n_pages];
     // Safety: `vec` has exactly one byte per page covering `mmap`'s full
     // length, matching what Linux's mincore(2) requires and will write to.
-    let result = unsafe { libc::mincore(mmap.as_ptr() as *mut libc::c_void, mmap.len(), vec.as_mut_ptr()) };
+    let result = unsafe {
+        libc::mincore(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            vec.as_mut_ptr(),
+        )
+    };
     if result != 0 {
         return None;
     }
@@ -478,11 +524,20 @@ fn mincore_resident_fraction(mmap: &Mmap) -> Option<f64> {
     let mut vec = vec![0i8; n_pages];
     // Safety: same contract as the Linux path above; Darwin's mincore(2)
     // takes a `*mut c_char` vector of the same one-byte-per-page shape.
-    let result = unsafe { libc::mincore(mmap.as_ptr() as *const libc::c_void, mmap.len(), vec.as_mut_ptr()) };
+    let result = unsafe {
+        libc::mincore(
+            mmap.as_ptr() as *const libc::c_void,
+            mmap.len(),
+            vec.as_mut_ptr(),
+        )
+    };
     if result != 0 {
         return None;
     }
-    let resident = vec.iter().filter(|&&byte| byte & libc::MINCORE_INCORE as i8 != 0).count();
+    let resident = vec
+        .iter()
+        .filter(|&&byte| byte & libc::MINCORE_INCORE as i8 != 0)
+        .count();
     Some(resident as f64 / n_pages as f64)
 }
 
@@ -589,7 +644,8 @@ fn system_free_bytes() -> Option<u64> {
     }
 
     let mut info = vm_statistics64::default();
-    let mut count = (mem::size_of::<vm_statistics64>() / mem::size_of::<natural_t>()) as mach_msg_type_number_t;
+    let mut count =
+        (mem::size_of::<vm_statistics64>() / mem::size_of::<natural_t>()) as mach_msg_type_number_t;
     // Safety: `info` is `vm_statistics64`'s real layout from `mach2`
     // (not hand-rolled), and `count` is sized in `natural_t` units to
     // match, so `host_statistics64` writes exactly as many words as
@@ -598,7 +654,12 @@ fn system_free_bytes() -> Option<u64> {
     // `thread_port_t`, assignment-compatible with the `host_t` this
     // takes since both are plain aliases of `mach_port_t`.
     let result = unsafe {
-        host_statistics64(mach_host_self(), HOST_VM_INFO64, &mut info as *mut vm_statistics64 as *mut integer_t, &mut count)
+        host_statistics64(
+            mach_host_self(),
+            HOST_VM_INFO64,
+            &mut info as *mut vm_statistics64 as *mut integer_t,
+            &mut count,
+        )
     };
     if result != KERN_SUCCESS {
         return None;
@@ -618,7 +679,7 @@ fn system_free_bytes() -> Option<u64> {
             // exactly the semantics wanted here, no free+inactive-style
             // approximation needed the way the macOS path has to build
             // one from more primitive counters.
-            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024);
         }
     }
@@ -696,7 +757,10 @@ mod system_free_bytes_tests {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
         {
             let free = free.expect("system_free_bytes should succeed on a supported platform");
-            assert!(free > 100_000_000, "expected well over 100MB free+inactive on a real machine, got {free}");
+            assert!(
+                free > 100_000_000,
+                "expected well over 100MB free+inactive on a real machine, got {free}"
+            );
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
         {

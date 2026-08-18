@@ -22,7 +22,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum WireSampling {
     Greedy,
-    Temperature { temperature: f32, top_k: i32, seed: u32 },
+    Temperature {
+        temperature: f32,
+        top_k: i32,
+        seed: u32,
+    },
 }
 
 /// How a caller's own generation loop should decide "the grammar-
@@ -53,10 +57,12 @@ impl GrammarCompletion {
     /// description.
     pub fn into_predicate(self) -> Box<dyn Fn(&str) -> bool> {
         match self {
-            GrammarCompletion::ExactMatch(options) => Box::new(move |text: &str| options.iter().any(|option| option == text)),
-            GrammarCompletion::ValidJson { prefill } => {
-                Box::new(move |text: &str| serde_json::from_str::<serde_json::Value>(&format!("{prefill}{text}")).is_ok())
+            GrammarCompletion::ExactMatch(options) => {
+                Box::new(move |text: &str| options.iter().any(|option| option == text))
             }
+            GrammarCompletion::ValidJson { prefill } => Box::new(move |text: &str| {
+                serde_json::from_str::<serde_json::Value>(&format!("{prefill}{text}")).is_ok()
+            }),
         }
     }
 }

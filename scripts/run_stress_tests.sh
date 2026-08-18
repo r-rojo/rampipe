@@ -5,7 +5,7 @@
 # repo root relative to its own location, so it works from a checkout
 # anywhere as long as it stays at <repo>/scripts/run_stress_tests.sh.
 # No cross-machine orchestration either: run it by hand, once per
-# machine you want to test (this Mac, genie, wherever else).
+# machine you want to test (laptop, workstation, wherever else).
 #
 # Auto-detects the right rampiped build: CUDA on Linux if
 # /usr/local/cuda is present (setting up its PATH/LD_LIBRARY_PATH for

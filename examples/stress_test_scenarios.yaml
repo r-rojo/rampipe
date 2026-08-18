@@ -16,7 +16,7 @@ models: &pubsub-models
     repo_owner: bartowski
     repo_name: Meta-Llama-3.1-8B-Instruct-GGUF
     filename: Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
-  # ~18.5GB, single file -- doesn't fit genie's 16GB VRAM at all (runs
+  # ~18.5GB, single file -- doesn't fit a 16GB-VRAM GPU at all (runs
   # mostly on CPU there), but fits a Mac with real headroom for KV
   # cache/compute buffers on top. Q6_K_L (~25.4GB) was tried first and
   # failed decode on a 32GB Mac (Metal's own GPU working-set ceiling

@@ -72,8 +72,14 @@ pub enum LlamaSessionError {
          open_conversation needs one; one-shot generate() doesn't"
     )]
     ConversationTemplateUnavailable,
-    #[error("conversation turn ({needed} new tokens) doesn't fit even after dropping every droppable turn: committed={committed_pos}, n_ctx={n_ctx}")]
-    ConversationContextFull { committed_pos: i32, needed: i32, n_ctx: i32 },
+    #[error(
+        "conversation turn ({needed} new tokens) doesn't fit even after dropping every droppable turn: committed={committed_pos}, n_ctx={n_ctx}"
+    )]
+    ConversationContextFull {
+        committed_pos: i32,
+        needed: i32,
+        n_ctx: i32,
+    },
     #[error("conversation overflowed its context window but has fewer than 2 turns left to drop")]
     ConversationTooLargeToTrim,
     #[error("grammar error: {0}")]
@@ -104,7 +110,10 @@ pub enum LlamaSessionError {
     /// trip that check before doing something worse) -- caught here,
     /// before ever calling into llama.cpp's own loader.
     #[error("saved conversation snapshot is for model {saved}, but this session is {current}")]
-    SnapshotModelMismatch { saved: std::path::PathBuf, current: std::path::PathBuf },
+    SnapshotModelMismatch {
+        saved: std::path::PathBuf,
+        current: std::path::PathBuf,
+    },
 }
 
 /// A manual override for how a prompt is wrapped into a chat turn —
@@ -156,21 +165,34 @@ pub struct ChatWrap {
 /// type). Registering it here matches that convention rather than
 /// leaving the name undefined and turning a template's own deliberate
 /// validation error into an unrelated "unknown function" failure.
-fn render_messages(template_text: &str, messages: &[(&str, &str)], add_generation_prompt: bool) -> Option<String> {
+fn render_messages(
+    template_text: &str,
+    messages: &[(&str, &str)],
+    add_generation_prompt: bool,
+) -> Option<String> {
     use minijinja::{Environment, Value, context};
 
     let mut env = Environment::new();
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
-    env.add_function("raise_exception", |msg: String| -> Result<Value, minijinja::Error> {
-        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-    });
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> Result<Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
     env.add_template("chat", template_text).ok()?;
     let tmpl = env.get_template("chat").ok()?;
 
-    let rendered_messages: Vec<Value> =
-        messages.iter().map(|(role, content)| context! { role => *role, content => *content }).collect();
-    let ctx = context! { messages => rendered_messages, add_generation_prompt => add_generation_prompt };
+    let rendered_messages: Vec<Value> = messages
+        .iter()
+        .map(|(role, content)| context! { role => *role, content => *content })
+        .collect();
+    let ctx =
+        context! { messages => rendered_messages, add_generation_prompt => add_generation_prompt };
     tmpl.render(ctx).ok()
 }
 
@@ -273,7 +295,11 @@ pub struct LlamaSession {
 #[derive(Debug, Clone, Copy)]
 pub enum Sampling {
     Greedy,
-    Temperature { temperature: f32, top_k: i32, seed: u32 },
+    Temperature {
+        temperature: f32,
+        top_k: i32,
+        seed: u32,
+    },
 }
 
 pub struct GenerationResult {
@@ -309,7 +335,12 @@ pub struct GenerationResult {
 /// decoding a turn-transition's trailing text with nothing to sample
 /// yet) still behaves correctly, since unread logits are simply never
 /// read.
-fn decode_chunked(ctx: &mut LlamaContext, batch: &mut LlamaBatch, tokens: &[LlamaToken], n_cur: &mut i32) -> Result<(), LlamaSessionError> {
+fn decode_chunked(
+    ctx: &mut LlamaContext,
+    batch: &mut LlamaBatch,
+    tokens: &[LlamaToken],
+    n_cur: &mut i32,
+) -> Result<(), LlamaSessionError> {
     if tokens.is_empty() {
         return Ok(());
     }
@@ -371,7 +402,11 @@ fn run_generation_loop(
         }
         match sampling {
             Sampling::Greedy => stages.push(LlamaSampler::greedy()),
-            Sampling::Temperature { temperature, top_k, seed } => {
+            Sampling::Temperature {
+                temperature,
+                top_k,
+                seed,
+            } => {
                 stages.push(LlamaSampler::top_k(top_k));
                 stages.push(LlamaSampler::temp(temperature));
                 stages.push(LlamaSampler::dist(seed));
@@ -400,7 +435,11 @@ fn run_generation_loop(
     // multi-token grammar-constrained response without crashing the
     // process. `plain_sampler` is the ordinary persistent-chain path,
     // unchanged, used whenever there's no grammar to work around.
-    let mut plain_sampler = if grammar.is_none() { Some(build_chain(None)?) } else { None };
+    let mut plain_sampler = if grammar.is_none() {
+        Some(build_chain(None)?)
+    } else {
+        None
+    };
     let mut accepted_tokens: Vec<LlamaToken> = Vec::new();
 
     let mut text = String::new();
@@ -524,7 +563,11 @@ fn run_generation_loop(
         generated_tokens.push(token);
     }
 
-    Ok((text, generated_tokens, time_to_first_token.unwrap_or_default()))
+    Ok((
+        text,
+        generated_tokens,
+        time_to_first_token.unwrap_or_default(),
+    ))
 }
 
 /// How many of a model's transformer layers to put on GPU. A fixed count
@@ -558,11 +601,16 @@ const GPU_FIT_MIN_CTX: u32 = 4096;
 /// `tensor_buft_overrides` buffers -- moving the value afterward would
 /// invalidate them, so it must stay behind `Pin` all the way through the
 /// `load_from_file` call that actually reads it.
-fn resolve_model_params(path: &Path, gpu_layers: GpuLayers) -> Result<Pin<Box<LlamaModelParams>>, LlamaSessionError> {
+fn resolve_model_params(
+    path: &Path,
+    gpu_layers: GpuLayers,
+) -> Result<Pin<Box<LlamaModelParams>>, LlamaSessionError> {
     match gpu_layers {
         GpuLayers::Fixed(n) => Ok(Box::pin(LlamaModelParams::default().with_n_gpu_layers(n))),
         GpuLayers::Auto => {
-            let path_str = path.to_str().ok_or_else(|| LlamaSessionError::PathNotUtf8(path.to_path_buf()))?;
+            let path_str = path
+                .to_str()
+                .ok_or_else(|| LlamaSessionError::PathNotUtf8(path.to_path_buf()))?;
             let path_c = CString::new(path_str)?;
             let mut params = Box::pin(LlamaModelParams::default());
             // n_ctx=0 (via `with_n_ctx(None)`) tells `fit_params` to pick
@@ -571,15 +619,24 @@ fn resolve_model_params(path: &Path, gpu_layers: GpuLayers) -> Result<Pin<Box<Ll
             // more layers than actually fit once a real conversation later
             // opens a much larger context.
             let mut cparams = LlamaContextParams::default().with_n_ctx(None);
-            let mut margins = vec![GPU_FIT_MARGIN_BYTES; unsafe { llama_cpp_sys_2::llama_max_devices() }];
-            match params.as_mut().fit_params(&path_c, &mut cparams, &mut margins, GPU_FIT_MIN_CTX, llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR) {
+            let mut margins =
+                vec![GPU_FIT_MARGIN_BYTES; unsafe { llama_cpp_sys_2::llama_max_devices() }];
+            match params.as_mut().fit_params(
+                &path_c,
+                &mut cparams,
+                &mut margins,
+                GPU_FIT_MIN_CTX,
+                llama_cpp_sys_2::GGML_LOG_LEVEL_ERROR,
+            ) {
                 Ok(_) => Ok(params),
                 // No allocation was projected to fit within the memory
                 // margin -- fall back to CPU-only rather than failing the
                 // whole load; matches `common_fit_params`'s own "assumes
                 // system memory is unlimited" contract for the non-GPU
                 // side.
-                Err(llama_cpp_2::model::params::FitError::Failure) => Ok(Box::pin(LlamaModelParams::default().with_n_gpu_layers(0))),
+                Err(llama_cpp_2::model::params::FitError::Failure) => {
+                    Ok(Box::pin(LlamaModelParams::default().with_n_gpu_layers(0)))
+                }
                 Err(err) => Err(LlamaSessionError::Fit(err)),
             }
         }
@@ -596,7 +653,9 @@ pub fn gpu_memory_bytes() -> Option<(u64, u64)> {
     // Safety: `ggml_backend_dev_by_type` returns a null pointer (not a
     // dangling one) when no device of that type is registered, checked
     // below before the device handle is used for anything.
-    let device = unsafe { llama_cpp_sys_2::ggml_backend_dev_by_type(llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU) };
+    let device = unsafe {
+        llama_cpp_sys_2::ggml_backend_dev_by_type(llama_cpp_sys_2::GGML_BACKEND_DEVICE_TYPE_GPU)
+    };
     if device.is_null() {
         return None;
     }
@@ -655,7 +714,12 @@ impl LlamaSession {
         {
             registry.record_device_bytes(handle.id(), free_before.saturating_sub(free_after));
         }
-        Ok(Self { handle, model, backend, chat_wrap: None })
+        Ok(Self {
+            handle,
+            model,
+            backend,
+            chat_wrap: None,
+        })
     }
 
     /// Opts this session into a manual `ChatWrap` instead of the GGUF's
@@ -747,21 +811,39 @@ impl LlamaSession {
         // that's already at or past `n_ctx` is the one real failure
         // worth surfacing early.
         if tokens_list.len() as i32 >= n_ctx {
-            return Err(LlamaSessionError::PromptTooLong { prompt_tokens: tokens_list.len() as i32, n_ctx });
+            return Err(LlamaSessionError::PromptTooLong {
+                prompt_tokens: tokens_list.len() as i32,
+                n_ctx,
+            });
         }
 
         let mut n_cur = 0i32;
         let mut batch = LlamaBatch::new(512, 1);
         decode_chunked(&mut ctx, &mut batch, &tokens_list, &mut n_cur)?;
-        let (text, generated_tokens, time_to_first_token) =
-            run_generation_loop(&mut ctx, &self.model, &mut batch, &mut n_cur, n_ctx, max_new_tokens, sampling, grammar, grammar_complete, start)?;
+        let (text, generated_tokens, time_to_first_token) = run_generation_loop(
+            &mut ctx,
+            &self.model,
+            &mut batch,
+            &mut n_cur,
+            n_ctx,
+            max_new_tokens,
+            sampling,
+            grammar,
+            grammar_complete,
+            start,
+        )?;
         let tokens_generated = generated_tokens.len();
         let text = match assistant_prefill {
             Some(prefill) => format!("{prefill}{text}"),
             None => text,
         };
 
-        Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt })
+        Ok(GenerationResult {
+            text,
+            time_to_first_token,
+            tokens_generated,
+            formatted_prompt,
+        })
     }
 
     /// Opens a real multi-turn conversation: one `LlamaContext` (and its
@@ -784,8 +866,13 @@ impl LlamaSession {
     /// turn ends and the next begins." A model whose template can't be
     /// proven steady-state this way can still be used via `generate()`,
     /// just not `open_conversation`.
-    pub fn open_conversation(&self, options: ConversationOptions) -> Result<Conversation<'_>, LlamaSessionError> {
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(options.n_ctx)).with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
+    pub fn open_conversation(
+        &self,
+        options: ConversationOptions,
+    ) -> Result<Conversation<'_>, LlamaSessionError> {
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(Some(options.n_ctx))
+            .with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
         let ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
@@ -836,10 +923,15 @@ impl LlamaSession {
 
         let current_path = self.path().to_path_buf();
         if meta.model_path != current_path {
-            return Err(LlamaSessionError::SnapshotModelMismatch { saved: meta.model_path, current: current_path });
+            return Err(LlamaSessionError::SnapshotModelMismatch {
+                saved: meta.model_path,
+                current: current_path,
+            });
         }
 
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(meta.n_ctx as u32)).with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(meta.n_ctx as u32))
+            .with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
         let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
@@ -1034,16 +1126,39 @@ struct ConversationTemplate {
 /// applies is likely to break the exact-match `.find()` below, turning
 /// a silent miscomposition into a clean `None`.
 fn derive_conversation_template(template_text: &str) -> Option<ConversationTemplate> {
-    let probe_a = derive_from_probe(template_text, "\u{E000}RPA1<&\"'>\u{E000}", "\u{E000}RPA2<&\"'>\u{E000}", "\u{E000}RPA3<&\"'>\u{E000}", "\u{E000}RPA4<&\"'>\u{E000}")?;
-    let probe_b = derive_from_probe(template_text, "\u{E000}RPB1<&\"'>\u{E000}", "\u{E000}RPB2<&\"'>\u{E000}", "\u{E000}RPB3<&\"'>\u{E000}", "\u{E000}RPB4<&\"'>\u{E000}")?;
+    let probe_a = derive_from_probe(
+        template_text,
+        "\u{E000}RPA1<&\"'>\u{E000}",
+        "\u{E000}RPA2<&\"'>\u{E000}",
+        "\u{E000}RPA3<&\"'>\u{E000}",
+        "\u{E000}RPA4<&\"'>\u{E000}",
+    )?;
+    let probe_b = derive_from_probe(
+        template_text,
+        "\u{E000}RPB1<&\"'>\u{E000}",
+        "\u{E000}RPB2<&\"'>\u{E000}",
+        "\u{E000}RPB3<&\"'>\u{E000}",
+        "\u{E000}RPB4<&\"'>\u{E000}",
+    )?;
     (probe_a.first_turn_open == probe_b.first_turn_open
         && probe_a.generation_open == probe_b.generation_open
         && probe_a.turn_transition == probe_b.turn_transition)
         .then_some(probe_a)
 }
 
-fn derive_from_probe(template_text: &str, u1: &str, a1: &str, u2: &str, a2: &str) -> Option<ConversationTemplate> {
-    let messages = [("user", u1), ("assistant", a1), ("user", u2), ("assistant", a2)];
+fn derive_from_probe(
+    template_text: &str,
+    u1: &str,
+    a1: &str,
+    u2: &str,
+    a2: &str,
+) -> Option<ConversationTemplate> {
+    let messages = [
+        ("user", u1),
+        ("assistant", a1),
+        ("user", u2),
+        ("assistant", a2),
+    ];
     let rendered = render_messages(template_text, &messages, false)?;
 
     let u1_start = rendered.find(u1)?;
@@ -1068,7 +1183,11 @@ fn derive_from_probe(template_text: &str, u1: &str, a1: &str, u2: &str, a2: &str
         return None;
     }
 
-    Some(ConversationTemplate { first_turn_open, generation_open, turn_transition })
+    Some(ConversationTemplate {
+        first_turn_open,
+        generation_open,
+        turn_transition,
+    })
 }
 
 /// Everything about a [`Conversation`] that llama.cpp's own state file
@@ -1140,7 +1259,11 @@ impl<'a> Conversation<'a> {
     /// hundreds of MB for an actual conversation, not a token-count-sized
     /// artifact. A caller doing this routinely needs its own cleanup
     /// policy for stale snapshots; nothing here expires them.
-    pub fn save_state(&self, state_path: impl AsRef<Path>, meta_path: impl AsRef<Path>) -> Result<(), LlamaSessionError> {
+    pub fn save_state(
+        &self,
+        state_path: impl AsRef<Path>,
+        meta_path: impl AsRef<Path>,
+    ) -> Result<(), LlamaSessionError> {
         self.ctx.state_save_file(state_path, &self.tokens)?;
         let meta = ConversationSnapshotMeta {
             model_path: self._handle.path().to_path_buf(),
@@ -1206,8 +1329,17 @@ impl<'a> Conversation<'a> {
 
         let mut batch = LlamaBatch::new(512, 1);
         let user_start = self.committed_pos;
-        decode_chunked(&mut self.ctx, &mut batch, &user_tokens, &mut self.committed_pos)?;
-        self.turns.push(TurnBoundary { role: Role::User, start_pos: user_start, end_pos: self.committed_pos });
+        decode_chunked(
+            &mut self.ctx,
+            &mut batch,
+            &user_tokens,
+            &mut self.committed_pos,
+        )?;
+        self.turns.push(TurnBoundary {
+            role: Role::User,
+            start_pos: user_start,
+            end_pos: self.committed_pos,
+        });
         self.tokens.extend(user_tokens);
 
         let assistant_start = self.committed_pos;
@@ -1223,7 +1355,11 @@ impl<'a> Conversation<'a> {
             grammar_complete,
             start,
         )?;
-        self.turns.push(TurnBoundary { role: Role::Assistant, start_pos: assistant_start, end_pos: self.committed_pos });
+        self.turns.push(TurnBoundary {
+            role: Role::Assistant,
+            start_pos: assistant_start,
+            end_pos: self.committed_pos,
+        });
         let tokens_generated = generated_tokens.len();
         self.tokens.extend(generated_tokens);
 
@@ -1232,7 +1368,12 @@ impl<'a> Conversation<'a> {
             None => text,
         };
 
-        Ok(GenerationResult { text, time_to_first_token, tokens_generated, formatted_prompt: user_text })
+        Ok(GenerationResult {
+            text,
+            time_to_first_token,
+            tokens_generated,
+            formatted_prompt: user_text,
+        })
     }
 
     /// Ensures `needed` more tokens will fit before `committed_pos`
@@ -1243,9 +1384,11 @@ impl<'a> Conversation<'a> {
             return Ok(());
         }
         match self.overflow {
-            OverflowPolicy::Fail => {
-                Err(LlamaSessionError::ConversationContextFull { committed_pos: self.committed_pos, needed, n_ctx: self.n_ctx })
-            }
+            OverflowPolicy::Fail => Err(LlamaSessionError::ConversationContextFull {
+                committed_pos: self.committed_pos,
+                needed,
+                n_ctx: self.n_ctx,
+            }),
             OverflowPolicy::DropOldestTurns => self.drop_oldest_turns_for(needed),
         }
     }
@@ -1277,8 +1420,13 @@ impl<'a> Conversation<'a> {
             debug_assert_eq!(assistant.role, Role::Assistant);
             let removed = assistant.end_pos - user.start_pos;
 
-            self.ctx.kv_cache_seq_rm(0, Some(user.start_pos as u32), Some(assistant.end_pos as u32))?;
-            self.ctx.kv_cache_seq_add(0, Some(assistant.end_pos as u32), None, -removed)?;
+            self.ctx.kv_cache_seq_rm(
+                0,
+                Some(user.start_pos as u32),
+                Some(assistant.end_pos as u32),
+            )?;
+            self.ctx
+                .kv_cache_seq_add(0, Some(assistant.end_pos as u32), None, -removed)?;
 
             for turn in &mut self.turns {
                 turn.start_pos -= removed;
@@ -1327,7 +1475,12 @@ const CONVERSATION_DEFRAG_THOLD: f32 = 0.1;
 /// implementation are the other two real shapes this is meant for, each
 /// living wherever that transport's own code lives.
 pub trait LocalModel: Send + Sync {
-    fn complete(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError>;
+    fn complete(
+        &self,
+        prompt: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+    ) -> Result<GenerationResult, LlamaSessionError>;
 
     /// Opens a real multi-turn session against this model. Boxed and
     /// trait-object-safe since different `LocalModel` implementations
@@ -1338,7 +1491,10 @@ pub trait LocalModel: Send + Sync {
     /// way `taskpipe::backend::Executor` holds `Box<dyn InferenceClient>`
     /// today) only ever needs `ConversationHandle`'s common surface, not
     /// which concrete type is behind it.
-    fn open_conversation(&self, options: ConversationOptions) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError>;
+    fn open_conversation(
+        &self,
+        options: ConversationOptions,
+    ) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError>;
 }
 
 /// The common surface every `LocalModel::open_conversation` result
@@ -1376,8 +1532,17 @@ impl ConversationHandle for Conversation<'_> {
         assistant_prefill: Option<&str>,
         grammar_completion: Option<crate::protocol::GrammarCompletion>,
     ) -> Result<GenerationResult, LlamaSessionError> {
-        let grammar_complete = grammar_completion.map(crate::protocol::GrammarCompletion::into_predicate);
-        Conversation::send(self, message, max_new_tokens, sampling, grammar, assistant_prefill, grammar_complete.as_deref())
+        let grammar_complete =
+            grammar_completion.map(crate::protocol::GrammarCompletion::into_predicate);
+        Conversation::send(
+            self,
+            message,
+            max_new_tokens,
+            sampling,
+            grammar,
+            assistant_prefill,
+            grammar_complete.as_deref(),
+        )
     }
 
     fn turn_count(&self) -> usize {
@@ -1386,11 +1551,19 @@ impl ConversationHandle for Conversation<'_> {
 }
 
 impl LocalModel for LlamaSession {
-    fn complete(&self, prompt: &str, max_new_tokens: i32, sampling: Sampling) -> Result<GenerationResult, LlamaSessionError> {
+    fn complete(
+        &self,
+        prompt: &str,
+        max_new_tokens: i32,
+        sampling: Sampling,
+    ) -> Result<GenerationResult, LlamaSessionError> {
         self.generate(prompt, max_new_tokens, sampling, None, None, None)
     }
 
-    fn open_conversation(&self, options: ConversationOptions) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError> {
+    fn open_conversation(
+        &self,
+        options: ConversationOptions,
+    ) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError> {
         Ok(Box::new(LlamaSession::open_conversation(self, options)?))
     }
 }
@@ -1409,15 +1582,20 @@ mod tests {
     /// handling this test's own call never exercises -- exactly the
     /// shape `render_with_minijinja`'s doc comment claims llama.cpp's
     /// engine can't execute but this can.
-    const JAMBA_CHAT_TEMPLATE: &str = include_str!("../tests/fixtures/jamba_mini_1_7_chat_template.jinja");
+    const JAMBA_CHAT_TEMPLATE: &str =
+        include_str!("../tests/fixtures/jamba_mini_1_7_chat_template.jinja");
 
     const CHATML_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n\
                          {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
     #[test]
     fn renders_jambas_real_template_for_a_single_user_turn() {
-        let rendered = render_with_minijinja(JAMBA_CHAT_TEMPLATE, "Hello, how are you?").expect("should render");
-        assert_eq!(rendered, "<|bom|><|system|> <|eom|><|bom|><|user|> Hello, how are you?<|eom|><|bom|><|assistant|>");
+        let rendered = render_with_minijinja(JAMBA_CHAT_TEMPLATE, "Hello, how are you?")
+            .expect("should render");
+        assert_eq!(
+            rendered,
+            "<|bom|><|system|> <|eom|><|bom|><|user|> Hello, how are you?<|eom|><|bom|><|assistant|>"
+        );
     }
 
     /// Not just Jamba-specific -- a plain ChatML-style template (the
@@ -1428,12 +1606,18 @@ mod tests {
     #[test]
     fn renders_a_plain_chatml_style_template() {
         let rendered = render_with_minijinja(CHATML_TEMPLATE, "hi").expect("should render");
-        assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            rendered,
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 
     #[test]
     fn returns_none_for_a_template_with_genuinely_invalid_syntax() {
-        assert_eq!(render_with_minijinja("{% this is not valid jinja %}", "hi"), None);
+        assert_eq!(
+            render_with_minijinja("{% this is not valid jinja %}", "hi"),
+            None
+        );
     }
 
     /// `raise_exception` must be registered -- a template calling it
@@ -1442,7 +1626,8 @@ mod tests {
     /// template's own intended error.
     #[test]
     fn a_template_defining_raise_exception_as_a_call_does_not_fail_on_an_unknown_function() {
-        let template = "{% if false %}{{ raise_exception(\"unreachable\") }}{% endif %}{{ prompt }}";
+        let template =
+            "{% if false %}{{ raise_exception(\"unreachable\") }}{% endif %}{{ prompt }}";
         // `prompt` isn't part of the context this function builds (only
         // `messages`/`add_generation_prompt` are) -- this asserts the
         // render doesn't fail on `raise_exception` being undefined, not
@@ -1460,7 +1645,10 @@ mod tests {
         // marker, since that's what a real multi-turn transcript
         // actually has between the two spans.
         assert_eq!(template.first_turn_open, "<|im_start|>user\n");
-        assert_eq!(template.generation_open, "<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            template.generation_open,
+            "<|im_end|>\n<|im_start|>assistant\n"
+        );
         assert_eq!(template.turn_transition, "<|im_end|>\n<|im_start|>user\n");
 
         // Composing turn 1 out of these spans must reproduce exactly
@@ -1468,8 +1656,14 @@ mod tests {
         // one-shot renderer) already produces for a single open turn --
         // the two paths ought to agree on what "send the first message"
         // looks like.
-        let composed_turn_1 = format!("{}{}{}", template.first_turn_open, "hi", template.generation_open);
-        assert_eq!(composed_turn_1, render_with_minijinja(CHATML_TEMPLATE, "hi").unwrap());
+        let composed_turn_1 = format!(
+            "{}{}{}",
+            template.first_turn_open, "hi", template.generation_open
+        );
+        assert_eq!(
+            composed_turn_1,
+            render_with_minijinja(CHATML_TEMPLATE, "hi").unwrap()
+        );
     }
 
     /// The real case that motivated composing turns from fixed spans
@@ -1480,14 +1674,21 @@ mod tests {
     #[test]
     fn derives_a_conversation_template_for_jamba_without_leaking_its_first_turn_preamble() {
         let template = derive_conversation_template(JAMBA_CHAT_TEMPLATE).expect("should derive");
-        assert!(template.first_turn_open.contains("<|system|>"), "system preamble belongs only in first_turn_open, got {:?}", template.first_turn_open);
+        assert!(
+            template.first_turn_open.contains("<|system|>"),
+            "system preamble belongs only in first_turn_open, got {:?}",
+            template.first_turn_open
+        );
         assert!(!template.generation_open.contains("<|system|>"));
         assert!(!template.turn_transition.contains("<|system|>"));
     }
 
     #[test]
     fn rejects_a_template_with_no_chat_syntax_at_all() {
-        assert!(derive_conversation_template("just plain text, no {{ }} or {% %} anywhere").is_none() || true);
+        assert!(
+            derive_conversation_template("just plain text, no {{ }} or {% %} anywhere").is_none()
+                || true
+        );
         // A template with no `messages` loop at all still renders (as
         // literal text with no sentinel present), so this only documents
         // the shape rather than asserting a specific outcome -- the real
