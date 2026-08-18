@@ -762,6 +762,11 @@ impl LlamaSession {
     /// decodes that turn's own new text — everything earlier in the
     /// conversation is already sitting in the cache from a prior call.
     ///
+    /// `defrag_thold` is set to [`CONVERSATION_DEFRAG_THOLD`], not left
+    /// at llama.cpp's own default of `-1.0` (auto-defrag disabled) --
+    /// see that constant's own doc comment for why a conversation
+    /// context specifically needs it on.
+    ///
     /// Requires a chat template this crate can prove renders each turn
     /// the same way regardless of how many turns came before it (see
     /// `derive_conversation_template`) — `ChatWrap` (a single-shot,
@@ -771,7 +776,7 @@ impl LlamaSession {
     /// proven steady-state this way can still be used via `generate()`,
     /// just not `open_conversation`.
     pub fn open_conversation(&self, options: ConversationOptions) -> Result<Conversation<'_>, LlamaSessionError> {
-        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(options.n_ctx));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(Some(options.n_ctx)).with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
         let ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
@@ -825,7 +830,7 @@ impl LlamaSession {
             return Err(LlamaSessionError::SnapshotModelMismatch { saved: meta.model_path, current: current_path });
         }
 
-        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(meta.n_ctx as u32));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(meta.n_ctx as u32)).with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
         let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
@@ -1179,7 +1184,16 @@ impl<'a> Conversation<'a> {
         }
         let user_tokens = self.model.str_to_token(&user_text, add_bos)?;
 
-        self.ensure_room_for(user_tokens.len() as i32)?;
+        // `max_new_tokens`, not just the incoming message, or a
+        // conversation whose running budget is merely *tight* (not yet
+        // full) silently generates fewer tokens than asked -- possibly
+        // none at all -- instead of `drop_oldest_turns_for` evicting
+        // enough history upfront to leave real room for the reply. Real,
+        // live bug: found via `examples/conversation_overflow_smoke.rs`
+        // producing correct replies for its first ~22 turns, then
+        // silently empty ones for the rest, well before `n_ctx` was
+        // actually exhausted by the conversation's own content alone.
+        self.ensure_room_for(user_tokens.len() as i32 + max_new_tokens)?;
 
         let mut batch = LlamaBatch::new(512, 1);
         let user_start = self.committed_pos;
@@ -1274,6 +1288,26 @@ impl<'a> Conversation<'a> {
         Ok(())
     }
 }
+
+/// KV cache defragmentation threshold for every `Conversation` context
+/// (`open_conversation`/`open_conversation_from_state`).
+///
+/// llama.cpp's own default (`llama_context_default_params`) is `-1.0`,
+/// which disables automatic defragmentation entirely -- fine for a
+/// context that only ever appends, but `drop_oldest_turns_for`'s
+/// `kv_cache_seq_rm`/`kv_cache_seq_add` surgery is exactly the workload
+/// that fragments a cache over a long-running session: real, live
+/// failure, a long tool-use conversation with many turns dropped over
+/// time hit `llama.cpp decode error: Decode Error 1: NoKvCacheSlot` on
+/// an ordinary turn, despite `committed_pos` staying well under `n_ctx`
+/// by `run_generation_loop`'s own position-based accounting -- the
+/// *positions* had room, but the physical KV cache cells didn't have a
+/// large enough contiguous free span left for the batch, since nothing
+/// was ever compacting the fragmentation `kv_cache_seq_rm`/`_add` leaves
+/// behind beyond shifting position *numbers*. `0.1` matches
+/// `llama-cpp-2`'s own doctest example and llama.cpp's conventional
+/// default when defrag is explicitly enabled.
+const CONVERSATION_DEFRAG_THOLD: f32 = 0.1;
 
 /// A model callable in-process or over some other transport — the
 /// common seam `taskpipe::backend::InferenceClient` used to be the only
