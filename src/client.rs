@@ -175,7 +175,7 @@ pub struct RampipedConversation {
     /// client-side. The daemon owns the real KV cache and its own turn
     /// boundaries; nothing in the wire protocol reports them back, so
     /// this is a local tally incremented per successful `send` purely to
-    /// satisfy `llama::ConversationHandle::turn_count`. Matches
+    /// satisfy `conversation::ConversationHandle::turn_count`. Matches
     /// `llama::Conversation::turn_count`'s own unit (exchanges, not
     /// individual messages).
     turns: usize,
@@ -288,31 +288,33 @@ impl RampipedConversation {
 }
 
 /// Makes a daemon-backed conversation usable through the same
-/// `llama::ConversationHandle` seam an in-process `llama::Conversation`
-/// already implements, so a caller holding `Box<dyn ConversationHandle>`
-/// no longer needs to know which backend it got -- the case
-/// `llama::LocalModel`'s own doc comment already named ("a
-/// `rampiped`-socket-backed... implementation") but nothing provided.
+/// [`crate::conversation::ConversationHandle`] seam an in-process
+/// `llama::Conversation` already implements, so a caller holding
+/// `Box<dyn ConversationHandle>` no longer needs to know which backend
+/// it got -- the case `llama::LocalModel`'s own doc comment already
+/// named ("a `rampiped`-socket-backed... implementation") but nothing
+/// provided.
 ///
-/// Gated on `llama` as well as `client` because the trait itself lives
-/// behind the `llama` feature: a client-only build (the whole point of
-/// the `client` feature -- talking to an already-running daemon without
-/// linking `llama-cpp-2`) still gets `RampipedConversation`'s own
-/// inherent `send`, just not this impl.
-#[cfg(feature = "llama")]
-impl crate::llama::ConversationHandle for RampipedConversation {
+/// Deliberately *not* gated on `llama`. It used to be, because the trait
+/// itself lived behind that feature and there was no way to name it
+/// otherwise -- which meant a client-only build (the whole point of the
+/// `client` feature: talking to an already-running daemon without
+/// linking `llama-cpp-2`) got `RampipedConversation`'s inherent `send`
+/// and nothing generic. Now that the seam lives in
+/// [`crate::conversation`], this is exactly the build that needs it.
+impl crate::conversation::ConversationHandle for RampipedConversation {
     fn send(
         &mut self,
         message: &str,
         max_new_tokens: i32,
-        sampling: crate::llama::Sampling,
+        sampling: crate::conversation::Sampling,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
-    ) -> Result<crate::llama::GenerationResult, crate::llama::LlamaSessionError> {
+    ) -> Result<crate::conversation::GenerationResult, crate::conversation::ConversationError> {
         let sampling = match sampling {
-            crate::llama::Sampling::Greedy => WireSampling::Greedy,
-            crate::llama::Sampling::Temperature {
+            crate::conversation::Sampling::Greedy => WireSampling::Greedy,
+            crate::conversation::Sampling::Temperature {
                 temperature,
                 top_k,
                 seed,
@@ -331,8 +333,8 @@ impl crate::llama::ConversationHandle for RampipedConversation {
             assistant_prefill,
             grammar_completion,
         )
-        .map_err(|e| crate::llama::LlamaSessionError::Backend(e.to_string()))?;
-        Ok(crate::llama::GenerationResult {
+        .map_err(|e| crate::conversation::ConversationError::Backend(e.to_string()))?;
+        Ok(crate::conversation::GenerationResult {
             text: outcome.text,
             // Back to a `Duration` from the milliseconds the wire format
             // flattens it to (see `GenerateOutcome`'s own doc comment) --
