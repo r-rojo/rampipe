@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "client")]
 pub mod client;
+pub mod conversation;
 #[cfg(feature = "llama")]
 pub mod llama;
 pub mod protocol;

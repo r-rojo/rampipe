@@ -34,6 +34,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+// The conversation seam -- `ConversationHandle` and the value types its
+// surface is written in -- moved to `crate::conversation` so a build
+// without this feature can still name it; see that module for why.
+// Re-exported here because every caller (and every doc link) already
+// refers to these as `rampipe::llama::*`, and they remain part of this
+// module's vocabulary even though their definitions no longer live in it.
+pub use crate::conversation::{ConversationError, ConversationHandle, GenerationResult, Sampling};
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaSessionError {
     #[error("residency registry error: {0}")]
@@ -92,15 +100,6 @@ pub enum LlamaSessionError {
     SnapshotMeta(#[from] serde_json::Error),
     #[error("conversation snapshot file I/O: {0}")]
     SnapshotIo(#[from] std::io::Error),
-    /// A non-in-process [`ConversationHandle`] implementation's own
-    /// transport/remote failure, flattened to a message so the trait can
-    /// keep one error type across in-process and socket-backed (and,
-    /// later, cross-machine) conversations. Never produced by anything in
-    /// this module -- see `crate::client::RampipedConversation`'s own
-    /// `ConversationHandle` impl, which is what maps a `RampipedError`
-    /// onto this.
-    #[error("conversation backend error: {0}")]
-    Backend(String),
     /// Fail-closed rejection when a saved snapshot's own recorded model
     /// path doesn't match the session it's being reloaded against -- a
     /// state file's KV cache bytes are tied to one specific model's
@@ -279,50 +278,6 @@ pub struct LlamaSession {
     /// `ChatWrap`'s doc comment for when a caller sets this instead, via
     /// `with_chat_wrap`.
     chat_wrap: Option<ChatWrap>,
-}
-
-/// How `generate()` picks the next token. `Greedy` is pure argmax -- fully
-/// deterministic given a prompt, which is what a first attempt at a task
-/// wants (reproducible, and the model's single best guess). `Temperature`
-/// exists for retries: after a first attempt already failed, re-sampling
-/// the exact same distribution greedily just reproduces the same output
-/// (verified empirically -- a real caller-observed case is a small model
-/// converging back to the same wrong `ropey` API guess across retries),
-/// so a retry needs the chain to actually explore other high-probability
-/// candidates instead of only ever taking the single most likely one.
-/// `seed` should vary per retry attempt -- reusing it would make
-/// `Temperature` just as deterministic (and just as stuck) as `Greedy`.
-#[derive(Debug, Clone, Copy)]
-pub enum Sampling {
-    Greedy,
-    Temperature {
-        temperature: f32,
-        top_k: i32,
-        seed: u32,
-    },
-}
-
-pub struct GenerationResult {
-    pub text: String,
-    /// Wall-clock from the start of the call to the first sampled token:
-    /// for `generate()`, context creation + tokenize + prompt prefill +
-    /// first sample; for `Conversation::send()`, just this turn's own
-    /// tokenize + decode + first sample, since the context and every
-    /// prior turn's KV cache already exist. This is where page-in cost
-    /// (Lazy vs. Prefault residency) actually shows up on a first call --
-    /// prefill is what touches most of the model's weight pages for the
-    /// first time.
-    pub time_to_first_token: Duration,
-    pub tokens_generated: usize,
-    /// The exact text tokenized and decoded onto the model for this
-    /// call -- for `generate()`, the whole formatted prompt; for
-    /// `Conversation::send()`, just this turn's own new text (the prior
-    /// turns are already sitting in the KV cache, not re-sent). Pure
-    /// instrumentation -- nothing about how a prompt gets sent to the
-    /// model changes because of this field existing -- so a caller doing
-    /// verbose logging (or debugging a model behaving oddly) can see
-    /// what the model was actually shown, not just what it said back.
-    pub formatted_prompt: String,
 }
 
 /// Decodes `tokens` onto `ctx`'s KV cache starting at `*n_cur`, in chunks
@@ -1497,31 +1452,6 @@ pub trait LocalModel: Send + Sync {
     ) -> Result<Box<dyn ConversationHandle + '_>, LlamaSessionError>;
 }
 
-/// The common surface every `LocalModel::open_conversation` result
-/// exposes, regardless of what's actually holding the state underneath
-/// (an in-process KV cache, or a session id round-tripped to a daemon).
-///
-/// `grammar_completion` is the *serializable* [`crate::protocol::
-/// GrammarCompletion`] rather than the `&dyn Fn(&str) -> bool` predicate
-/// `Conversation::send` itself takes, because a closure can't cross a
-/// socket: any implementation that isn't in-process has to receive this
-/// as data. The in-process implementation below converts it back into a
-/// predicate with [`crate::protocol::GrammarCompletion::into_predicate`],
-/// which is exactly what every caller was already doing by hand at its
-/// own call site.
-pub trait ConversationHandle {
-    fn send(
-        &mut self,
-        message: &str,
-        max_new_tokens: i32,
-        sampling: Sampling,
-        grammar: Option<&str>,
-        assistant_prefill: Option<&str>,
-        grammar_completion: Option<crate::protocol::GrammarCompletion>,
-    ) -> Result<GenerationResult, LlamaSessionError>;
-    fn turn_count(&self) -> usize;
-}
-
 impl ConversationHandle for Conversation<'_> {
     fn send(
         &mut self,
@@ -1531,7 +1461,7 @@ impl ConversationHandle for Conversation<'_> {
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
         grammar_completion: Option<crate::protocol::GrammarCompletion>,
-    ) -> Result<GenerationResult, LlamaSessionError> {
+    ) -> Result<GenerationResult, ConversationError> {
         let grammar_complete =
             grammar_completion.map(crate::protocol::GrammarCompletion::into_predicate);
         Conversation::send(
@@ -1543,6 +1473,7 @@ impl ConversationHandle for Conversation<'_> {
             assistant_prefill,
             grammar_complete.as_deref(),
         )
+        .map_err(ConversationError::Llama)
     }
 
     fn turn_count(&self) -> usize {
