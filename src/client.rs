@@ -67,6 +67,16 @@ impl RampipedClient {
     /// discovering that on the first real `generate()` call -- the
     /// connection itself isn't kept, since `rampiped` serves one
     /// request per connection (see module doc comment).
+    ///
+    /// For a caller about to make a real request immediately afterward
+    /// anyway (`generate()`, `status()`), that request already reports
+    /// the identical connection failure on its own -- use [`Self::new`]
+    /// instead and skip paying for this probe's own throwaway
+    /// connection, which `rampiped`'s accept loop logs as a connection
+    /// error (zero bytes sent before the probe drops it) for no reason
+    /// a real caller needs. This is for a caller that wants reachability
+    /// answered as its own fast, standalone question -- `brush-ai`'s own
+    /// `is_rampiped_reachable` -- with no request to make yet.
     pub fn connect(socket_path: impl Into<PathBuf>) -> Result<Self, RampipedError> {
         let socket_path = socket_path.into();
         UnixStream::connect(&socket_path).map_err(|source| RampipedError::Connect {
@@ -74,6 +84,15 @@ impl RampipedClient {
             source,
         })?;
         Ok(Self { socket_path })
+    }
+
+    /// A client for `socket_path`, with no upfront connectivity probe --
+    /// see [`Self::connect`]'s own doc comment for when to prefer this.
+    /// The first real call (`generate()`/`status()`) reports a dead
+    /// socket exactly as clearly, just without a second, unused
+    /// connection along the way.
+    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self { socket_path: socket_path.into() }
     }
 
     // The parameters mirror `GenerateRequest`'s fields one-for-one; a params
