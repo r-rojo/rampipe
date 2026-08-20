@@ -92,7 +92,9 @@ impl RampipedClient {
     /// socket exactly as clearly, just without a second, unused
     /// connection along the way.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
-        Self { socket_path: socket_path.into() }
+        Self {
+            socket_path: socket_path.into(),
+        }
     }
 
     // The parameters mirror `GenerateRequest`'s fields one-for-one; a params
