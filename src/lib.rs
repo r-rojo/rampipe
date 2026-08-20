@@ -14,7 +14,7 @@ pub mod protocol;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const PAGE_SIZE: usize = 4096;
-// `warm` is `resident_fraction >= WARM_FRACTION` — real residency data from
+// `warm` is `resident_fraction >= WARM_FRACTION` -- real residency data from
 // mincore(2), not a guess from timing. Not quite 1.0 so a single straggler
 // page (e.g. one still mid-fault when mincore samples it) doesn't flip an
 // otherwise-fully-resident mapping to "not warm".
@@ -30,12 +30,12 @@ pub enum Residency {
     /// mmap, then touch every page immediately (synchronously) so the
     /// page-fault cost is paid up front instead of mid-generation. On Linux
     /// this should leave every page resident by the time it returns; on
-    /// Darwin, empirically, don't assume it — see the caveat on
+    /// Darwin, empirically, don't assume it -- see the caveat on
     /// `SwapMetrics::resident_fraction`.
     Prefault,
     /// mmap, then hint the kernel via `madvise(MADV_WILLNEED)` that every
-    /// page will be needed soon. Returns almost immediately — it's a
-    /// non-blocking hint, not a guarantee — so unlike `Prefault`, pages
+    /// page will be needed soon. Returns almost immediately -- it's a
+    /// non-blocking hint, not a guarantee -- so unlike `Prefault`, pages
     /// aren't necessarily resident by the time `load()` returns; the
     /// kernel's readahead may still be in flight.
     Advise,
@@ -45,7 +45,7 @@ pub enum Residency {
 pub struct SwapMetrics {
     pub map_latency: Duration,
     /// `Some` only when loaded with `Residency::Prefault` or `Residency::
-    /// Advise` — the time spent in the touch loop or the `madvise` call,
+    /// Advise` -- the time spent in the touch loop or the `madvise` call,
     /// respectively. For `Advise` this is *not* the time until pages are
     /// actually resident (see `Residency::Advise`), just the call latency.
     pub prefault_latency: Option<Duration>,
@@ -64,11 +64,11 @@ pub struct SwapMetrics {
     /// trustworthy for file-backed mappings. Testing here (2026-07-25)
     /// showed `mincore` consistently reporting only ~25% of pages resident
     /// for an mmap'd file regardless of size (32 pages vs. 500 pages, same
-    /// ratio) — and the number didn't change even after `mlock(2)`, which
+    /// ratio) -- and the number didn't change even after `mlock(2)`, which
     /// *guarantees* full residency. A plain anonymous (non-file-backed)
-    /// mmap'd page reports correctly through the same call. That pattern —
+    /// mmap'd page reports correctly through the same call. That pattern --
     /// accurate for anonymous memory, deliberately-looking imprecise for
-    /// file-backed memory — matches the shape of known page-cache
+    /// file-backed memory -- matches the shape of known page-cache
     /// side-channel mitigations (mincore has historically been usable to
     /// fingerprint what's in the shared page cache, leaking other
     /// processes' file-access patterns). Root cause not confirmed against
@@ -77,7 +77,7 @@ pub struct SwapMetrics {
     /// on Darwin. Untested on Linux.
     pub resident_fraction: Option<f64>,
     /// `resident_fraction >= WARM_FRACTION`. Computed from a real syscall
-    /// now, not guessed from prefault timing — but inherits
+    /// now, not guessed from prefault timing -- but inherits
     /// `resident_fraction`'s Darwin caveat above, so treat it the same way.
     pub warm: bool,
 }
@@ -100,8 +100,8 @@ pub enum EvictError {
     HandleOutstanding { outstanding: usize },
 }
 
-/// Stable identifier for a resident model. Cheap to copy, and — unlike a
-/// `PathBuf` — safe to hand across an FFI boundary as a plain `u64`, which
+/// Stable identifier for a resident model. Cheap to copy, and -- unlike a
+/// `PathBuf` -- safe to hand across an FFI boundary as a plain `u64`, which
 /// matters once Phase 4 (UniFFI/Swift) exists to hand it to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ModelId(u64);
@@ -123,7 +123,7 @@ struct Resident {
 }
 
 /// A live reference to a mapped model. While any handle for a given model is
-/// alive, `SwapRegistry::evict` for its id fails — this is the safety
+/// alive, `SwapRegistry::evict` for its id fails -- this is the safety
 /// invariant that makes eviction safe under concurrent generation: a live
 /// generation holds a handle, so the scheduler cannot unmap weights under it.
 #[derive(Clone)]
@@ -178,7 +178,7 @@ struct RegistryState {
     resident: HashMap<ModelId, Arc<Resident>>,
     by_path: HashMap<PathBuf, ModelId>,
     /// When each resident model was last handed out (a fresh load *or*
-    /// a cache-hit against an already-resident one) — separate from
+    /// a cache-hit against an already-resident one) -- separate from
     /// `Resident` itself (shared via `Arc` and handed out through
     /// `ModelHandle`) so updating it on every access never needs
     /// interior mutability inside something callers hold a live
@@ -288,7 +288,7 @@ impl SwapRegistry {
         Ok(ModelHandle { id, inner })
     }
 
-    /// Evicts the model identified by `id`, freeing its mapping — but only
+    /// Evicts the model identified by `id`, freeing its mapping -- but only
     /// if no `ModelHandle` for it is still alive. This is the invariant
     /// that protects an in-flight generation from having its weights
     /// unmapped out from under it.
@@ -326,7 +326,7 @@ impl SwapRegistry {
             .len()
     }
 
-    /// Total mapped bytes across resident models. Not RSS — this is the
+    /// Total mapped bytes across resident models. Not RSS -- this is the
     /// ceiling, not the current cost.
     pub fn mapped_bytes(&self) -> usize {
         self.state
@@ -338,12 +338,12 @@ impl SwapRegistry {
             .sum()
     }
 
-    /// Every resident model's id, oldest-accessed first — the order a
+    /// Every resident model's id, oldest-accessed first -- the order a
     /// caller managing several resident models at once (`rampiped`, not
     /// this crate, which never evicts on its own) should walk when it
     /// needs to free budget for a new one. "Accessed" means handed out
     /// by `load()`, whether that was a fresh map or a cache hit against
-    /// an already-resident model — see `RegistryState::last_accessed`'s
+    /// an already-resident model -- see `RegistryState::last_accessed`'s
     /// own doc comment.
     pub fn resident_ids_by_lru(&self) -> Vec<ModelId> {
         let state = self.state.lock().expect("rampipe registry lock poisoned");
@@ -358,12 +358,12 @@ impl SwapRegistry {
 
     /// Whether loading a new model of `new_size_bytes` would keep total
     /// resident bytes within `budget_fraction` of the memory actually
-    /// available for models — system free memory *plus* whatever's
+    /// available for models -- system free memory *plus* whatever's
     /// already resident, since a caller managing eviction (`rampiped`)
     /// can always reclaim already-resident bytes; counting only
     /// currently-free memory would make an already-fully-loaded machine
     /// look permanently out of budget even when eviction would free
-    /// plenty of room. `None` — not `Some(true)` or `Some(false)` — when
+    /// plenty of room. `None` -- not `Some(true)` or `Some(false)` -- when
     /// `system_free_bytes` itself can't be measured (see that
     /// function's own doc comment for which platforms), so a caller
     /// never silently treats "couldn't tell" as "yes" or "no".
@@ -447,7 +447,7 @@ impl Default for SwapRegistry {
 }
 
 /// Touches one byte per page to force the OS to fault every page of `mmap`
-/// into physical memory. Crude on purpose for Phase 1 — the roadmap's own
+/// into physical memory. Crude on purpose for Phase 1 -- the roadmap's own
 /// open item is to compare this against `madvise(WILLNEED)`.
 fn prefault(mmap: &Mmap) {
     let mut sum: u64 = 0;
@@ -458,7 +458,7 @@ fn prefault(mmap: &Mmap) {
 }
 
 /// Hints the kernel that every page of `mmap` will be needed soon, via
-/// `madvise(MADV_WILLNEED)`. Non-blocking — see `Residency::Advise`'s doc
+/// `madvise(MADV_WILLNEED)`. Non-blocking -- see `Residency::Advise`'s doc
 /// comment for why that matters.
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "ios"))]
 fn advise_willneed(mmap: &Mmap) {
@@ -507,12 +507,12 @@ fn mincore_resident_fraction(mmap: &Mmap) -> Option<f64> {
     Some(resident as f64 / n_pages as f64)
 }
 
-// See the caveat on `SwapMetrics::resident_fraction` — this call succeeds
+// See the caveat on `SwapMetrics::resident_fraction` -- this call succeeds
 // and returns well-formed data, but the residency it reports for
 // file-backed mappings has empirically not matched reality on Darwin
 // (verified against mlock(2), which guarantees residency this didn't
 // reflect). Kept because it's still what the roadmap asked for and it's
-// not wrong to call, just not trustworthy here — not worth silently
+// not wrong to call, just not trustworthy here -- not worth silently
 // dropping the platform implementation over a result that can't be
 // confirmed against an authoritative source.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -590,29 +590,29 @@ fn current_rss_bytes() -> Option<i64> {
 }
 
 /// Best-effort system-wide "how much memory could a new model use"
-/// figure — `free + inactive` pages (matching what `vm_stat`/Activity
+/// figure -- `free + inactive` pages (matching what `vm_stat`/Activity
 /// Monitor traditionally call "available" memory: pages that aren't
 /// actively used and can be reclaimed without swapping), not just
 /// literally-free pages alone. `free_count` on its own dramatically
 /// understates real headroom on a system that's been running a while,
 /// since macOS aggressively uses "free" RAM for file-backed page cache
-/// it'll happily evict under pressure — this is meant to answer "is
+/// it'll happily evict under pressure -- this is meant to answer "is
 /// there room," not "is anything sitting fully idle."
 ///
 /// `host_statistics64`/`HOST_VM_INFO64` aren't bound by the `mach2`
-/// crate itself (only the `vm_statistics64` struct type is) — declared
+/// crate itself (only the `vm_statistics64` struct type is) -- declared
 /// directly here via a small, deliberate `extern "C"` block rather than
 /// pulling in a whole second mach-bindings crate for one function.
 /// `HOST_VM_INFO64 = 4`, confirmed against Apple's own
 /// `osfmk/mach/host_info.h` (`#define HOST_VM_INFO64 4 /* 64-bit
 /// virtual memory stats */`), not guessed. Page size via
-/// `libc::sysconf(_SC_PAGESIZE)` (the portable POSIX way — real on
+/// `libc::sysconf(_SC_PAGESIZE)` (the portable POSIX way -- real on
 /// Apple Silicon, where the hardware page size is actually 16KB, not
 /// the 4096 this file's own `PAGE_SIZE` const assumes elsewhere;
 /// getting this wrong would corrupt the computed byte figure, not just
 /// look slightly off), not a second mach call.
 ///
-/// `None` — not `Some(0)` — on any failure (the syscall failing, or no
+/// `None` -- not `Some(0)` -- on any failure (the syscall failing, or no
 /// implementation for this platform below), so `SwapRegistry::
 /// fits_within_budget` never silently treats "couldn't measure" as "no
 /// room at all."
@@ -649,7 +649,7 @@ fn system_free_bytes() -> Option<u64> {
     // Safety: `info` is `vm_statistics64`'s real layout from `mach2`
     // (not hand-rolled), and `count` is sized in `natural_t` units to
     // match, so `host_statistics64` writes exactly as many words as
-    // `info` has room for — the same shape `current_rss_bytes` above
+    // `info` has room for -- the same shape `current_rss_bytes` above
     // already uses for `task_info`. `mach_host_self()` returns a
     // `thread_port_t`, assignment-compatible with the `host_t` this
     // takes since both are plain aliases of `mach_port_t`.
@@ -674,7 +674,7 @@ fn system_free_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            // Format: "MemAvailable:   12345678 kB" — the kernel's own
+            // Format: "MemAvailable:   12345678 kB" -- the kernel's own
             // "free + reclaimable, without swapping" figure, already
             // exactly the semantics wanted here, no free+inactive-style
             // approximation needed the way the macOS path has to build
@@ -718,7 +718,7 @@ mod rss_tests {
         }
     }
 
-    // Loading a real chunk of memory should move RSS by a plausible amount —
+    // Loading a real chunk of memory should move RSS by a plausible amount --
     // catches the case where phys_footprint/statm parsing is silently
     // reading a field that never changes.
     #[test]

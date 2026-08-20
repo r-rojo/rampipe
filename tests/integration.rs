@@ -166,12 +166,12 @@ fn mincore_result_is_structurally_valid_after_prefault() {
     // NOT asserting "prefault forces ~full residency" here, on purpose.
     // Empirically (this repo, Darwin, 2026-07-25): mincore(2) reports a
     // consistent ~25% resident fraction for a file-backed mmap regardless
-    // of file size (verified at 32 pages and 500 pages), and — the
-    // decisive test — the fraction doesn't move even after mlock(2), which
+    // of file size (verified at 32 pages and 500 pages), and -- the
+    // decisive test -- the fraction doesn't move even after mlock(2), which
     // *guarantees* every page is resident and pinned. A plain anonymous
     // (non-file-backed) mmap'd page reports correctly via the same mincore
     // call. This points at Apple deliberately returning imprecise mincore
-    // results specifically for file-backed mappings — plausibly the same
+    // results specifically for file-backed mappings -- plausibly the same
     // mitigation class as published page-cache side-channel research (using
     // mincore to fingerprint what's in the shared page cache leaks
     // information about other processes' file access). Whatever the exact

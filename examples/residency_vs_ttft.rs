@@ -1,13 +1,13 @@
-//! Loads the same GGUF model three times — `Residency::Lazy`, `Prefault`,
-//! and `Advise` — through independent `SwapRegistry`s (independent so no
+//! Loads the same GGUF model three times -- `Residency::Lazy`, `Prefault`,
+//! and `Advise` -- through independent `SwapRegistry`s (independent so no
 //! load can dedup-hit another), then runs a real generation against each
 //! and reports time-to-first-token alongside the residency metrics. The
 //! point: page-in cost should show up as slower TTFT for `Lazy` relative
 //! to the two eager modes, since both warm the same OS page cache
 //! llama.cpp's own (separate) mmap reads from.
 //!
-//! `resident_fraction`/`warm` are printed but — see `SwapMetrics::
-//! resident_fraction`'s doc comment — not trustworthy for file-backed
+//! `resident_fraction`/`warm` are printed but -- see `SwapMetrics::
+//! resident_fraction`'s doc comment -- not trustworthy for file-backed
 //! mappings on Darwin as of this writing; `mincore(2)` was empirically
 //! found to report a fixed ~25% resident regardless of actual state,
 //! even after `mlock(2)`. Printed anyway so the (also real, also
@@ -20,7 +20,7 @@
 //! macOS), so on a machine where the file is already cached from a
 //! previous run, the Lazy/eager gap will be smaller than a genuine cold
 //! start. Treat this as illustrative, not a rigorous cold-start
-//! benchmark — that's still open work.
+//! benchmark -- that's still open work.
 //!
 //!     cargo run --release --features llama --example residency_vs_ttft
 

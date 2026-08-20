@@ -1,4 +1,4 @@
-//! A pure-socket client for `rampiped` (`src/bin/rampiped.rs`) — behind
+//! A pure-socket client for `rampiped` (`src/bin/rampiped.rs`) -- behind
 //! its own `client` feature so a caller that only wants to *talk* to an
 //! already-running daemon (taskpipe running with `--rampiped`, or the
 //! separate AI-backed shell project) never links `llama-cpp-2` and its
@@ -6,7 +6,7 @@
 //!
 //! One request per connection, matching `rampiped`'s own accept loop
 //! (it reads exactly one line, replies with exactly one line, then
-//! drops the connection) — `generate()` opens a fresh connection every
+//! drops the connection) -- `generate()` opens a fresh connection every
 //! call rather than holding one open across calls.
 
 use crate::protocol::{
@@ -42,7 +42,7 @@ pub enum RampipedError {
     Remote(String),
 }
 
-/// A successful generation, as reported by `rampiped` — mirrors
+/// A successful generation, as reported by `rampiped` -- mirrors
 /// `rampipe::llama::GenerationResult`, but with `time_to_first_token`
 /// already flattened to milliseconds (a `Duration` doesn't survive JSON
 /// round-tripping without extra serde plumbing neither side otherwise
@@ -64,7 +64,7 @@ pub struct RampipedClient {
 impl RampipedClient {
     /// Fails fast if nothing is listening at `socket_path` (a real
     /// connect attempt, immediately dropped) rather than only
-    /// discovering that on the first real `generate()` call — the
+    /// discovering that on the first real `generate()` call -- the
     /// connection itself isn't kept, since `rampiped` serves one
     /// request per connection (see module doc comment).
     pub fn connect(socket_path: impl Into<PathBuf>) -> Result<Self, RampipedError> {
@@ -162,7 +162,7 @@ impl RampipedClient {
     }
 }
 
-/// A still-open, KV-cache-persistent conversation against `rampiped` —
+/// A still-open, KV-cache-persistent conversation against `rampiped` --
 /// unlike `RampipedClient::generate()`, which opens a fresh connection
 /// and shuts down its write half every single call, this holds one
 /// connection open across every `send()`, mirroring
@@ -183,7 +183,7 @@ pub struct RampipedConversation {
 
 impl RampipedConversation {
     /// Opens a fresh connection, sends `OpenConversationRequest`, and
-    /// waits for the daemon's `Opened` ack before returning — a caller
+    /// waits for the daemon's `Opened` ack before returning -- a caller
     /// that gets `Ok` back knows the daemon has already loaded (or is
     /// already loading) `model_path` and is ready for `send()`.
     pub fn open(
@@ -233,7 +233,7 @@ impl RampipedConversation {
     }
 
     /// Sends one new turn into this still-open conversation and waits
-    /// for the reply — same parameter shape as
+    /// for the reply -- same parameter shape as
     /// `rampipe::llama::Conversation::send`, just over the wire.
     pub fn send(
         &mut self,
@@ -290,13 +290,13 @@ impl RampipedConversation {
 /// Makes a daemon-backed conversation usable through the same
 /// `llama::ConversationHandle` seam an in-process `llama::Conversation`
 /// already implements, so a caller holding `Box<dyn ConversationHandle>`
-/// no longer needs to know which backend it got — the case
+/// no longer needs to know which backend it got -- the case
 /// `llama::LocalModel`'s own doc comment already named ("a
 /// `rampiped`-socket-backed... implementation") but nothing provided.
 ///
 /// Gated on `llama` as well as `client` because the trait itself lives
 /// behind the `llama` feature: a client-only build (the whole point of
-/// the `client` feature — talking to an already-running daemon without
+/// the `client` feature -- talking to an already-running daemon without
 /// linking `llama-cpp-2`) still gets `RampipedConversation`'s own
 /// inherent `send`, just not this impl.
 #[cfg(feature = "llama")]

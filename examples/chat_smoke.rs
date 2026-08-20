@@ -1,6 +1,6 @@
 //! Real smoke test for `Conversation`: a live, multi-turn exchange
 //! against a resident model, checking that the *second* turn's answer
-//! actually depends on the *first* turn's content — the one thing that
+//! actually depends on the *first* turn's content -- the one thing that
 //! can't be faked by two independent `generate()` calls (each of which
 //! would start from a blank context and have no way to know what the
 //! first prompt said).

@@ -3,7 +3,7 @@
 //! failed across separate `taskpipe` invocations. Reproduces exactly
 //! `LocalBackend`'s prompt-construction shape (see `backend.rs`) against
 //! a real task that showed the variance (gamepipe issue #1, "Core ECS
-//! structs"), and does ONE `generate()` call per process invocation —
+//! structs"), and does ONE `generate()` call per process invocation --
 //! matching how `taskpipe` actually runs (a fresh process, fresh model
 //! load, every time), not a warm session reused across repeated calls
 //! within one process.
@@ -11,7 +11,7 @@
 //! Bypasses `rampipe::llama::LlamaSession` deliberately: its `load()`
 //! doesn't expose `n_gpu_layers`, and this needs to A/B Metal-offload vs.
 //! CPU-only against the *exact* same generate-loop logic (copied
-//! straight from `rampipe/src/llama.rs`) — not a rampipe API change for
+//! straight from `rampipe/src/llama.rs`) -- not a rampipe API change for
 //! a one-off diagnostic.
 //!
 //! Metal (default):    cargo run --release --features llama --example determinism_probe
@@ -35,7 +35,7 @@ const MAX_NEW_TOKENS: i32 = 1400;
 
 const FILE_PATH: &str = "src/ecs.rs";
 const TITLE: &str = "Core ECS structs";
-const BODY: &str = "## Goal\nDefine core ECS structs (Position, Velocity, Transform) as plain Rust\nstructs with basic component storage (Vec<Option<T>> per component type\nis fine — no archetype system needed).\n\n## Acceptance criteria\n- [ ] Compiles\n- [ ] Test constructing a few entities and reading components back";
+const BODY: &str = "## Goal\nDefine core ECS structs (Position, Velocity, Transform) as plain Rust\nstructs with basic component storage (Vec<Option<T>> per component type\nis fine -- no archetype system needed).\n\n## Acceptance criteria\n- [ ] Compiles\n- [ ] Test constructing a few entities and reading components back";
 
 fn download_model() -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating Hugging Face Hub client")?;
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
 
     // Everything below is copied verbatim from
     // `rampipe::llama::LlamaSession::generate()` (n_ctx, batch chunking,
-    // sampler chain, decode loop) — the whole point is an apples-to-apples
+    // sampler chain, decode loop) -- the whole point is an apples-to-apples
     // comparison against real `LocalBackend` behavior, not a simplified
     // stand-in.
     let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(4096));

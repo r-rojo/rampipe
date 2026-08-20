@@ -17,13 +17,13 @@
 //! ~100 lines of socket boilerplate.
 //!
 //! Connection handling is concurrent (one thread per connection); the
-//! actual GPU-touching work — deciding what to load/evict and running a
-//! generation — is not: it all happens inside one critical section,
+//! actual GPU-touching work -- deciding what to load/evict and running a
+//! generation -- is not: it all happens inside one critical section,
 //! guarded by `SharedState`'s own `Mutex`, so at most one load, evict, or
 //! decode is ever in flight process-wide. A GPU can only usefully run one
 //! decode at a time anyway, and loading a second model onto it while a
 //! decode is using it risks the same kind of memory pressure this daemon
-//! exists to avoid — so this is a deliberate choice, not a missing
+//! exists to avoid -- so this is a deliberate choice, not a missing
 //! optimization: real gain is a slow-to-send or slow-to-receive client no
 //! longer blocking every *other* client's request while its own
 //! connection is merely open (the previous, fully single-threaded
@@ -142,12 +142,12 @@ fn wire_overflow_to_overflow(overflow: WireOverflowPolicy) -> OverflowPolicy {
     }
 }
 
-/// Everything a load, evict, or generate call touches — bundled into one
+/// Everything a load, evict, or generate call touches -- bundled into one
 /// struct specifically so it can live behind one `Mutex` (see module doc
 /// comment). `backend` lives in here too, not as a separate `&LlamaBackend`
 /// passed alongside: `llama_cpp_2::llama_backend::LlamaBackend` is
 /// expected to be `Send` but not necessarily `Sync` (see brush's `aish`
-/// builtin, `ai.rs::ModelState`'s own doc comment, which this mirrors) —
+/// builtin, `ai.rs::ModelState`'s own doc comment, which this mirrors) --
 /// putting it behind the same `Mutex` as everything else means only
 /// `Send` is ever required, never `Sync`, and it's never touched from two
 /// threads at once by construction.
@@ -163,7 +163,7 @@ struct SharedState {
     sessions: HashMap<PathBuf, Arc<LlamaSession>>,
     budget_fraction: f64,
     /// This process's own executable path and its mtime *at the moment
-    /// this struct was built* (i.e. daemon startup) — not re-derived on
+    /// this struct was built* (i.e. daemon startup) -- not re-derived on
     /// every `Status` request, which would just reflect whatever
     /// happens to be on disk right now regardless of what code this
     /// already-running process actually loaded. See
@@ -191,7 +191,7 @@ struct ModelStats {
 }
 
 /// `std::env::current_exe()` plus that file's own mtime, in Unix
-/// seconds — best-effort: `None` for either half just means this
+/// seconds -- best-effort: `None` for either half just means this
 /// platform or environment didn't have an answer, not an error worth
 /// failing startup over.
 fn current_exe_snapshot() -> (Option<PathBuf>, Option<u64>) {
@@ -245,7 +245,7 @@ impl SharedState {
 
     /// Ensures `path` is resident in `self.sessions`, loading it (and
     /// evicting, if the budget requires it) if it isn't already. Returns
-    /// nothing — deliberately not `&LlamaSession`, since a reference tied
+    /// nothing -- deliberately not `&LlamaSession`, since a reference tied
     /// to `&mut self` here would keep the whole `SharedState` borrowed
     /// mutably for as long as the caller holds it, blocking the caller
     /// from also borrowing `self.backend` immutably alongside
@@ -298,7 +298,7 @@ impl SharedState {
     /// `handle_conversation`, which keeps its clone alive for exactly as
     /// long as that conversation's connection stays open) rather than
     /// removing the entry and then failing outright on
-    /// `EvictError::HandleOutstanding` — a background conversation
+    /// `EvictError::HandleOutstanding` -- a background conversation
     /// sitting idle shouldn't be able to make an unrelated one-shot
     /// request against a *different* model fail. Checking the count
     /// first (instead of removing speculatively and catching the evict
@@ -385,7 +385,7 @@ impl SharedState {
     }
 }
 
-/// Request reading and response writing happen with no lock held —
+/// Request reading and response writing happen with no lock held --
 /// only `handle_request` (the actual GPU-touching work) takes
 /// `state`'s lock, and only for as long as that one request's turn
 /// takes. A slow-to-send or slow-to-receive client blocks only its own
@@ -441,7 +441,7 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
 
 /// Builds a [`StatusResponse`] from this process's own pid, its
 /// startup-time exe snapshot (see [`current_exe_snapshot`]), and
-/// whatever's currently resident — locked only long enough to read
+/// whatever's currently resident -- locked only long enough to read
 /// `sessions`' keys, not for the duration of any generation.
 fn handle_status(state: &Mutex<SharedState>) -> rampipe::protocol::StatusResponse {
     let state = state.lock().expect("rampiped model store lock poisoned");
@@ -516,7 +516,7 @@ fn handle_request(
 }
 
 /// Serves one whole conversation for as long as its connection stays
-/// open — one thread per connection (same as the accept loop's own
+/// open -- one thread per connection (same as the accept loop's own
 /// convention), so `session` (an `Arc<LlamaSession>` clone) and the
 /// `Conversation` opened from it both live as plain locals on *this*
 /// thread's own stack for the conversation's entire lifetime. This is
@@ -524,7 +524,7 @@ fn handle_request(
 /// inside `session`) be held across many requests without storing it
 /// inside `SharedState` itself, which would need a self-referential
 /// struct (`SharedState.sessions` both owns sessions and would need to
-/// hold something borrowing from one of them at the same time) — an
+/// hold something borrowing from one of them at the same time) -- an
 /// ordinary function-local owner-and-borrower pair sidesteps that
 /// entirely.
 fn handle_conversation(
@@ -634,7 +634,7 @@ fn handle_conversation(
 /// The one critical section for a conversation turn: locks `state`
 /// purely as a serialization gate (matching `handle_request`'s own "at
 /// most one decode in flight" invariant, extended to conversation
-/// turns), held only for the duration of this one `send()` call — never
+/// turns), held only for the duration of this one `send()` call -- never
 /// across the idle time between turns while this thread is blocked
 /// reading the next line from its own socket, so a conversation sitting
 /// idle never blocks an unrelated request's turn at the lock.
