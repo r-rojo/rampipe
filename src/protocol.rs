@@ -208,18 +208,57 @@ pub enum WireOverflowPolicy {
 /// `model_path` on the connection this arrives on. The daemon replies
 /// with one [`ConversationResponse::Opened`] (or `Err`), then the
 /// connection stays open for any number of subsequent
-/// [`ConversationTurnRequest`]/[`ConversationResponse`] round trips,
-/// one per line each way, until the client drops the connection -- no
-/// explicit close message needed.
+/// [`ConversationRequest`]/[`ConversationResponse`] round trips, one per
+/// line each way, until the client drops the connection (or a
+/// `Snapshot` request ends it deliberately -- see [`ConversationRequest`]
+/// and [`ConversationResponse::Snapshotted`]).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenConversationRequest {
     pub model_path: PathBuf,
     pub n_ctx: u32,
     pub overflow: WireOverflowPolicy,
+    /// Opens from a prior [`ConversationRequest::Snapshot`] instead of
+    /// starting fresh -- `n_ctx` above is then ignored in favor of
+    /// whatever the snapshot itself recorded (see
+    /// `rampipe::llama::LlamaSession::open_conversation_from_state`'s own
+    /// doc comment for why the saved value wins over a caller-supplied
+    /// one). Fails closed (`ConversationResponse::Err`) if the snapshot's
+    /// own recorded model doesn't match `model_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_from: Option<SnapshotRef>,
+}
+
+/// Where a conversation's saved KV-cache state lives -- both paths are
+/// caller-chosen (see `Conversation::save_state`'s own doc comment), so
+/// this is just what a [`ConversationRequest::Snapshot`] and a later
+/// [`OpenConversationRequest::restore_from`] need to agree on to name the
+/// same saved conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRef {
+    pub state_path: PathBuf,
+    pub meta_path: PathBuf,
+}
+
+/// What arrives on an already-open conversation's connection -- `Turn`
+/// is today's only case, renamed from the bare
+/// (now-removed) `ConversationTurnRequest` shape into one arm of this
+/// enum so `Snapshot` can arrive on the same connection without a
+/// separate message type the read loop would have to guess between.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ConversationRequest {
+    Turn(ConversationTurnRequest),
+    /// Persists this conversation's KV cache to `state_path`/`meta_path`
+    /// (see [`SnapshotRef`]) and ends the connection -- the daemon replies
+    /// [`ConversationResponse::Snapshotted`] and then closes, the same
+    /// way an ordinary client disconnect already ends a conversation,
+    /// freeing whatever VRAM its `LlamaContext` held. A later
+    /// `OpenConversationRequest` naming the same paths via `restore_from`
+    /// picks the conversation back up without replaying it turn by turn.
+    Snapshot(SnapshotRef),
 }
 
 /// One turn sent into an already-open conversation (see
-/// [`OpenConversationRequest`]) -- same fields as [`GenerateRequest`]
+/// [`ConversationRequest::Turn`]) -- same fields as [`GenerateRequest`]
 /// minus `model_path`/`prompt` (the conversation itself already fixes
 /// the model; `message` stands in for `prompt`, scoped to just this
 /// turn's new text).
@@ -238,7 +277,9 @@ pub struct ConversationTurnRequest {
 
 /// One line back per conversation-mode message -- `Opened` acknowledges
 /// [`OpenConversationRequest`], `Turn` answers a
-/// [`ConversationTurnRequest`], `Err` can follow either.
+/// [`ConversationRequest::Turn`], `Snapshotted` acknowledges a
+/// [`ConversationRequest::Snapshot`] (the connection ends right after),
+/// `Err` can follow any of the above.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ConversationResponse {
     Opened,
@@ -253,6 +294,7 @@ pub enum ConversationResponse {
         /// conversation).
         formatted_prompt: String,
     },
+    Snapshotted,
     Err {
         message: String,
     },
@@ -290,5 +332,79 @@ mod tests {
         // this function's own contract promises.
         let path = default_socket_path().expect("HOME should be set in a real test environment");
         assert!(path.ends_with(".rampipe/rampiped.sock"));
+    }
+
+    /// `restore_from: None` is the only shape every caller before this
+    /// field existed ever sent -- pinning that it's omitted, not
+    /// null-serialized, is what keeps a pre-existing wire capture (or a
+    /// hand-written request) still valid.
+    #[test]
+    fn a_fresh_open_request_omits_restore_from_entirely() {
+        let request = OpenConversationRequest {
+            model_path: PathBuf::from("/models/coder.gguf"),
+            n_ctx: 8192,
+            overflow: WireOverflowPolicy::DropOldestTurns,
+            restore_from: None,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("restore_from"), "{encoded}");
+    }
+
+    #[test]
+    fn a_restoring_open_request_carries_the_snapshot_paths() {
+        let request = OpenConversationRequest {
+            model_path: PathBuf::from("/models/coder.gguf"),
+            n_ctx: 8192,
+            overflow: WireOverflowPolicy::DropOldestTurns,
+            restore_from: Some(SnapshotRef {
+                state_path: PathBuf::from("/state/coder.state"),
+                meta_path: PathBuf::from("/state/coder.meta.json"),
+            }),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(
+            encoded.contains(r#""state_path":"/state/coder.state""#),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains(r#""meta_path":"/state/coder.meta.json""#),
+            "{encoded}"
+        );
+    }
+
+    /// `ConversationRequest::Turn` and `::Snapshot` are externally tagged
+    /// the same way `ClientMessage`'s own variants are -- pinned so a
+    /// change here is a deliberate, visible wire-format decision, not an
+    /// incidental derive drift.
+    #[test]
+    fn a_turn_request_is_tagged_turn() {
+        let request = ConversationRequest::Turn(ConversationTurnRequest {
+            message: "hi".to_string(),
+            max_new_tokens: 16,
+            sampling: WireSampling::Greedy,
+            grammar: None,
+            assistant_prefill: None,
+            grammar_completion: None,
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.starts_with(r#"{"Turn":"#), "{encoded}");
+    }
+
+    #[test]
+    fn a_snapshot_request_is_tagged_snapshot() {
+        let request = ConversationRequest::Snapshot(SnapshotRef {
+            state_path: PathBuf::from("/state/coder.state"),
+            meta_path: PathBuf::from("/state/coder.meta.json"),
+        });
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.starts_with(r#"{"Snapshot":"#), "{encoded}");
+    }
+
+    #[test]
+    fn snapshotted_is_a_bare_string() {
+        assert_eq!(
+            serde_json::to_string(&ConversationResponse::Snapshotted).unwrap(),
+            "\"Snapshotted\""
+        );
     }
 }

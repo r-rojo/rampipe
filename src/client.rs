@@ -10,9 +10,9 @@
 //! call rather than holding one open across calls.
 
 use crate::protocol::{
-    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest,
-    GenerateResponse, GrammarCompletion, OpenConversationRequest, StatusResponse,
-    WireOverflowPolicy, WireSampling,
+    ClientMessage, ConversationRequest, ConversationResponse, ConversationTurnRequest,
+    GenerateRequest, GenerateResponse, GrammarCompletion, OpenConversationRequest, SnapshotRef,
+    StatusResponse, WireOverflowPolicy, WireSampling,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -207,11 +207,18 @@ impl RampipedConversation {
     /// waits for the daemon's `Opened` ack before returning -- a caller
     /// that gets `Ok` back knows the daemon has already loaded (or is
     /// already loading) `model_path` and is ready for `send()`.
+    ///
+    /// `restore_from`, when `Some`, reopens a conversation a prior
+    /// [`RampipedConversation::snapshot`] saved instead of starting
+    /// fresh -- `n_ctx`/`overflow` are then ignored in favor of whatever
+    /// the snapshot itself recorded (see
+    /// `OpenConversationRequest::restore_from`'s own doc comment).
     pub fn open(
         socket_path: impl Into<PathBuf>,
         model_path: &Path,
         n_ctx: u32,
         overflow: WireOverflowPolicy,
+        restore_from: Option<SnapshotRef>,
     ) -> Result<Self, RampipedError> {
         let socket_path = socket_path.into();
         let stream =
@@ -231,6 +238,7 @@ impl RampipedConversation {
             model_path: model_path.to_path_buf(),
             n_ctx,
             overflow,
+            restore_from,
         });
         let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
@@ -247,9 +255,12 @@ impl RampipedConversation {
                 turns: 0,
             }),
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Turn { .. } => Err(RampipedError::Remote(
-                "rampiped sent a turn response before the conversation was opened".to_string(),
-            )),
+            ConversationResponse::Turn { .. } | ConversationResponse::Snapshotted => {
+                Err(RampipedError::Remote(
+                    "rampiped sent an unexpected response before the conversation was opened"
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -265,14 +276,14 @@ impl RampipedConversation {
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
     ) -> Result<GenerateOutcome, RampipedError> {
-        let turn = ConversationTurnRequest {
+        let turn = ConversationRequest::Turn(ConversationTurnRequest {
             message: message.to_string(),
             max_new_tokens,
             sampling,
             grammar: grammar.map(str::to_string),
             assistant_prefill: assistant_prefill.map(str::to_string),
             grammar_completion,
-        };
+        });
         let mut payload = serde_json::to_vec(&turn).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
         self.writer
@@ -301,9 +312,50 @@ impl RampipedConversation {
                 })
             }
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Opened => Err(RampipedError::Remote(
-                "rampiped re-sent Opened mid-conversation".to_string(),
-            )),
+            ConversationResponse::Opened | ConversationResponse::Snapshotted => {
+                Err(RampipedError::Remote(
+                    "rampiped sent an unexpected response to a conversation turn".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Persists this conversation's KV cache to `state_path`/`meta_path`
+    /// and ends it -- consumes `self` because the daemon closes the
+    /// connection right after replying, the same way it would for an
+    /// ordinary drop; there is nothing left to `send()` to afterward. A
+    /// later [`RampipedConversation::open`] with a matching
+    /// `restore_from` picks the conversation back up without replaying
+    /// it turn by turn.
+    pub fn snapshot(
+        mut self,
+        state_path: impl Into<PathBuf>,
+        meta_path: impl Into<PathBuf>,
+    ) -> Result<(), RampipedError> {
+        let request = ConversationRequest::Snapshot(SnapshotRef {
+            state_path: state_path.into(),
+            meta_path: meta_path.into(),
+        });
+        let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
+        payload.push(b'\n');
+        self.writer
+            .write_all(&payload)
+            .map_err(RampipedError::Send)?;
+
+        let mut line = String::new();
+        self.reader
+            .read_line(&mut line)
+            .map_err(RampipedError::Read)?;
+        let response: ConversationResponse =
+            serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
+        match response {
+            ConversationResponse::Snapshotted => Ok(()),
+            ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
+            ConversationResponse::Opened | ConversationResponse::Turn { .. } => {
+                Err(RampipedError::Remote(
+                    "rampiped sent an unexpected response to a snapshot request".to_string(),
+                ))
+            }
         }
     }
 }

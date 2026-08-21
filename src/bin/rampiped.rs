@@ -39,8 +39,8 @@ use anyhow::{Context, Result, bail};
 use llama_cpp_2::llama_backend::LlamaBackend;
 use rampipe::llama::{Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Sampling};
 use rampipe::protocol::{
-    ClientMessage, ConversationResponse, ConversationTurnRequest, GenerateRequest,
-    GenerateResponse, OpenConversationRequest, WireOverflowPolicy, WireSampling,
+    ClientMessage, ConversationRequest, ConversationResponse, ConversationTurnRequest,
+    GenerateRequest, GenerateResponse, OpenConversationRequest, WireOverflowPolicy, WireSampling,
 };
 use rampipe::{ModelId, Residency, SwapRegistry};
 use std::collections::HashMap;
@@ -567,18 +567,32 @@ fn handle_conversation(
         }
     };
 
-    let n_ctx = NonZeroU32::new(request.n_ctx).context("n_ctx must be nonzero")?;
-    let options = ConversationOptions {
-        n_ctx,
-        overflow: wire_overflow_to_overflow(request.overflow),
+    // `restore_from` reopens a conversation a prior `Snapshot` request
+    // saved to disk instead of starting fresh -- `open_conversation_from_state`
+    // derives its own `n_ctx`/`overflow` from what the snapshot itself
+    // recorded (see that method's own doc comment for why the saved
+    // value wins over whatever `request.n_ctx`/`request.overflow` says),
+    // so neither is read in this branch.
+    let opened = match &request.restore_from {
+        Some(snapshot) => session
+            .open_conversation_from_state(&snapshot.state_path, &snapshot.meta_path)
+            .map_err(|error| format!("{error:#}")),
+        None => {
+            let n_ctx = NonZeroU32::new(request.n_ctx).context("n_ctx must be nonzero")?;
+            let options = ConversationOptions {
+                n_ctx,
+                overflow: wire_overflow_to_overflow(request.overflow),
+            };
+            session
+                .open_conversation(options)
+                .map_err(|error| format!("{error:#}"))
+        }
     };
 
-    let mut conversation = match session.open_conversation(options) {
+    let mut conversation = match opened {
         Ok(conversation) => conversation,
-        Err(error) => {
-            let response = ConversationResponse::Err {
-                message: format!("{error:#}"),
-            };
+        Err(message) => {
+            let response = ConversationResponse::Err { message };
             serde_json::to_writer(&mut writer, &response).context("encoding response")?;
             writer.write_all(b"\n").context("writing response")?;
             return Ok(());
@@ -602,32 +616,60 @@ fn handle_conversation(
             return Ok(());
         }
 
-        let turn_response = match serde_json::from_str::<ConversationTurnRequest>(line.trim()) {
-            Ok(turn) => {
+        let parsed = serde_json::from_str::<ConversationRequest>(line.trim());
+        let (turn_response, snapshotted) = match parsed {
+            Ok(ConversationRequest::Turn(turn)) => {
                 let response = run_conversation_turn(state, &mut conversation, &turn);
                 let tokens_generated = match &response {
                     ConversationResponse::Turn {
                         tokens_generated, ..
                     } => Some(*tokens_generated),
-                    ConversationResponse::Opened | ConversationResponse::Err { .. } => None,
+                    ConversationResponse::Opened
+                    | ConversationResponse::Snapshotted
+                    | ConversationResponse::Err { .. } => None,
                 };
                 state
                     .lock()
                     .expect("rampiped model store lock poisoned")
                     .record_outcome(&request.model_path, tokens_generated);
-                response
+                (response, false)
             }
-            // A turn that never decoded never touched the model at all --
-            // nothing to record against it, same reasoning as `Ok(())`
-            // never being reached in `handle_request` when the model
-            // itself fails to load before generation is ever attempted.
-            Err(error) => ConversationResponse::Err {
-                message: format!("decoding conversation turn: {error:#}"),
-            },
+            Ok(ConversationRequest::Snapshot(snapshot)) => {
+                match conversation.save_state(&snapshot.state_path, &snapshot.meta_path) {
+                    Ok(()) => (ConversationResponse::Snapshotted, true),
+                    Err(error) => (
+                        ConversationResponse::Err {
+                            message: format!("{error:#}"),
+                        },
+                        false,
+                    ),
+                }
+            }
+            // A request that never decoded never touched the model at
+            // all -- nothing to record against it, same reasoning as
+            // `Ok(())` never being reached in `handle_request` when the
+            // model itself fails to load before generation is ever
+            // attempted.
+            Err(error) => (
+                ConversationResponse::Err {
+                    message: format!("decoding conversation request: {error:#}"),
+                },
+                false,
+            ),
         };
 
         serde_json::to_writer(&mut writer, &turn_response).context("encoding response")?;
         writer.write_all(b"\n").context("writing response")?;
+
+        // A successful snapshot ends the conversation deliberately, the
+        // same way a client disconnect already does -- `conversation`
+        // drops here, freeing its `LlamaContext`'s VRAM. A snapshot that
+        // *failed* leaves the conversation open: the caller asked to
+        // hibernate it, not to abandon it, so a failed attempt should
+        // still be usable rather than silently lost.
+        if snapshotted {
+            return Ok(());
+        }
     }
 }
 

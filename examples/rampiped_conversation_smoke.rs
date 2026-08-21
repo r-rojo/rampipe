@@ -38,7 +38,7 @@ fn main() -> Result<()> {
 
     println!("=== turn 1: context carryover over the wire ===");
     let mut conversation =
-        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail)
+        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail, None)
             .context("opening conversation")?;
 
     let turn1 = conversation
