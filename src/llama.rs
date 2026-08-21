@@ -164,6 +164,23 @@ pub struct ChatWrap {
 /// type). Registering it here matches that convention rather than
 /// leaving the name undefined and turning a template's own deliberate
 /// validation error into an unrelated "unknown function" failure.
+///
+/// `pycompat::unknown_method_callback`: real, live gap this closes --
+/// Qwen 3.8's own `tokenizer.chat_template` calls
+/// `content.startswith('<tool_response>')`, which Python's own Jinja2
+/// silently supports (it falls through to native Python `str` methods
+/// for anything its own filter/method table doesn't define); minijinja
+/// is a from-scratch Rust reimplementation with no such fallback, so
+/// without this the call fails with "unknown method: string has no
+/// method named startswith" -- confirmed live, this was the actual
+/// reason `open_conversation` rejected that model's template as unusable
+/// (surfaced generically as "no template at all, or not provably
+/// steady-state," since a render failure and genuine non-determinism
+/// both collapse to the same `None` here). `minijinja-contrib`'s own
+/// `pycompat` module is exactly the fix its docs recommend for this
+/// class of problem -- confirmed live (a standalone probe against this
+/// exact template) that registering it alone, with no template changes,
+/// makes the render succeed.
 fn render_messages(
     template_text: &str,
     messages: &[(&str, &str)],
@@ -174,6 +191,7 @@ fn render_messages(
     let mut env = Environment::new();
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
     env.add_function(
         "raise_exception",
         |msg: String| -> Result<Value, minijinja::Error> {
@@ -1523,6 +1541,17 @@ mod tests {
     const CHATML_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n\
                          {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
 
+    /// Real, live-observed template that fails without
+    /// `set_unknown_method_callback` -- confirmed live against
+    /// `agentpiped`, `open_conversation` rejected this model with "no
+    /// template at all, or not provably steady-state" because
+    /// `render_messages` silently swallowed the real error
+    /// (`.render(ctx).ok()`); the actual failure, found by removing
+    /// that `.ok()` in a standalone probe, was `unknown method: string
+    /// has no method named startswith` at the template's own
+    /// `content.startswith('<tool_response>')` call.
+    const QWEN_3_8_CHAT_TEMPLATE: &str = include_str!("../tests/fixtures/qwen3_8_chat_template.jinja");
+
     #[test]
     fn renders_jambas_real_template_for_a_single_user_turn() {
         let rendered = render_with_minijinja(JAMBA_CHAT_TEMPLATE, "Hello, how are you?")
@@ -1616,6 +1645,31 @@ mod tests {
         );
         assert!(!template.generation_open.contains("<|system|>"));
         assert!(!template.turn_transition.contains("<|system|>"));
+    }
+
+    /// The actual bug this session's `pycompat` fix closes -- a small,
+    /// readable reproduction rather than relying solely on the full real
+    /// Qwen 3.8 template below to prove the mechanism. Python's own
+    /// Jinja2 lets a template call native `str` methods it never
+    /// defines itself (like `.startswith()`); minijinja has no such
+    /// fallback without `set_unknown_method_callback`.
+    #[test]
+    fn renders_a_template_that_calls_pythons_native_startswith_method() {
+        let template = "{% if messages[0].content.startswith('hi') %}yes{% else %}no{% endif %}";
+        let rendered = render_messages(template, &[("user", "hi there")], false)
+            .expect("pycompat should make .startswith() resolve, not error");
+        assert_eq!(rendered, "yes");
+    }
+
+    /// The real, live-observed case -- confirms the actual model
+    /// template that motivated this fix now derives a genuine,
+    /// steady-state conversation template end to end, not just that the
+    /// isolated `.startswith()` call works in a toy template.
+    #[test]
+    fn derives_a_conversation_template_for_the_real_qwen_3_8_template() {
+        let template = derive_conversation_template(QWEN_3_8_CHAT_TEMPLATE)
+            .expect("should derive now that pycompat covers .startswith()/.endswith()");
+        assert!(template.generation_open.contains("<|im_start|>assistant"));
     }
 
     #[test]

@@ -15,6 +15,13 @@ llama-cpp-2 = { version = "0.1.154", optional = true }
 llama-cpp-sys-2 = { version = "0.1.154", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 minijinja = { version = "2", features = ["json"], optional = true }
+# Registers Python-native string/dict methods (`.startswith()`, `.items()`,
+# ...) minijinja's own from-scratch Jinja2 reimplementation doesn't
+# replicate -- see `render_messages`'s own doc comment for the real, live
+# chat template (Qwen 3.8's) this fixes: it calls `content.startswith(...)`,
+# which Python's own Jinja2 silently supports by falling through to native
+# Python str methods, but minijinja has no equivalent fallback without this.
+minijinja-contrib = { version = "2", features = ["pycompat"], optional = true }
 memmap2 = "0.9.11"
 thiserror = "2.0.19"
 libc = "0.2.189"
@@ -31,7 +38,7 @@ serde_yaml = "0.9"
 mach2 = "0.6.0"
 
 [features]
-llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs", "dep:minijinja"]
+llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs", "dep:minijinja", "dep:minijinja-contrib"]
 # GPU offload via llama.cpp's CUDA backend. Requires the CUDA toolkit
 # (`nvcc`) on the build machine -- the driver alone (`nvidia-smi`
 # working) is not enough, since this compiles GPU kernels at build
