@@ -321,14 +321,17 @@ impl RampipedConversation {
     }
 
     /// Persists this conversation's KV cache to `state_path`/`meta_path`
-    /// and ends it -- consumes `self` because the daemon closes the
-    /// connection right after replying, the same way it would for an
-    /// ordinary drop; there is nothing left to `send()` to afterward. A
-    /// later [`RampipedConversation::open`] with a matching
+    /// and ends it -- the daemon closes the connection right after
+    /// replying, so any further call on `self` (a `send()`, another
+    /// `snapshot()`) fails rather than doing anything meaningful; this
+    /// takes `&mut self` rather than consuming it only so it can satisfy
+    /// [`crate::conversation::ConversationHandle::snapshot`]'s own
+    /// by-reference shape (see that trait method's doc comment for why).
+    /// A later [`RampipedConversation::open`] with a matching
     /// `restore_from` picks the conversation back up without replaying
     /// it turn by turn.
     pub fn snapshot(
-        mut self,
+        &mut self,
         state_path: impl Into<PathBuf>,
         meta_path: impl Into<PathBuf>,
     ) -> Result<(), RampipedError> {
@@ -421,5 +424,14 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
 
     fn turn_count(&self) -> usize {
         self.turns
+    }
+
+    fn snapshot(
+        &mut self,
+        state_path: &std::path::Path,
+        meta_path: &std::path::Path,
+    ) -> Result<(), crate::conversation::ConversationError> {
+        RampipedConversation::snapshot(self, state_path, meta_path)
+            .map_err(|error| crate::conversation::ConversationError::Backend(error.to_string()))
     }
 }

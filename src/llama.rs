@@ -1479,6 +1479,10 @@ impl ConversationHandle for Conversation<'_> {
     fn turn_count(&self) -> usize {
         Conversation::turn_count(self)
     }
+
+    fn snapshot(&mut self, state_path: &Path, meta_path: &Path) -> Result<(), ConversationError> {
+        Conversation::save_state(self, state_path, meta_path).map_err(ConversationError::Llama)
+    }
 }
 
 impl LocalModel for LlamaSession {

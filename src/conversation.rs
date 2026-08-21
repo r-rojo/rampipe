@@ -111,4 +111,22 @@ pub trait ConversationHandle {
         grammar_completion: Option<crate::protocol::GrammarCompletion>,
     ) -> Result<GenerationResult, ConversationError>;
     fn turn_count(&self) -> usize;
+    /// Persists this conversation's KV cache to `state_path`/`meta_path`
+    /// and, on success, leaves it unusable for anything further -- a
+    /// caller must treat any subsequent `send()` as a bug, not a
+    /// retryable failure (the in-process implementation could technically
+    /// still be sent to afterward; the daemon-backed one physically
+    /// can't, since `rampiped` closes the connection right after
+    /// replying -- this trait's contract is the stricter of the two, so
+    /// a caller holding a bare `Box<dyn ConversationHandle>` gets the
+    /// same rule regardless of which backend it actually got).
+    /// `&mut self` rather than consuming `self`: a `Box<dyn
+    /// ConversationHandle>` can't cleanly offer a by-value trait method
+    /// through a trait object, and the caller-discipline cost of "don't
+    /// use this afterward" is the same either way.
+    fn snapshot(
+        &mut self,
+        state_path: &std::path::Path,
+        meta_path: &std::path::Path,
+    ) -> Result<(), ConversationError>;
 }
