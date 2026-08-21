@@ -589,8 +589,17 @@ fn handle_conversation(
         }
     };
 
+    // `Option`-wrapped so a successful snapshot can drop the real
+    // `Conversation` (and free its `LlamaContext`'s VRAM) by setting
+    // this to `None` mid-loop, before the `Snapshotted` reply goes out
+    // -- see that arm's own comment for why the ordering matters. A
+    // plain `let mut conversation: Conversation<'_>` can't express "drop
+    // this in one loop iteration, then keep looping" at all: the borrow
+    // checker can't prove a move inside one `match` arm never reaches a
+    // later iteration that still expects it, even though this one always
+    // returns right after.
     let mut conversation = match opened {
-        Ok(conversation) => conversation,
+        Ok(conversation) => Some(conversation),
         Err(message) => {
             let response = ConversationResponse::Err { message };
             serde_json::to_writer(&mut writer, &response).context("encoding response")?;
@@ -617,9 +626,13 @@ fn handle_conversation(
         }
 
         let parsed = serde_json::from_str::<ConversationRequest>(line.trim());
-        let (turn_response, snapshotted) = match parsed {
+        match parsed {
             Ok(ConversationRequest::Turn(turn)) => {
-                let response = run_conversation_turn(state, &mut conversation, &turn);
+                let response = run_conversation_turn(
+                    state,
+                    conversation.as_mut().expect("conversation is only ever taken by a Snapshot arm that unconditionally returns right after"),
+                    &turn,
+                );
                 let tokens_generated = match &response {
                     ConversationResponse::Turn {
                         tokens_generated, ..
@@ -632,17 +645,48 @@ fn handle_conversation(
                     .lock()
                     .expect("rampiped model store lock poisoned")
                     .record_outcome(&request.model_path, tokens_generated);
-                (response, false)
+                serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+                writer.write_all(b"\n").context("writing response")?;
             }
             Ok(ConversationRequest::Snapshot(snapshot)) => {
-                match conversation.save_state(&snapshot.state_path, &snapshot.meta_path) {
-                    Ok(()) => (ConversationResponse::Snapshotted, true),
-                    Err(error) => (
-                        ConversationResponse::Err {
-                            message: format!("{error:#}"),
-                        },
-                        false,
-                    ),
+                let saved = conversation
+                    .as_ref()
+                    .expect("conversation is only ever taken by this arm, which unconditionally returns right after")
+                    .save_state(&snapshot.state_path, &snapshot.meta_path);
+                let response = match saved {
+                    Ok(()) => {
+                        // Drop *before* the reply is sent, not after --
+                        // a caller receiving `Snapshotted` needs this
+                        // context's VRAM to already be free, since the
+                        // whole reason to hibernate one is almost always
+                        // "so I can open another one right now." Writing
+                        // the reply first and dropping afterward (this
+                        // function returning, `conversation` going out
+                        // of scope) left a real window where a caller
+                        // that immediately tried to open a second
+                        // context hit an actual CUDA out-of-memory,
+                        // confirmed live: `bin/agentpiped.rs`'s own
+                        // hibernate-then-open sequencing is correct on
+                        // *its* side, but "the reply already arrived"
+                        // does not mean "the memory is already back" if
+                        // this side sends it too early.
+                        conversation = None;
+                        ConversationResponse::Snapshotted
+                    }
+                    // A snapshot that *failed* leaves the conversation
+                    // open: the caller asked to hibernate it, not to
+                    // abandon it, so a failed attempt should still be
+                    // usable rather than silently lost -- there is
+                    // nothing to drop early in this arm.
+                    Err(error) => ConversationResponse::Err {
+                        message: format!("{error:#}"),
+                    },
+                };
+                let snapshotted = matches!(response, ConversationResponse::Snapshotted);
+                serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+                writer.write_all(b"\n").context("writing response")?;
+                if snapshotted {
+                    return Ok(());
                 }
             }
             // A request that never decoded never touched the model at
@@ -650,25 +694,13 @@ fn handle_conversation(
             // `Ok(())` never being reached in `handle_request` when the
             // model itself fails to load before generation is ever
             // attempted.
-            Err(error) => (
-                ConversationResponse::Err {
+            Err(error) => {
+                let response = ConversationResponse::Err {
                     message: format!("decoding conversation request: {error:#}"),
-                },
-                false,
-            ),
-        };
-
-        serde_json::to_writer(&mut writer, &turn_response).context("encoding response")?;
-        writer.write_all(b"\n").context("writing response")?;
-
-        // A successful snapshot ends the conversation deliberately, the
-        // same way a client disconnect already does -- `conversation`
-        // drops here, freeing its `LlamaContext`'s VRAM. A snapshot that
-        // *failed* leaves the conversation open: the caller asked to
-        // hibernate it, not to abandon it, so a failed attempt should
-        // still be usable rather than silently lost.
-        if snapshotted {
-            return Ok(());
+                };
+                serde_json::to_writer(&mut writer, &response).context("encoding response")?;
+                writer.write_all(b"\n").context("writing response")?;
+            }
         }
     }
 }
