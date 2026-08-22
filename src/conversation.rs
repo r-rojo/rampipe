@@ -29,12 +29,56 @@ use std::time::Duration;
 /// `Temperature` just as deterministic (and just as stuck) as `Greedy`.
 #[derive(Debug, Clone, Copy)]
 pub enum Sampling {
-    Greedy,
+    Greedy {
+        penalties: Penalties,
+    },
     Temperature {
         temperature: f32,
         top_k: i32,
         seed: u32,
+        penalties: Penalties,
     },
+}
+
+/// Discourages repeating tokens already seen recently in this turn's own
+/// context -- independent of which final-selection strategy `Sampling`
+/// picks, since it adjusts logits *before* greedy argmax or temperature/
+/// dist ever runs, so even pure `Greedy` decoding is affected. That
+/// matters concretely: greedy is exactly the shape most prone to
+/// repetition (no randomness to escape a self-reinforcing loop once one
+/// starts) -- confirmed live, a real manager turn against Qwen 3.8
+/// generated a single shell command that degenerated into the same four
+/// `find`/`cat`/`ls` invocations repeated dozens of times, burning its
+/// entire token budget before ever finishing, using plain `Greedy` with
+/// no penalty applied at all.
+///
+/// Field meanings and "disabled" values match llama.cpp's own
+/// `llama_sampler_init_penalties` directly -- see that function's own
+/// doc comment in `llama_cpp_2::sampling::LlamaSampler::penalties`.
+/// `Default` is fully disabled, so a caller that never opts in gets
+/// byte-identical behavior to before this existed.
+#[derive(Debug, Clone, Copy)]
+pub struct Penalties {
+    /// How many of the most recent tokens count toward the penalty (0 =
+    /// disabled, -1 = the whole context).
+    pub last_n: i32,
+    /// 1.0 = disabled.
+    pub repeat: f32,
+    /// 0.0 = disabled.
+    pub freq: f32,
+    /// 0.0 = disabled.
+    pub present: f32,
+}
+
+impl Default for Penalties {
+    fn default() -> Self {
+        Self {
+            last_n: 0,
+            repeat: 1.0,
+            freq: 0.0,
+            present: 0.0,
+        }
+    }
 }
 
 pub struct GenerationResult {

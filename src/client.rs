@@ -11,8 +11,9 @@
 
 use crate::protocol::{
     ClientMessage, ConversationRequest, ConversationResponse, ConversationTurnRequest,
-    GenerateRequest, GenerateResponse, GrammarCompletion, OpenConversationRequest, SnapshotRef,
-    StatusResponse, WireOverflowPolicy, WireSampling,
+    EmbedRequest, EmbedResponse, GenerateRequest, GenerateResponse, GrammarCompletion,
+    OpenConversationRequest, SnapshotRef, StatusResponse, WireOverflowPolicy, WirePooling,
+    WireSampling,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -55,6 +56,15 @@ pub struct GenerateOutcome {
     /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
     /// comment.
     pub formatted_prompt: String,
+}
+
+/// A successful [`RampipedClient::embed`] -- one vector per input text,
+/// in request order.
+#[derive(Debug, Clone)]
+pub struct EmbedOutcome {
+    pub vectors: Vec<Vec<f32>>,
+    /// See `crate::protocol::EmbedResponse::Ok::n_embd`.
+    pub n_embd: usize,
 }
 
 pub struct RampipedClient {
@@ -151,6 +161,46 @@ impl RampipedClient {
                 formatted_prompt,
             }),
             GenerateResponse::Err { message } => Err(RampipedError::Remote(message)),
+        }
+    }
+
+    /// Embeds a batch of texts, returning one vector each in the same
+    /// order. Same one-shot connection shape as
+    /// [`RampipedClient::generate`].
+    pub fn embed(
+        &self,
+        model_path: &Path,
+        texts: &[String],
+        pooling: WirePooling,
+        normalize: bool,
+    ) -> Result<EmbedOutcome, RampipedError> {
+        let request = ClientMessage::Embed(EmbedRequest {
+            model_path: model_path.to_path_buf(),
+            texts: texts.to_vec(),
+            pooling,
+            normalize,
+        });
+        let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
+        payload.push(b'\n');
+
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|source| RampipedError::Connect {
+                path: self.socket_path.clone(),
+                source,
+            })?;
+        stream.write_all(&payload).map_err(RampipedError::Send)?;
+        stream
+            .shutdown(std::net::Shutdown::Write)
+            .map_err(RampipedError::Send)?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(RampipedError::Read)?;
+        let response: EmbedResponse =
+            serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
+        match response {
+            EmbedResponse::Ok { vectors, n_embd } => Ok(EmbedOutcome { vectors, n_embd }),
+            EmbedResponse::Err { message } => Err(RampipedError::Remote(message)),
         }
     }
 
@@ -388,16 +438,27 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
     ) -> Result<crate::conversation::GenerationResult, crate::conversation::ConversationError> {
+        let to_wire_penalties =
+            |p: crate::conversation::Penalties| crate::protocol::WirePenalties {
+                last_n: p.last_n,
+                repeat: p.repeat,
+                freq: p.freq,
+                present: p.present,
+            };
         let sampling = match sampling {
-            crate::conversation::Sampling::Greedy => WireSampling::Greedy,
+            crate::conversation::Sampling::Greedy { penalties } => WireSampling::Greedy {
+                penalties: to_wire_penalties(penalties),
+            },
             crate::conversation::Sampling::Temperature {
                 temperature,
                 top_k,
                 seed,
+                penalties,
             } => WireSampling::Temperature {
                 temperature,
                 top_k,
                 seed,
+                penalties: to_wire_penalties(penalties),
             },
         };
         let outcome = RampipedConversation::send(

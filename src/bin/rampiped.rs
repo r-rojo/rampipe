@@ -37,10 +37,13 @@
 
 use anyhow::{Context, Result, bail};
 use llama_cpp_2::llama_backend::LlamaBackend;
-use rampipe::llama::{Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Sampling};
+use rampipe::llama::{
+    Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Pooling, Sampling,
+};
 use rampipe::protocol::{
     ClientMessage, ConversationRequest, ConversationResponse, ConversationTurnRequest,
-    GenerateRequest, GenerateResponse, OpenConversationRequest, WireOverflowPolicy, WireSampling,
+    EmbedRequest, EmbedResponse, GenerateRequest, GenerateResponse, OpenConversationRequest,
+    WireOverflowPolicy, WirePooling, WireSampling,
 };
 use rampipe::{ModelId, Residency, SwapRegistry};
 use std::collections::HashMap;
@@ -120,17 +123,39 @@ fn parse_args() -> Result<ParsedArgs> {
     }))
 }
 
+fn wire_penalties_to_penalties(p: rampipe::protocol::WirePenalties) -> rampipe::llama::Penalties {
+    rampipe::llama::Penalties {
+        last_n: p.last_n,
+        repeat: p.repeat,
+        freq: p.freq,
+        present: p.present,
+    }
+}
+
+fn wire_pooling_to_pooling(pooling: WirePooling) -> Pooling {
+    match pooling {
+        WirePooling::Model => Pooling::Model,
+        WirePooling::Mean => Pooling::Mean,
+        WirePooling::Cls => Pooling::Cls,
+        WirePooling::Last => Pooling::Last,
+    }
+}
+
 fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
     match sampling {
-        WireSampling::Greedy => Sampling::Greedy,
+        WireSampling::Greedy { penalties } => Sampling::Greedy {
+            penalties: wire_penalties_to_penalties(penalties),
+        },
         WireSampling::Temperature {
             temperature,
             top_k,
             seed,
+            penalties,
         } => Sampling::Temperature {
             temperature,
             top_k,
             seed,
+            penalties: wire_penalties_to_penalties(penalties),
         },
     }
 }
@@ -436,6 +461,18 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
             stream.write_all(b"\n").context("writing response")?;
             Ok(())
         }
+        ClientMessage::Embed(request) => {
+            let response = match handle_embed(state, &request) {
+                Ok(response) => response,
+                Err(error) => EmbedResponse::Err {
+                    message: format!("{error:#}"),
+                },
+            };
+            let mut stream = stream;
+            serde_json::to_writer(&mut stream, &response).context("encoding response")?;
+            stream.write_all(b"\n").context("writing response")?;
+            Ok(())
+        }
     }
 }
 
@@ -513,6 +550,33 @@ fn handle_request(
         time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
         formatted_prompt: result.formatted_prompt,
     })
+}
+
+/// Embeds a batch of texts. Holds the same lock every other GPU-touching
+/// path holds -- an embedding decode is GPU work like any other, and the
+/// daemon's whole concurrency story is that exactly one such call runs at
+/// a time while connections are still accepted and read concurrently.
+///
+/// Deliberately does *not* call `record_outcome`: `tokens_generated` is a
+/// generation statistic and an embedding request generates none, so
+/// folding it into the same counters would quietly corrupt what `Status`
+/// reports about throughput.
+fn handle_embed(state: &Mutex<SharedState>, request: &EmbedRequest) -> Result<EmbedResponse> {
+    let mut state = state.lock().expect("rampiped model store lock poisoned");
+    state.ensure_loaded(&request.model_path)?;
+    let session = state
+        .sessions
+        .get(&request.model_path)
+        .expect("ensure_loaded just guaranteed this");
+    let vectors = session
+        .embed(
+            &request.texts,
+            wire_pooling_to_pooling(request.pooling),
+            request.normalize,
+        )
+        .with_context(|| format!("embedding against {}", request.model_path.display()))?;
+    let n_embd = vectors.first().map_or(0, Vec::len);
+    Ok(EmbedResponse::Ok { vectors, n_embd })
 }
 
 /// Serves one whole conversation for as long as its connection stays

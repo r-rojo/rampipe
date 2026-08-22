@@ -13,7 +13,7 @@
 
 use crate::{ModelHandle, Residency, SwapMetrics, SwapRegistry};
 use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 // Re-exported: `LlamaSession::load` (and, previously, `generate`) took
 // `&LlamaBackend` as a parameter, so any caller constructing one (every
 // caller, since there's no other way to get one) needs to be able to name
@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 // Re-exported here because every caller (and every doc link) already
 // refers to these as `rampipe::llama::*`, and they remain part of this
 // module's vocabulary even though their definitions no longer live in it.
-pub use crate::conversation::{ConversationError, ConversationHandle, GenerationResult, Sampling};
+pub use crate::conversation::{
+    ConversationError, ConversationHandle, GenerationResult, Penalties, Sampling,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlamaSessionError {
@@ -74,6 +76,8 @@ pub enum LlamaSessionError {
     PathHasNul(#[from] std::ffi::NulError),
     #[error("fitting model params to device memory: {0}")]
     Fit(#[from] llama_cpp_2::model::params::FitError),
+    #[error("embeddings error: {0}")]
+    Embeddings(#[from] llama_cpp_2::EmbeddingsError),
     #[error(
         "model has no chat template this crate can safely reuse turn-by-turn (either no \
          template at all, or its rendering isn't provably steady-state per turn) -- \
@@ -287,6 +291,51 @@ pub unsafe fn suppress_logs() {
 /// init" token), so it's `Send + Sync` automatically and `Arc`-safe to
 /// share across the worker threads a real caller (`rampiped`) runs
 /// generation from.
+/// The in-process half of [`crate::protocol::WirePooling`]. Kept
+/// separate for the same reason `Sampling` and `WireSampling` are: this
+/// one names a `llama_cpp_2` type and so cannot exist in a build without
+/// the `llama` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    Model,
+    Mean,
+    Cls,
+    Last,
+}
+
+impl Pooling {
+    /// `None` means "leave `LlamaContextParams` alone", which is how
+    /// llama.cpp is told to consult the model's own hparams.
+    fn to_llama(self) -> Option<LlamaPoolingType> {
+        match self {
+            Pooling::Model => None,
+            Pooling::Mean => Some(LlamaPoolingType::Mean),
+            Pooling::Cls => Some(LlamaPoolingType::Cls),
+            Pooling::Last => Some(LlamaPoolingType::Last),
+        }
+    }
+}
+
+/// Scales `v` to unit length in place. A no-op on an all-zero vector
+/// rather than producing NaNs -- an empty or fully-truncated input is a
+/// caller error worth surfacing as a zero vector (which matches nothing)
+/// rather than as poison that silently contaminates every later cosine.
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+/// Cap on tokens decoded per embedded text, and on the batch allocated
+/// to do it. Retrieval encoders are trained at 512 positions and the
+/// texts this exists for are short cue phrases, so a cap here costs
+/// nothing real and keeps a caller from having a 32K-context model
+/// allocate a 32K batch to embed the words "north elevator".
+const EMBED_MAX_TOKENS: usize = 512;
+
 pub struct LlamaSession {
     handle: ModelHandle,
     model: LlamaModel,
@@ -373,13 +422,34 @@ fn run_generation_loop(
         if let Some(grammar_str) = grammar {
             stages.push(LlamaSampler::grammar(model, grammar_str, "root")?);
         }
+        // A penalties stage, when its own fields aren't all "disabled",
+        // goes before the final-selection stage regardless of which
+        // `Sampling` variant is in play -- it adjusts logits, so it has
+        // to run before greedy argmax or temperature/dist ever sees
+        // them, the same ordering reasoning the grammar stage above
+        // already follows.
+        let push_penalties = |stages: &mut Vec<LlamaSampler>, penalties: Penalties| {
+            if penalties.repeat != 1.0 || penalties.freq != 0.0 || penalties.present != 0.0 {
+                stages.push(LlamaSampler::penalties(
+                    penalties.last_n,
+                    penalties.repeat,
+                    penalties.freq,
+                    penalties.present,
+                ));
+            }
+        };
         match sampling {
-            Sampling::Greedy => stages.push(LlamaSampler::greedy()),
+            Sampling::Greedy { penalties } => {
+                push_penalties(&mut stages, penalties);
+                stages.push(LlamaSampler::greedy());
+            }
             Sampling::Temperature {
                 temperature,
                 top_k,
                 seed,
+                penalties,
             } => {
+                push_penalties(&mut stages, penalties);
                 stages.push(LlamaSampler::top_k(top_k));
                 stages.push(LlamaSampler::temp(temperature));
                 stages.push(LlamaSampler::dist(seed));
@@ -729,6 +799,87 @@ impl LlamaSession {
         self.handle.device_bytes()
     }
 
+    /// Embeds each of `texts` into one vector, using a fresh
+    /// embeddings-enabled context for the whole batch.
+    ///
+    /// A separate context from the generation path on purpose:
+    /// `with_embeddings(true)` changes what llama.cpp extracts from a
+    /// decode, and the same model can legitimately be asked for both, so
+    /// neither call gets to mutate the other's context configuration.
+    /// The model itself is shared -- residency is per-model, and this
+    /// costs no extra weights.
+    ///
+    /// Every token is added with logits enabled, matching llama.cpp's
+    /// own `examples/embedding` (`batch_add_seq` passes `true` for every
+    /// token): pooling reads across the whole sequence, not just the
+    /// last position.
+    pub fn embed(
+        &self,
+        texts: &[String],
+        pooling: Pooling,
+        normalize: bool,
+    ) -> Result<Vec<Vec<f32>>, LlamaSessionError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self.embed_pooled(texts, pooling, normalize) {
+            // The model declared no pooling type of its own and llama.cpp
+            // resolved the unspecified request to NONE, which makes
+            // `llama_get_embeddings_seq` return null. Mean is the
+            // sensible fallback and the alternative is handing the caller
+            // an error it has no way to act on.
+            Err(LlamaSessionError::Embeddings(llama_cpp_2::EmbeddingsError::NonePoolType))
+                if pooling == Pooling::Model =>
+            {
+                self.embed_pooled(texts, Pooling::Mean, normalize)
+            }
+            other => other,
+        }
+    }
+
+    fn embed_pooled(
+        &self,
+        texts: &[String],
+        pooling: Pooling,
+        normalize: bool,
+    ) -> Result<Vec<Vec<f32>>, LlamaSessionError> {
+        // `with_n_ctx(None)` -> n_ctx=0 -> llama.cpp uses the model's own
+        // training context, which for a retrieval encoder is the only
+        // correct answer (bge-small is trained at 512; asking for 8192
+        // would be meaningless).
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(None)
+            .with_embeddings(true);
+        if let Some(pooling_type) = pooling.to_llama() {
+            ctx_params = ctx_params.with_pooling_type(pooling_type);
+        }
+        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
+
+        let capacity = (ctx.n_ctx() as usize).min(EMBED_MAX_TOKENS).max(1);
+        let mut batch = LlamaBatch::new(capacity, 1);
+        let mut out = Vec::with_capacity(texts.len());
+
+        for text in texts {
+            let mut tokens = self.model.str_to_token(text, AddBos::Always)?;
+            tokens.truncate(capacity);
+            batch.clear();
+            for (pos, &token) in tokens.iter().enumerate() {
+                batch.add(token, pos as i32, &[0], true)?;
+            }
+            // Each text is independent -- without this, sequence 0 keeps
+            // accumulating and every vector after the first pools over
+            // its own text *plus* every text before it.
+            ctx.clear_kv_cache();
+            ctx.decode(&mut batch)?;
+            let mut vector = ctx.embeddings_seq_ith(0)?.to_vec();
+            if normalize {
+                l2_normalize(&mut vector);
+            }
+            out.push(vector);
+        }
+        Ok(out)
+    }
+
     /// Runs a real generation, using a fresh context each call -- no
     /// state (KV cache, turn history) survives past this one call. See
     /// `open_conversation` for a session that keeps its KV cache alive
@@ -872,8 +1023,10 @@ impl LlamaSession {
         // session on it, including for a rope kind added to llama.cpp
         // after this binding was last updated," which is not a close
         // call.
-        let supports_kv_cache_position_shift =
-            matches!(self.model.rope_type(), Some(RopeType::Norm) | Some(RopeType::NeoX));
+        let supports_kv_cache_position_shift = matches!(
+            self.model.rope_type(),
+            Some(RopeType::Norm) | Some(RopeType::NeoX)
+        );
         let (overflow, defrag_thold) = if supports_kv_cache_position_shift {
             (options.overflow, CONVERSATION_DEFRAG_THOLD)
         } else {
@@ -1590,7 +1743,8 @@ mod tests {
     /// that `.ok()` in a standalone probe, was `unknown method: string
     /// has no method named startswith` at the template's own
     /// `content.startswith('<tool_response>')` call.
-    const QWEN_3_8_CHAT_TEMPLATE: &str = include_str!("../tests/fixtures/qwen3_8_chat_template.jinja");
+    const QWEN_3_8_CHAT_TEMPLATE: &str =
+        include_str!("../tests/fixtures/qwen3_8_chat_template.jinja");
 
     #[test]
     fn renders_jambas_real_template_for_a_single_user_turn() {
@@ -1739,7 +1893,8 @@ mod tests {
         };
         let registry = SwapRegistry::new();
         let backend = Arc::new(LlamaBackend::init().expect("init backend"));
-        let session = LlamaSession::load(&registry, backend, &path, Residency::Lazy).expect("load model");
+        let session =
+            LlamaSession::load(&registry, backend, &path, Residency::Lazy).expect("load model");
         let rope_type = session.model.rope_type();
         assert!(
             !matches!(rope_type, Some(RopeType::Norm) | Some(RopeType::NeoX)),
@@ -1781,20 +1936,21 @@ mod tests {
             Residency::Lazy,
             GpuLayers::Fixed(30),
         );
-        assert!(session.is_ok(), "forced offload should at least not error: {:?}", session.err());
+        assert!(
+            session.is_ok(),
+            "forced offload should at least not error: {:?}",
+            session.err()
+        );
     }
 
     #[test]
     fn rejects_a_template_with_no_chat_syntax_at_all() {
-        assert!(
-            derive_conversation_template("just plain text, no {{ }} or {% %} anywhere").is_none()
-                || true
-        );
         // A template with no `messages` loop at all still renders (as
         // literal text with no sentinel present), so this only documents
         // the shape rather than asserting a specific outcome -- the real
         // safety net is `derive_from_probe`'s sentinel-position checks,
         // covered by the tests above using real templates.
+        let _ = derive_conversation_template("just plain text, no {{ }} or {% %} anywhere");
     }
 
     #[test]

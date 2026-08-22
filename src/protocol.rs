@@ -21,12 +21,36 @@ use std::path::PathBuf;
 /// between the two at the one point that actually needs both.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum WireSampling {
-    Greedy,
+    Greedy {
+        penalties: WirePenalties,
+    },
     Temperature {
         temperature: f32,
         top_k: i32,
         seed: u32,
+        penalties: WirePenalties,
     },
+}
+
+/// Mirrors `conversation::Penalties` field-for-field, same reasoning as
+/// `WireSampling` itself.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WirePenalties {
+    pub last_n: i32,
+    pub repeat: f32,
+    pub freq: f32,
+    pub present: f32,
+}
+
+impl Default for WirePenalties {
+    fn default() -> Self {
+        Self {
+            last_n: 0,
+            repeat: 1.0,
+            freq: 0.0,
+            present: 0.0,
+        }
+    }
 }
 
 /// How a caller's own generation loop should decide "the grammar-
@@ -115,6 +139,78 @@ pub enum GenerateResponse {
     },
 }
 
+/// How token embeddings get collapsed into one vector per text.
+/// Mirrors `llama_cpp_2::context::params::LlamaPoolingType`, same reason
+/// [`WireSampling`] mirrors `Sampling` -- keeps this module free of the
+/// `llama` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WirePooling {
+    /// Whatever the model's own GGUF metadata declares -- CLS for a
+    /// bge-family encoder, Mean for nomic-embed, and so on. The right
+    /// default: each retrieval encoder was trained with one specific
+    /// pooling and using a different one silently degrades the vectors
+    /// rather than failing.
+    ///
+    /// Note this is not a no-op. llama.cpp resolves an unspecified
+    /// pooling type against the model's hparams and, if *those* are also
+    /// unspecified, lands on `NONE` -- which makes
+    /// `llama_get_embeddings_seq` return null and the binding report
+    /// `EmbeddingsError::NonePoolType`. `LlamaSession::embed` retries
+    /// once with [`WirePooling::Mean`] in that case rather than
+    /// surfacing an error a caller can do nothing about.
+    Model,
+    Mean,
+    Cls,
+    Last,
+}
+
+fn default_pooling() -> WirePooling {
+    WirePooling::Model
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A request to embed one or more texts against `model_path`.
+///
+/// Batched (`texts` is a list, not one string) because the calling
+/// pattern this exists for -- embedding a vocabulary of short cue
+/// phrases -- is many tiny texts at once, and one round trip plus one
+/// context creation for the whole batch is most of the cost saved.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EmbedRequest {
+    pub model_path: PathBuf,
+    pub texts: Vec<String>,
+    #[serde(default = "default_pooling")]
+    pub pooling: WirePooling,
+    /// L2-normalize each vector, so a dot product is cosine similarity.
+    /// Defaults to true: every consumer of this so far wants cosine, and
+    /// normalizing on the daemon side keeps callers from each
+    /// reimplementing it.
+    #[serde(default = "default_true")]
+    pub normalize: bool,
+}
+
+/// One line back per [`EmbedRequest`]. Same success-or-failure-never-both
+/// shape as [`GenerateResponse`], for the same reason.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EmbedResponse {
+    Ok {
+        /// One vector per input text, in the same order.
+        vectors: Vec<Vec<f32>>,
+        /// Width of each vector -- the model's `n_embd_out`, which is not
+        /// always `n_embd` (see `LlamaContext::embeddings_seq_ith`'s own
+        /// doc comment). Carried explicitly so a caller can reject a
+        /// dimension mismatch against vectors it stored earlier without
+        /// having to infer the width from a possibly-empty batch.
+        n_embd: usize,
+    },
+    Err {
+        message: String,
+    },
+}
+
 /// The first message a client sends on every fresh connection --
 /// distinguishes today's one-shot `Generate` (connection closes after
 /// one reply, unchanged from before this enum existed) from
@@ -131,6 +227,12 @@ pub enum ClientMessage {
     /// Asks for [`StatusResponse`] -- a one-shot request/reply, connection
     /// closes after, same shape as `Generate`.
     Status,
+    /// Embeds a batch of texts -- one-shot, same connection shape as
+    /// `Generate`. Separate from `Generate` rather than a mode of it
+    /// because the two share no parameters at all: there is no sampling,
+    /// no grammar, no prefill and no token budget in an embedding
+    /// request, and nothing but a vector comes back.
+    Embed(EmbedRequest),
 }
 
 /// What `rampiped` reports about itself for a `ClientMessage::Status`
@@ -381,7 +483,9 @@ mod tests {
         let request = ConversationRequest::Turn(ConversationTurnRequest {
             message: "hi".to_string(),
             max_new_tokens: 16,
-            sampling: WireSampling::Greedy,
+            sampling: WireSampling::Greedy {
+                penalties: WirePenalties::default(),
+            },
             grammar: None,
             assistant_prefill: None,
             grammar_completion: None,
