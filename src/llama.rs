@@ -1750,22 +1750,24 @@ mod tests {
         );
     }
 
-    /// Diagnostic, not (yet) a locked-in regression test: `GpuLayers::Auto`
-    /// offloads 0/66 layers for this model -- `fit_params` (llama.cpp's
-    /// own `common_fit_params`) decides nothing fits within the memory
-    /// margin, confirmed live via its own `load_tensors: offloaded 0/66
-    /// layers to GPU` stderr line, despite 15GB+ actually being free.
-    /// This forces a real layer count instead, skipping the fit-estimation
-    /// step entirely, to tell apart two very different explanations: a bad
-    /// *estimate* for this new architecture (this succeeds, offloads
-    /// something real) vs. a genuine incompatibility (this also fails or
-    /// silently offloads 0). Run with `--nocapture` and read the real
-    /// `load_tensors:` line -- this only asserts the *call itself*
-    /// doesn't error, since introspecting the exact offloaded count isn't
-    /// exposed as a clean Rust API here.
+    /// There is no real bug here -- see this crate's own commit history
+    /// for the false alarm this test was originally written to chase
+    /// down: `GpuLayers::Auto` was observed offloading 0/66 layers for
+    /// this model, which looked like a `fit_params` (llama.cpp's own
+    /// `common_fit_params`) estimation bug for this new architecture.
+    /// It wasn't -- confirmed live, the actual cause was mundane: an
+    /// already-running `rampiped` process (a *different* model, left
+    /// over from earlier testing) was holding ~14GB of this box's ~16GB
+    /// VRAM resident the entire time, so `fit_params` correctly saw
+    /// almost no free memory and correctly declined to offload anything.
+    /// With that process killed and real VRAM free, plain
+    /// `GpuLayers::Auto` offloads all 66/66 layers with no forcing
+    /// needed at all. This test now exists only as a plain sanity check
+    /// that the `GpuLayers::Fixed` escape hatch itself still works for
+    /// this model, not to guard against anything broken.
     #[test]
     #[ignore = "needs the real, large Qwen 3.8 GGUF -- set QWEN_3_8_GGUF_PATH to run"]
-    fn qwen_3_8_with_a_forced_gpu_layer_count_skips_the_broken_auto_fit() {
+    fn qwen_3_8_loads_with_an_explicit_forced_gpu_layer_count() {
         let Ok(path) = std::env::var("QWEN_3_8_GGUF_PATH") else {
             eprintln!("skipping: QWEN_3_8_GGUF_PATH not set");
             return;
