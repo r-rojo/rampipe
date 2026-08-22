@@ -24,7 +24,7 @@ use llama_cpp_2::context::params::LlamaContextParams;
 pub use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel};
+use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaModel, RopeType};
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use std::ffi::CString;
@@ -843,9 +843,49 @@ impl LlamaSession {
         &self,
         options: ConversationOptions,
     ) -> Result<Conversation<'_>, LlamaSessionError> {
+        // Real, live-observed crash this guards against: a model using
+        // some multi-position rope scheme hit `GGML_ASSERT(
+        // hparams.n_pos_per_embd() == 1 && "seq_add() is only supported
+        // for n_pos_per_embd() == 1")` and aborted the whole process --
+        // confirmed live against the real model, this fires from
+        // *either* `drop_oldest_turns_for`'s own `kv_cache_seq_add` call
+        // on overflow, or llama.cpp's own internal auto-defrag doing the
+        // same position-shift under the hood, so both have to be
+        // disabled together, not just one.
+        //
+        // Allowlist, not a denylist, and deliberately so -- confirmed
+        // live (reading llama.cpp's own `llama_model_rope_type()`
+        // switch in `llama-model.cpp`) that the real model this crash
+        // was found against reports `LLAMA_ROPE_TYPE_IMROPE`
+        // ("interleaved M-RoPE", a newer constant llama.cpp added and
+        // groups explicitly alongside its vision architectures) -- a
+        // value `rope_type()`'s own match arms here don't have a case
+        // for, so it silently fell through to `None`. A denylist keyed
+        // on `Some(MRope) | Some(Vision)` would have missed this exact
+        // case entirely and let the crash back in. Only the two rope
+        // kinds confirmed ordinary, single-position-per-token text
+        // models use (`Norm`, `NeoX`) are trusted with the risky path;
+        // everything else -- `None`, `MRope`, `Vision`, or any future
+        // rope kind this binding doesn't recognize yet -- plays it safe.
+        // That trades away "auto-trim/auto-compact a long conversation"
+        // for "never crash the whole daemon out from under every other
+        // session on it, including for a rope kind added to llama.cpp
+        // after this binding was last updated," which is not a close
+        // call.
+        let supports_kv_cache_position_shift =
+            matches!(self.model.rope_type(), Some(RopeType::Norm) | Some(RopeType::NeoX));
+        let (overflow, defrag_thold) = if supports_kv_cache_position_shift {
+            (options.overflow, CONVERSATION_DEFRAG_THOLD)
+        } else {
+            // llama.cpp's own `llama_context_default_params` value for
+            // "defrag disabled entirely" -- see `CONVERSATION_DEFRAG_THOLD`'s
+            // own doc comment.
+            (OverflowPolicy::Fail, -1.0)
+        };
+
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(options.n_ctx))
-            .with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
+            .with_defrag_thold(defrag_thold);
         let ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
@@ -865,7 +905,7 @@ impl LlamaSession {
             n_ctx,
             committed_pos: 0,
             turns: Vec::new(),
-            overflow: options.overflow,
+            overflow,
             tokens: Vec::new(),
         })
     }
@@ -1670,6 +1710,76 @@ mod tests {
         let template = derive_conversation_template(QWEN_3_8_CHAT_TEMPLATE)
             .expect("should derive now that pycompat covers .startswith()/.endswith()");
         assert!(template.generation_open.contains("<|im_start|>assistant"));
+    }
+
+    /// The real, live-observed crash `open_conversation`'s own
+    /// `rope_type()` guard exists for -- and the real reason it's an
+    /// allowlist, not a denylist: confirmed live, this actual model
+    /// doesn't report `Some(MRope)`/`Some(Vision)` at all. It reports
+    /// `None`, because llama.cpp's own `llama_model_rope_type()`
+    /// returns `LLAMA_ROPE_TYPE_IMROPE` for its architecture (`QWEN35`,
+    /// grouped with the vision archs in llama.cpp's own source) -- a
+    /// rope kind this binding's `rope_type()` has no match arm for, so
+    /// it silently falls through to the catch-all `None` case. A
+    /// denylist keyed on the two *named* multimodal variants would have
+    /// missed this and let the crash back in; this is exactly why
+    /// `open_conversation` only trusts the two *positively confirmed*
+    /// ordinary rope kinds (`Norm`, `NeoX`) with the risky
+    /// `kv_cache_seq_add` path, not "everything except a fixed list of
+    /// known-bad ones." Needs the real, large GGUF this crash was found
+    /// against -- set `QWEN_3_8_GGUF_PATH` to run; skips (not fails)
+    /// everywhere else, same pattern `agentpipe::cli_agent`'s own
+    /// credentialed tests use.
+    #[test]
+    #[ignore = "needs the real, large Qwen 3.8 GGUF -- set QWEN_3_8_GGUF_PATH to run"]
+    fn qwen_3_8_does_not_report_an_ordinary_single_position_rope_type() {
+        let Ok(path) = std::env::var("QWEN_3_8_GGUF_PATH") else {
+            eprintln!("skipping: QWEN_3_8_GGUF_PATH not set");
+            return;
+        };
+        let registry = SwapRegistry::new();
+        let backend = Arc::new(LlamaBackend::init().expect("init backend"));
+        let session = LlamaSession::load(&registry, backend, &path, Residency::Lazy).expect("load model");
+        let rope_type = session.model.rope_type();
+        assert!(
+            !matches!(rope_type, Some(RopeType::Norm) | Some(RopeType::NeoX)),
+            "expected a non-ordinary rope type (this model's real value is None, via the \
+             unmapped LLAMA_ROPE_TYPE_IMROPE case), got {rope_type:?} -- if this now reports \
+             Norm/NeoX, either the model changed or llama-cpp-2 started mapping IMROPE, and \
+             open_conversation's own allowlist comment should be revisited",
+        );
+    }
+
+    /// Diagnostic, not (yet) a locked-in regression test: `GpuLayers::Auto`
+    /// offloads 0/66 layers for this model -- `fit_params` (llama.cpp's
+    /// own `common_fit_params`) decides nothing fits within the memory
+    /// margin, confirmed live via its own `load_tensors: offloaded 0/66
+    /// layers to GPU` stderr line, despite 15GB+ actually being free.
+    /// This forces a real layer count instead, skipping the fit-estimation
+    /// step entirely, to tell apart two very different explanations: a bad
+    /// *estimate* for this new architecture (this succeeds, offloads
+    /// something real) vs. a genuine incompatibility (this also fails or
+    /// silently offloads 0). Run with `--nocapture` and read the real
+    /// `load_tensors:` line -- this only asserts the *call itself*
+    /// doesn't error, since introspecting the exact offloaded count isn't
+    /// exposed as a clean Rust API here.
+    #[test]
+    #[ignore = "needs the real, large Qwen 3.8 GGUF -- set QWEN_3_8_GGUF_PATH to run"]
+    fn qwen_3_8_with_a_forced_gpu_layer_count_skips_the_broken_auto_fit() {
+        let Ok(path) = std::env::var("QWEN_3_8_GGUF_PATH") else {
+            eprintln!("skipping: QWEN_3_8_GGUF_PATH not set");
+            return;
+        };
+        let registry = SwapRegistry::new();
+        let backend = Arc::new(LlamaBackend::init().expect("init backend"));
+        let session = LlamaSession::load_with_gpu_layers(
+            &registry,
+            backend,
+            &path,
+            Residency::Lazy,
+            GpuLayers::Fixed(30),
+        );
+        assert!(session.is_ok(), "forced offload should at least not error: {:?}", session.err());
     }
 
     #[test]
