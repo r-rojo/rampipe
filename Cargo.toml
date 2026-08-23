@@ -113,3 +113,20 @@ required-features = ["client"]
 [[bin]]
 name = "rampiped"
 required-features = ["llama"]
+
+# Both use `rampipe::client`. Without this, `cargo test --features
+# template` tries to build them and fails on an unresolved import --
+# which is how the suite came to be unrunnable for a while without
+# anyone noticing.
+[[example]]
+name = "rampiped_hibernate_smoke"
+required-features = ["client"]
+
+[[example]]
+name = "sampling_from_config"
+required-features = ["client"]
+
+# Reports what each model on this host resolves to. Needs only the
+# settings type, so it builds without a backend.
+[[example]]
+name = "resolve_model_settings"
