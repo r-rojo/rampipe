@@ -9,5 +9,6 @@ fn main() {
             p.file_name().unwrap().to_string_lossy(),
             settings.sampling_for(&p),
             entry.and_then(|e| e.note.as_deref()).unwrap_or("(none)"));
+        println!("    max_new_tokens: {:?}", settings.max_new_tokens_for(&p));
     }
 }

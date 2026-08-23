@@ -253,7 +253,7 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario, out_dir: &Path) 
         let outcome = match client.generate(
             &model_path,
             &scenario.prompt,
-            max_new_tokens,
+            Some(max_new_tokens),
             None,
             None,
             None,
@@ -363,7 +363,7 @@ fn run_concurrent_phase(
                         .generate(
                             &model_path,
                             &prompt,
-                            max_new_tokens,
+                            Some(max_new_tokens),
                             None,
                             None,
                             None,
@@ -463,7 +463,7 @@ fn run_churn_phase(
             let outcome = match client.generate(
                 model_path,
                 &scenario.prompt,
-                max_new_tokens,
+                Some(max_new_tokens),
                 None,
                 None,
                 None,

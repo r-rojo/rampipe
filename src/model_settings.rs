@@ -90,6 +90,20 @@ pub struct Entry {
     pub presence_penalty: f32,
     #[serde(default)]
     pub penalty_last_n: i32,
+    /// How much a model may generate in one turn.
+    ///
+    /// A fact about the model in the same way the penalties are -- what
+    /// it can produce coherently in one go, and how much room a caller
+    /// has to give it. Here rather than in the caller for the reason
+    /// this whole module exists: `agent99` held `1500` as a literal
+    /// copied out of an example, and a model asked to write a 136-line
+    /// test file was guillotined at exactly that number, mid-expression,
+    /// with the fragment written to disk.
+    ///
+    /// `None` leaves it to the caller, which is what a classifier turn
+    /// wanting sixteen tokens should do.
+    #[serde(default)]
+    pub max_new_tokens: Option<i32>,
     /// Free text, so the file records *where a number came from*. Not
     /// decoration: the whole failure this module fixes was a value
     /// nobody could trace back to its source.
@@ -159,6 +173,13 @@ impl ModelSettings {
             .or(self.default.as_ref())
     }
 
+    /// How much `model_path` may generate in one turn, when a caller did
+    /// not say.
+    #[must_use]
+    pub fn max_new_tokens_for(&self, model_path: &Path) -> Option<i32> {
+        self.entry_for(model_path).and_then(|entry| entry.max_new_tokens)
+    }
+
     /// What to sample with for `model_path` when a caller did not say.
     #[must_use]
     pub fn sampling_for(&self, model_path: &Path) -> WireSampling {
@@ -189,6 +210,20 @@ mod tests {
 
     fn settings(text: &str) -> ModelSettings {
         toml::from_str(text).expect("parse")
+    }
+
+    /// The cap belongs to the model, not to whichever program is
+    /// driving it. See `Entry::max_new_tokens`.
+    #[test]
+    fn a_generation_cap_can_be_configured_per_model() {
+        let config = settings("[models.big]\nmax_new_tokens = 8192\n\n[models.small]\nrepeat_penalty = 1.1\n");
+        assert_eq!(config.max_new_tokens_for(Path::new("/m/big-Q4.gguf")), Some(8192));
+        assert_eq!(
+            config.max_new_tokens_for(Path::new("/m/small-Q4.gguf")),
+            None,
+            "an entry that says nothing about it leaves the caller's own value alone"
+        );
+        assert_eq!(config.max_new_tokens_for(Path::new("/m/unknown.gguf")), None);
     }
 
     #[test]

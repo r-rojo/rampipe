@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     let turn1 = conversation
         .send(
             "Say the single word: pong",
-            8,
+            Some(8),
             None,
             None,
             None,
@@ -79,7 +79,7 @@ fn main() -> anyhow::Result<()> {
     let turn2 = restored
         .send(
             "What single word did I just ask you to say?",
-            16,
+            Some(16),
             None,
             None,
             None,

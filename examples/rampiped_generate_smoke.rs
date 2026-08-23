@@ -51,7 +51,7 @@ fn main() -> Result<()> {
         .generate(
             &model_path,
             "What is the capital of France? Reply with just the city name.",
-            MAX_NEW_TOKENS,
+            Some(MAX_NEW_TOKENS),
             None,
             None,
             None,

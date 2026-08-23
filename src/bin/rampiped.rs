@@ -536,6 +536,10 @@ fn handle_request(
         .expect("ensure_loaded just guaranteed this");
     let sampling =
         wire_sampling_to_sampling(request.sampling.unwrap_or_else(|| settings.sampling_for(&request.model_path)));
+    let max_new_tokens = request
+        .max_new_tokens
+        .or_else(|| settings.max_new_tokens_for(&request.model_path))
+        .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
     let grammar_complete = request
         .grammar_completion
         .clone()
@@ -543,7 +547,7 @@ fn handle_request(
     let result = session
         .generate(
             &request.prompt,
-            request.max_new_tokens,
+            max_new_tokens,
             sampling,
             request.grammar.as_deref(),
             request.assistant_prefill.as_deref(),
@@ -609,6 +613,7 @@ fn handle_conversation(
     // not per turn. The model does not change under a conversation, so
     // neither does what its card recommends.
     let configured = settings.sampling_for(&request.model_path);
+    let configured_tokens = settings.max_new_tokens_for(&request.model_path);
     let mut writer = stream;
 
     // Caught and turned into a real `ConversationResponse::Err` here,
@@ -724,6 +729,7 @@ fn handle_conversation(
                     conversation.as_mut().expect("conversation is only ever taken by a Snapshot arm that unconditionally returns right after"),
                     &turn,
                     configured,
+                    configured_tokens,
                 );
                 let tokens_generated = match &response {
                     ConversationResponse::Turn {
@@ -810,6 +816,7 @@ fn run_conversation_turn(
     conversation: &mut Conversation<'_>,
     turn: &ConversationTurnRequest,
     configured: WireSampling,
+    configured_tokens: Option<i32>,
 ) -> ConversationResponse {
     let _guard = state.lock().expect("rampiped model store lock poisoned");
     // A caller that said nothing gets what this model is configured
@@ -819,6 +826,10 @@ fn run_conversation_turn(
     // the model, but a classifier turn and a coding turn against that
     // same model legitimately want different sampling.
     let sampling = wire_sampling_to_sampling(turn.sampling.unwrap_or(configured));
+    // Caller first, then the model's own configured cap, then a floor
+    // generous enough to write a file. The old default was the caller's
+    // problem to get right and it got it wrong.
+    let max_new_tokens = turn.max_new_tokens.or(configured_tokens).unwrap_or(DEFAULT_MAX_NEW_TOKENS);
     let grammar_complete = turn
         .grammar_completion
         .clone()
@@ -828,14 +839,14 @@ fn run_conversation_turn(
     let result = match &turn.tool_results {
         Some(results) => conversation.send_tool_results(
             results,
-            turn.max_new_tokens,
+            max_new_tokens,
             sampling,
             turn.grammar.as_deref(),
             grammar_complete.as_deref(),
         ),
         None => conversation.send(
             &turn.message,
-            turn.max_new_tokens,
+            max_new_tokens,
             sampling,
             turn.grammar.as_deref(),
             turn.assistant_prefill.as_deref(),
@@ -871,6 +882,24 @@ fn bind_fresh(path: &Path) -> Result<UnixListener> {
     }
     UnixListener::bind(path).with_context(|| format!("binding socket {}", path.display()))
 }
+
+/// What a model may generate in one turn when neither the caller nor
+/// the configuration says.
+///
+/// Chosen to fit a source file rather than a sentence -- the value this
+/// replaces was 1500, and a model asked for a 136-line test file was cut
+/// off at exactly that, mid-expression.
+///
+/// Not larger, because this trades against the context window and the
+/// trade is not free. A first attempt at 8192 failed outright:
+/// `conversation turn (8219 new tokens) doesn't fit even after dropping
+/// every droppable turn`. Even where it fits, it fits by starving
+/// everything else -- an agent working a real task opens with a briefing
+/// measured at 2887 tokens and then accumulates a tool result per turn.
+///
+/// A caller that knows its own context budget should say so; this is
+/// only what happens when nobody does.
+const DEFAULT_MAX_NEW_TOKENS: i32 = 4096;
 
 fn main() -> Result<()> {
     let args = match parse_args()? {

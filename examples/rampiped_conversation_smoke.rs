@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     let turn1 = conversation
         .send(
             "My favorite number is 7492. Just say OK.",
-            MAX_NEW_TOKENS,
+            Some(MAX_NEW_TOKENS),
             None,
             None,
             None,
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     let turn2 = conversation
         .send(
             "What's my favorite number? Reply with just the digits, nothing else.",
-            MAX_NEW_TOKENS,
+            Some(MAX_NEW_TOKENS),
             None,
             None,
             None,
@@ -88,7 +88,7 @@ fn main() -> Result<()> {
     let grammar_turn = conversation
         .send(
             "Is 7492 an even number? Answer with exactly one word: YES or NO.",
-            5,
+            Some(5),
             None,
             Some("root ::= \"YES\" | \"NO\"\n"),
             None,
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
         .generate(
             &model_b,
             "Say hello in exactly one word.",
-            10,
+            Some(10),
             None,
             None,
             None,
@@ -135,7 +135,7 @@ fn main() -> Result<()> {
     let turn3 = conversation
         .send(
             "One more time, what's my favorite number? Just the digits.",
-            MAX_NEW_TOKENS,
+            Some(MAX_NEW_TOKENS),
             None,
             None,
             None,

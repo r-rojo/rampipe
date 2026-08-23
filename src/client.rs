@@ -122,7 +122,9 @@ impl RampipedClient {
         &self,
         model_path: &Path,
         prompt: &str,
-        max_new_tokens: i32,
+        // `None` lets the daemon apply what this model is configured
+        // for -- see `rampipe::model_settings`.
+        max_new_tokens: Option<i32>,
         // `None` lets the daemon apply what this model is configured
         // for -- see `rampipe::model_settings`.
         sampling: Option<WireSampling>,
@@ -368,7 +370,9 @@ impl RampipedConversation {
     pub fn send(
         &mut self,
         message: &str,
-        max_new_tokens: i32,
+        // `None` lets the daemon apply what this model is configured
+        // for -- see `rampipe::model_settings`.
+        max_new_tokens: Option<i32>,
         sampling: Option<WireSampling>,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
@@ -399,7 +403,9 @@ impl RampipedConversation {
     pub fn send_tool_results(
         &mut self,
         results: &[String],
-        max_new_tokens: i32,
+        // `None` lets the daemon apply what this model is configured
+        // for -- see `rampipe::model_settings`.
+        max_new_tokens: Option<i32>,
         sampling: Option<WireSampling>,
         grammar: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
@@ -569,7 +575,7 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         let outcome = RampipedConversation::send(
             self,
             message,
-            max_new_tokens,
+            Some(max_new_tokens),
             Some(sampling_to_wire(sampling)),
             grammar,
             assistant_prefill,
@@ -605,7 +611,7 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         let outcome = RampipedConversation::send_tool_results(
             self,
             results,
-            max_new_tokens,
+            Some(max_new_tokens),
             Some(sampling_to_wire(sampling)),
             grammar,
             grammar_completion,

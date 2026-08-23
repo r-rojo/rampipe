@@ -15,21 +15,31 @@ fn main() {
     )
     .expect("settings");
     println!("configured for this model: {:?}", settings.sampling_for(&model));
+    println!("configured max_new_tokens:  {:?}", settings.max_new_tokens_for(&model));
 
     let mut c = RampipedConversation::open(
-        &socket, &model, 2048, WireOverflowPolicy::Fail, None, None, Vec::new(), None,
+        &socket, &model, 8192, WireOverflowPolicy::DropOldestTurns, None, None, Vec::new(), None,
     )
     .expect("open");
 
     // The whole point: nothing said about sampling.
-    let none = c.send("Reply with exactly: OK", 8, None, None, None, None).expect("send with None");
+    let none = c.send("Reply with exactly: OK", Some(8), None, None, None, None).expect("send with None");
     println!("sampling: None      -> {:?}", none.text.trim());
+
+    // And the cap: nothing said about either, so the daemon applies the
+    // model's own 8192 rather than a number this program invented.
+    let long = c
+        .send("Count from 1 to 30, one number per line, nothing else.", None, None, None, None, None)
+        .expect("send with no cap");
+    let lines = long.text.trim().lines().count();
+    println!("max_new_tokens: None -> {} tokens, {lines} lines", long.tokens_generated);
+    assert!(long.tokens_generated > 8, "a turn with no cap must not be limited to the 8 used above");
 
     // And an explicit value still wins.
     let explicit = c
         .send(
             "Reply with exactly: OK",
-            8,
+            Some(8),
             Some(WireSampling::Greedy { penalties: WirePenalties::default() }),
             None,
             None,

@@ -190,7 +190,9 @@ pub enum ToolFormat {
 pub struct GenerateRequest {
     pub model_path: PathBuf,
     pub prompt: String,
-    pub max_new_tokens: i32,
+    /// `None` means "as much as this model is configured for".
+    #[serde(default)]
+    pub max_new_tokens: Option<i32>,
     /// `None` means "use whatever this model is configured for" -- the
     /// same rule as [`ConversationTurnRequest::sampling`], and for the
     /// same reason: a one-shot generation against a model should get
@@ -494,7 +496,16 @@ pub struct ConversationTurnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_results: Option<Vec<String>>,
     pub message: String,
-    pub max_new_tokens: i32,
+    /// `None` means "as much as this model is configured for" -- see
+    /// `crate::model_settings::Entry::max_new_tokens`.
+    ///
+    /// Same rule as `sampling` below, and for a sharper reason: a
+    /// caller holding this number as a literal is how a model came to
+    /// be cut off mid-file, with the fragment written to disk. A caller
+    /// that genuinely wants a small answer -- a classifier turn wanting
+    /// five tokens -- still says so and still wins.
+    #[serde(default)]
+    pub max_new_tokens: Option<i32>,
     /// `None` means "use whatever this model is configured for" -- see
     /// `crate::model_settings`.
     ///
@@ -665,7 +676,7 @@ mod tests {
         let request = ConversationRequest::Turn(ConversationTurnRequest {
             tool_results: None,
             message: "hi".to_string(),
-            max_new_tokens: 16,
+            max_new_tokens: Some(16),
             sampling: Some(WireSampling::Greedy {
                 penalties: WirePenalties::default(),
             }),

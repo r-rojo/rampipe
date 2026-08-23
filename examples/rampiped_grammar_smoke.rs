@@ -34,7 +34,7 @@ fn main() -> Result<()> {
         .generate(
             &model_path,
             prompt,
-            5,
+            Some(5),
             None,
             Some("root ::= \"YES\" | \"NO\"\n"),
             None,
@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     match client.generate(
         &model_path,
         "hello",
-        5,
+        Some(5),
         None,
         Some("root ::= \"unterminated"),
         None,

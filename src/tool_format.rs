@@ -554,23 +554,46 @@ fn parse_delimited_calls(
 /// for that call again."
 #[must_use]
 pub fn ends_mid_call(text: &str, format: &ToolFormat) -> bool {
-    let call_open = match format {
-        ToolFormat::Json { call_open, .. } | ToolFormat::Delimited { call_open, .. } => call_open,
+    let (call_open, call_close) = match format {
+        ToolFormat::Json { call_open, call_close, .. } | ToolFormat::Delimited { call_open, call_close, .. } => {
+            (call_open, call_close)
+        }
     };
     if call_open.is_empty() {
         return false;
     }
     let trimmed = text.trim_end();
 
-    // A complete `call_open` with nothing usable after it: the marker
-    // arrived, the call did not.
-    if trimmed.ends_with(call_open) {
-        return true;
+    // A call that opened and never closed.
+    //
+    // This is the general case and it is the one that matters. The
+    // checks below only ever caught a severed *opener* -- text ending
+    // with the marker or a prefix of it -- which misses the shape that
+    // actually costs something: a call that announced itself, named its
+    // function, began an argument, and was cut off inside it.
+    //
+    // Measured, on a real run: a model was asked to write a 136-line
+    // test file with a 1500-token budget. Generation stopped at exactly
+    // the cap, in the middle of `assert_eq!(&buffer`. The parser
+    // recovered that as a complete `write` call with a truncated
+    // `content`, the harness wrote the fragment to disk, and four
+    // verification attempts then failed on "this file contains an
+    // unclosed delimiter" before the run was abandoned. Nothing anywhere
+    // reported that the reply had been cut off.
+    //
+    // A caller cannot defend against that without being told, and this
+    // is the only place that knows what a complete call looks like.
+    if let Some(opened) = trimmed.rfind(call_open.as_str()) {
+        let after = &trimmed[opened + call_open.len()..];
+        if call_close.is_empty() || !after.contains(call_close.as_str()) {
+            return true;
+        }
     }
-    // ...or any non-empty prefix of it, which is the severed case
-    // above. Walked by character boundary, never by byte offset: a
-    // marker containing a multi-byte character would otherwise panic
-    // on the slice.
+
+    // ...or a non-empty prefix of the opener at the very end, which the
+    // rule above cannot see because the marker never completed. Walked
+    // by character boundary, never by byte offset: a marker containing a
+    // multi-byte character would otherwise panic on the slice.
     call_open
         .char_indices()
         .skip(1)
@@ -687,6 +710,44 @@ pub fn derive_tool_result_spans(template_text: &str, render: RenderFn<'_>) -> Op
 
 #[cfg(test)]
 mod tests {
+    /// Two calls where only the second was severed.
+    #[test]
+    fn a_severed_second_call_is_caught_even_though_the_first_closed() {
+        let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
+        let text = "<tool_call>\n<function=read>\n<parameter=path>\na.rs\n</parameter>\n</function>\n</tool_call>\n\
+                    <tool_call>\n<function=write>\n<parameter=path>\nb.rs\n</parameter>\n<parameter=content>\nfn b() {";
+        assert!(ends_mid_call(text, &format), "the last call never closed");
+    }
+
+    /// A write cut off mid-argument -- which is what a token cap does to
+    /// a model writing a file longer than its budget.
+    ///
+    /// Measured on a real run: `agent99` asked for a 136-line test file
+    /// with `MAX_NEW_TOKENS = 1500`, generation stopped at exactly the
+    /// cap in the middle of an `assert_eq!(&buffer`, and the harness
+    /// wrote that to disk. Four verify attempts then failed on `this
+    /// file contains an unclosed delimiter` and the run was abandoned.
+    ///
+    /// `ends_mid_call` did not fire because it only looks for a severed
+    /// call *opener*. Whether the severed call also *parses* decides
+    /// whether a caller can defend itself at all.
+    #[test]
+    fn a_call_severed_mid_argument_is_reported_as_truncated() {
+        let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
+        let severed = "<tool_call>\n<function=write>\n<parameter=path>\ntests/a.rs\n</parameter>\n\
+                       <parameter=content>\nfn a() {\n    assert_eq!(&buffer";
+
+        let calls = parse_tool_calls(severed, &format);
+        let flagged = ends_mid_call(severed, &format);
+        assert!(
+            calls.is_empty() || flagged,
+            "a call cut off mid-argument must either fail to parse or be flagged as truncated -- \
+             otherwise a half-written file reaches disk. parsed {} call(s), flagged {flagged}",
+            calls.len()
+        );
+    }
+
+
     use super::*;
 
     /// A stub renderer standing in for minijinja: enough of the two real
@@ -981,6 +1042,10 @@ mod tests {
         let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
         let complete = "<tool_call>\n<function=read>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>";
         assert!(!ends_mid_call(complete, &format), "{complete}");
+        // Still parses, and still is not flagged: the unterminated-call
+        // rule must not sweep up calls that really did close.
+        assert_eq!(parse_tool_calls(complete, &format).len(), 1);
+        assert!(!ends_mid_call("I have finished the task.", &format), "prose is not a severed call");
     }
 
     #[test]
