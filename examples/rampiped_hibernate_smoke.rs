@@ -11,7 +11,7 @@
 
 use anyhow::Context;
 use rampipe::client::RampipedConversation;
-use rampipe::protocol::{GrammarCompletion, SnapshotRef, WireOverflowPolicy, WireSampling};
+use rampipe::protocol::{GrammarCompletion, SnapshotRef, WireOverflowPolicy};
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
@@ -30,6 +30,9 @@ fn main() -> anyhow::Result<()> {
         4096,
         WireOverflowPolicy::Fail,
         None,
+        None,
+        Vec::new(),
+        None,
     )
     .context("opening conversation")?;
 
@@ -37,7 +40,7 @@ fn main() -> anyhow::Result<()> {
         .send(
             "Say the single word: pong",
             8,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None::<GrammarCompletion>,
@@ -65,6 +68,11 @@ fn main() -> anyhow::Result<()> {
             state_path: state_path.clone(),
             meta_path: meta_path.clone(),
         }),
+        // A restored conversation already carries its own system prompt
+        // and tools in its reloaded KV cache -- see `open`.
+        None,
+        Vec::new(),
+        None,
     )
     .context("reopening from snapshot")?;
 
@@ -72,7 +80,7 @@ fn main() -> anyhow::Result<()> {
         .send(
             "What single word did I just ask you to say?",
             16,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None::<GrammarCompletion>,

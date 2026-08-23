@@ -11,6 +11,9 @@ keywords = ["llm", "mmap", "gguf", "inference", "memory"]
 categories = ["memory-management", "science"]
 
 [dependencies]
+# Per-model sampling settings -- the half of a model's configuration
+# that a GGUF does not carry. See `src/model_settings.rs`.
+toml = "0.8"
 llama-cpp-2 = { version = "0.1.154", optional = true }
 llama-cpp-sys-2 = { version = "0.1.154", optional = true }
 encoding_rs = { version = "0.8", optional = true }
@@ -38,7 +41,16 @@ serde_yaml = "0.9"
 mach2 = "0.6.0"
 
 [features]
-llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs", "dep:minijinja", "dep:minijinja-contrib"]
+# Jinja chat-template rendering (`crate::chat_template`), split out of
+# `llama` so the template-shaped parts of this crate can be built and
+# tested without compiling llama.cpp at all. That matters concretely for
+# `tool_format`: its whole job is deriving a model's tool-calling format
+# from a real chat template, and validating that against a real
+# template is the only test that proves it -- one that would otherwise
+# have cost a full llama.cpp build to run. `llama` implies it, so no
+# existing consumer has to ask for it.
+template = ["dep:minijinja", "dep:minijinja-contrib"]
+llama = ["dep:llama-cpp-2", "dep:llama-cpp-sys-2", "dep:encoding_rs", "template"]
 # GPU offload via llama.cpp's CUDA backend. Requires the CUDA toolkit
 # (`nvcc`) on the build machine -- the driver alone (`nvidia-smi`
 # working) is not enough, since this compiles GPU kernels at build

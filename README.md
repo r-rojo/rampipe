@@ -217,3 +217,42 @@ Dual-licensed under either of
 - MIT license ([LICENSE-MIT](LICENSE-MIT))
 
 at your option.
+
+## Per-model sampling settings
+
+A GGUF carries its chat template, which is why `rampipe` can *derive*
+how a model emits tool calls rather than being told. It carries no
+sampling metadata at all -- no temperature, no top-k, no repetition
+penalty, and no standard field to put them in. Those numbers live on the
+model card, in prose, and nothing here reads webpages.
+
+So: discovered where discoverable, configured where not.
+
+`~/.rampipe/models.toml` (or `--model-settings <path>`):
+
+```toml
+[models."Qwen3-Coder-30B-A3B-Instruct"]
+repeat_penalty  = 1.18
+frequency_penalty = 0.1
+presence_penalty  = 1.0
+penalty_last_n    = 512
+note = "from the model card"
+```
+
+Keys match as a **substring of the model's file name, longest wins**, so
+one entry covers every quantisation of the same model -- the settings
+belong to the model, not to the file, and requantising should not mean
+re-entering them.
+
+`note` is free text and exists because the failure this replaces was a
+number nobody could trace: `1.18` lived as a literal in an example
+program, was copied into a real worker, and disagreed with a
+separately-reasoned config elsewhere in the same codebase that neither
+of them read.
+
+A caller that sends `sampling: None` gets the model's configured
+settings. A caller that sends a value wins -- a classifier turn and a
+coding turn against the same model legitimately want different sampling.
+A missing file is not an error; a malformed one is, because applying
+defaults while the operator believes their settings are in force is
+exactly the failure this exists to stop.

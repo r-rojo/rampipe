@@ -102,6 +102,27 @@ pub struct GenerationResult {
     /// verbose logging (or debugging a model behaving oddly) can see
     /// what the model was actually shown, not just what it said back.
     pub formatted_prompt: String,
+    /// Tool calls decoded out of `text`, when this conversation was
+    /// opened with tools *and* the model's own template yielded a
+    /// derivable call format (see `crate::tool_format`).
+    ///
+    /// Always empty otherwise -- including for a conversation that
+    /// offered tools and simply got a prose answer, which is the
+    /// ordinary "the model chose to reply rather than act" case and not
+    /// distinguishable from "no tools offered" by looking here. `text`
+    /// is left completely untouched either way: the raw generation is
+    /// what a caller logs and what a grammar-based fallback still
+    /// parses, so this is strictly additive information rather than a
+    /// replacement for it.
+    pub tool_calls: Vec<crate::protocol::ToolCall>,
+    /// Generation stopped part-way into a tool call rather than because
+    /// the model finished -- see `crate::tool_format::ends_mid_call`.
+    ///
+    /// Computed here, where the model's derived call format lives,
+    /// rather than by the caller: a daemon-backed client deliberately
+    /// does not link the template machinery (that is the whole point of
+    /// the `client` feature), so it could not work this out itself.
+    pub truncated_tool_call: bool,
 }
 
 /// What a [`ConversationHandle`] call can fail with, across every
@@ -154,6 +175,44 @@ pub trait ConversationHandle {
         assistant_prefill: Option<&str>,
         grammar_completion: Option<crate::protocol::GrammarCompletion>,
     ) -> Result<GenerationResult, ConversationError>;
+    /// Whether tool calls emitted in this conversation can actually be
+    /// decoded -- true only when tools were offered at open time *and*
+    /// the backend can parse this model's call format.
+    ///
+    /// A caller uses this to choose between the tool-calling path and
+    /// its own prompt-and-grammar arrangement. It deliberately answers
+    /// a question an empty `GenerationResult::tool_calls` cannot: a turn
+    /// with no calls is the ordinary "the model chose to answer rather
+    /// than act" case, indistinguishable from "calls are never coming."
+    ///
+    /// Defaults to `false` so an implementation predating tool calling
+    /// keeps compiling and correctly reports that it has none.
+    fn supports_tool_calls(&self) -> bool {
+        false
+    }
+
+    /// Feeds executed tool results back and generates the next turn --
+    /// see `crate::llama::Conversation::send_tool_results`, which this
+    /// mirrors.
+    ///
+    /// Defaults to an error rather than silently falling back to
+    /// [`ConversationHandle::send`]: an implementation that cannot do
+    /// this also returns `false` from `supports_tool_calls`, so a
+    /// caller reaching here has ignored that and wants to know, not to
+    /// have its results quietly reshaped into user text.
+    fn send_tool_results(
+        &mut self,
+        _results: &[String],
+        _max_new_tokens: i32,
+        _sampling: Sampling,
+        _grammar: Option<&str>,
+        _grammar_completion: Option<crate::protocol::GrammarCompletion>,
+    ) -> Result<GenerationResult, ConversationError> {
+        Err(ConversationError::Backend(
+            "this conversation backend does not support tool results".to_string(),
+        ))
+    }
+
     fn turn_count(&self) -> usize;
     /// Persists this conversation's KV cache to `state_path`/`meta_path`
     /// and, on success, leaves it unusable for anything further -- a

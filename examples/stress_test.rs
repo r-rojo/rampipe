@@ -37,7 +37,6 @@
 use anyhow::{Context, Result};
 use hf_hub::HFClientSync;
 use rampipe::client::RampipedClient;
-use rampipe::protocol::WireSampling;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -255,7 +254,7 @@ fn run_sequential(client: &RampipedClient, scenario: &Scenario, out_dir: &Path) 
             &model_path,
             &scenario.prompt,
             max_new_tokens,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,
@@ -365,7 +364,7 @@ fn run_concurrent_phase(
                             &model_path,
                             &prompt,
                             max_new_tokens,
-                            WireSampling::Greedy,
+                            None,
                             None,
                             None,
                             None,
@@ -465,7 +464,7 @@ fn run_churn_phase(
                 model_path,
                 &scenario.prompt,
                 max_new_tokens,
-                WireSampling::Greedy,
+                None,
                 None,
                 None,
                 None,

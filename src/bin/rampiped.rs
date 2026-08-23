@@ -40,6 +40,7 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use rampipe::llama::{
     Conversation, ConversationOptions, LlamaSession, OverflowPolicy, Pooling, Sampling,
 };
+use rampipe::model_settings::ModelSettings;
 use rampipe::protocol::{
     ClientMessage, ConversationRequest, ConversationResponse, ConversationTurnRequest,
     EmbedRequest, EmbedResponse, GenerateRequest, GenerateResponse, OpenConversationRequest,
@@ -80,6 +81,9 @@ enum ParsedArgs {
 struct Args {
     socket: PathBuf,
     budget_fraction: f64,
+    /// Where per-model sampling settings live. Defaults to
+    /// `~/.rampipe/models.toml`; a missing file is not an error.
+    model_settings: Option<PathBuf>,
 }
 
 fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
@@ -120,6 +124,7 @@ fn parse_args() -> Result<ParsedArgs> {
     Ok(ParsedArgs::Run(Args {
         socket,
         budget_fraction,
+        model_settings: take_flag_value(&mut args, "--model-settings")?.map(PathBuf::from),
     }))
 }
 
@@ -422,7 +427,7 @@ impl SharedState {
 /// one line, done); `OpenConversation` hands the rest of this
 /// connection's lifetime to [`handle_conversation`], which reads and
 /// replies to any number of further turns on the same connection.
-fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<()> {
+fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>, settings: &ModelSettings) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning connection stream")?);
     let mut line = String::new();
     reader.read_line(&mut line).context("reading request")?;
@@ -430,7 +435,7 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
 
     match message {
         ClientMessage::Generate(request) => {
-            let response = match handle_request(state, &request) {
+            let response = match handle_request(state, &request, settings) {
                 Ok(response) => response,
                 Err(error) => GenerateResponse::Err {
                     message: format!("{error:#}"),
@@ -452,7 +457,7 @@ fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>) -> Result<(
             Ok(())
         }
         ClientMessage::OpenConversation(request) => {
-            handle_conversation(stream, reader, state, request)
+            handle_conversation(stream, reader, state, request, settings)
         }
         ClientMessage::Status => {
             let response = handle_status(state);
@@ -521,6 +526,7 @@ fn handle_status(state: &Mutex<SharedState>) -> rampipe::protocol::StatusRespons
 fn handle_request(
     state: &Mutex<SharedState>,
     request: &GenerateRequest,
+    settings: &ModelSettings,
 ) -> Result<GenerateResponse> {
     let mut state = state.lock().expect("rampiped model store lock poisoned");
     state.ensure_loaded(&request.model_path)?;
@@ -528,7 +534,8 @@ fn handle_request(
         .sessions
         .get(&request.model_path)
         .expect("ensure_loaded just guaranteed this");
-    let sampling = wire_sampling_to_sampling(request.sampling);
+    let sampling =
+        wire_sampling_to_sampling(request.sampling.unwrap_or_else(|| settings.sampling_for(&request.model_path)));
     let grammar_complete = request
         .grammar_completion
         .clone()
@@ -596,7 +603,12 @@ fn handle_conversation(
     mut reader: BufReader<UnixStream>,
     state: &Mutex<SharedState>,
     request: OpenConversationRequest,
+    settings: &ModelSettings,
 ) -> Result<()> {
+    // Resolved once, at open, from the path this conversation named --
+    // not per turn. The model does not change under a conversation, so
+    // neither does what its card recommends.
+    let configured = settings.sampling_for(&request.model_path);
     let mut writer = stream;
 
     // Caught and turned into a real `ConversationResponse::Err` here,
@@ -646,6 +658,9 @@ fn handle_conversation(
             let options = ConversationOptions {
                 n_ctx,
                 overflow: wire_overflow_to_overflow(request.overflow),
+                system: request.system.clone(),
+                tools: request.tools.clone(),
+                tool_format: request.tool_format.clone(),
             };
             session
                 .open_conversation(options)
@@ -672,7 +687,19 @@ fn handle_conversation(
         }
     };
 
-    let response = ConversationResponse::Opened;
+    // `OpenedWithTools` only when tools were actually offered -- see
+    // that variant's own doc comment for why this is a separate variant
+    // rather than a field, and what a bare `Opened` tells a client that
+    // did offer them.
+    let response = if request.tools.is_empty() {
+        ConversationResponse::Opened
+    } else {
+        ConversationResponse::OpenedWithTools {
+            supports_tool_calls: conversation
+                .as_ref()
+                .is_some_and(rampipe::llama::Conversation::supports_tool_calls),
+        }
+    };
     serde_json::to_writer(&mut writer, &response).context("encoding response")?;
     writer.write_all(b"\n").context("writing response")?;
 
@@ -696,12 +723,14 @@ fn handle_conversation(
                     state,
                     conversation.as_mut().expect("conversation is only ever taken by a Snapshot arm that unconditionally returns right after"),
                     &turn,
+                    configured,
                 );
                 let tokens_generated = match &response {
                     ConversationResponse::Turn {
                         tokens_generated, ..
                     } => Some(*tokens_generated),
                     ConversationResponse::Opened
+                    | ConversationResponse::OpenedWithTools { .. }
                     | ConversationResponse::Snapshotted
                     | ConversationResponse::Err { .. } => None,
                 };
@@ -780,27 +809,47 @@ fn run_conversation_turn(
     state: &Mutex<SharedState>,
     conversation: &mut Conversation<'_>,
     turn: &ConversationTurnRequest,
+    configured: WireSampling,
 ) -> ConversationResponse {
     let _guard = state.lock().expect("rampiped model store lock poisoned");
-    let sampling = wire_sampling_to_sampling(turn.sampling);
+    // A caller that said nothing gets what this model is configured
+    // for; a caller that said something wins. See
+    // `ConversationTurnRequest::sampling` for why that is the right way
+    // round -- the model's own recommended settings are a fact about
+    // the model, but a classifier turn and a coding turn against that
+    // same model legitimately want different sampling.
+    let sampling = wire_sampling_to_sampling(turn.sampling.unwrap_or(configured));
     let grammar_complete = turn
         .grammar_completion
         .clone()
         .map(rampipe::protocol::GrammarCompletion::into_predicate);
-    let result = conversation.send(
-        &turn.message,
-        turn.max_new_tokens,
-        sampling,
-        turn.grammar.as_deref(),
-        turn.assistant_prefill.as_deref(),
-        grammar_complete.as_deref(),
-    );
+    // A result turn and a message turn differ only in which of these
+    // two the daemon calls -- see `ConversationTurnRequest::tool_results`.
+    let result = match &turn.tool_results {
+        Some(results) => conversation.send_tool_results(
+            results,
+            turn.max_new_tokens,
+            sampling,
+            turn.grammar.as_deref(),
+            grammar_complete.as_deref(),
+        ),
+        None => conversation.send(
+            &turn.message,
+            turn.max_new_tokens,
+            sampling,
+            turn.grammar.as_deref(),
+            turn.assistant_prefill.as_deref(),
+            grammar_complete.as_deref(),
+        ),
+    };
     match result {
         Ok(result) => ConversationResponse::Turn {
             text: result.text,
             tokens_generated: result.tokens_generated,
             time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
             formatted_prompt: result.formatted_prompt,
+            tool_calls: result.tool_calls,
+            truncated_tool_call: result.truncated_tool_call,
         },
         Err(error) => ConversationResponse::Err {
             message: format!("{error:#}"),
@@ -840,6 +889,29 @@ fn main() -> Result<()> {
     // connection queue in the kernel accept backlog and then get served,
     // not "no such file" because the socket path didn't exist yet.
     let listener = bind_fresh(&args.socket)?;
+    // Loaded once at startup and shared. A parse error is fatal on
+    // purpose: carrying on with defaults while the operator believes
+    // their settings are in force is the exact failure this file exists
+    // to stop -- see `rampipe::model_settings`.
+    let settings_path = args
+        .model_settings
+        .clone()
+        .or_else(ModelSettings::default_path)
+        .unwrap_or_else(|| PathBuf::from("models.toml"));
+    let settings = Arc::new(ModelSettings::load(&settings_path).with_context(|| {
+        format!("reading model settings from {}", settings_path.display())
+    })?);
+    if settings.models.is_empty() && settings.default.is_none() {
+        println!("rampiped: no per-model settings at {} -- callers get what they send", settings_path.display());
+    } else {
+        println!(
+            "rampiped: model settings from {} ({} model(s){})",
+            settings_path.display(),
+            settings.models.len(),
+            if settings.default.is_some() { ", plus a default" } else { "" }
+        );
+    }
+
     let backend = LlamaBackend::init().context("llama.cpp backend init")?;
     let state = Arc::new(Mutex::new(SharedState::new(backend, args.budget_fraction)));
 
@@ -852,8 +924,9 @@ fn main() -> Result<()> {
             }
         };
         let state = Arc::clone(&state);
+        let settings = Arc::clone(&settings);
         thread::spawn(move || {
-            if let Err(error) = handle_connection(stream, &state) {
+            if let Err(error) = handle_connection(stream, &state, &settings) {
                 eprintln!("rampiped: connection error: {error:#}");
             }
         });

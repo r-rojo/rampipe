@@ -185,41 +185,11 @@ pub struct ChatWrap {
 /// class of problem -- confirmed live (a standalone probe against this
 /// exact template) that registering it alone, with no template changes,
 /// makes the render succeed.
-fn render_messages(
-    template_text: &str,
-    messages: &[(&str, &str)],
-    add_generation_prompt: bool,
-) -> Option<String> {
-    use minijinja::{Environment, Value, context};
+use crate::chat_template::render_messages;
 
-    let mut env = Environment::new();
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_function(
-        "raise_exception",
-        |msg: String| -> Result<Value, minijinja::Error> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                msg,
-            ))
-        },
-    );
-    env.add_template("chat", template_text).ok()?;
-    let tmpl = env.get_template("chat").ok()?;
-
-    let rendered_messages: Vec<Value> = messages
-        .iter()
-        .map(|(role, content)| context! { role => *role, content => *content })
-        .collect();
-    let ctx =
-        context! { messages => rendered_messages, add_generation_prompt => add_generation_prompt };
-    tmpl.render(ctx).ok()
-}
-
-/// Single-user-turn convenience wrapper over [`render_messages`] -- the
-/// one shape `LlamaSession::formatted_prompt` (one-shot `generate()`)
-/// actually needs.
+/// Single-user-turn convenience wrapper over
+/// [`crate::chat_template::render_messages`] -- the one shape
+/// `LlamaSession::formatted_prompt` (one-shot `generate()`) needs.
 fn render_with_minijinja(template_text: &str, prompt: &str) -> Option<String> {
     render_messages(template_text, &[("user", prompt)], true)
 }
@@ -967,6 +937,12 @@ impl LlamaSession {
             time_to_first_token,
             tokens_generated,
             formatted_prompt,
+            // A one-shot `generate()` has no conversation, and so no
+            // tool list and no derived format -- tools are a
+            // `Conversation`-level arrangement (see
+            // `ConversationOptions::tools`).
+            tool_calls: Vec::new(),
+            truncated_tool_call: false,
         })
     }
 
@@ -1042,13 +1018,28 @@ impl LlamaSession {
         let ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
-        let template = self
+        let template_text = self
             .model
             .chat_template(None)
             .ok()
             .and_then(|template| template.to_str().ok().map(str::to_string))
-            .and_then(|text| derive_conversation_template(&text))
             .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
+        let template = derive_conversation_template(&template_text)
+            .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
+
+        let ToolSetup {
+            opening,
+            system_for_first_turn,
+            tool_format,
+            tool_result_spans,
+            capabilities,
+        } = prepare_tools(
+            &template_text,
+            &template,
+            options.system.as_deref(),
+            &options.tools,
+            options.tool_format.as_ref(),
+        );
 
         Ok(Conversation {
             ctx,
@@ -1060,6 +1051,13 @@ impl LlamaSession {
             turns: Vec::new(),
             overflow,
             tokens: Vec::new(),
+            opening,
+            system_for_first_turn,
+            tool_format,
+            tool_result_spans,
+            capabilities,
+            tools: options.tools,
+            configured_tool_format: options.tool_format,
         })
     }
 
@@ -1101,12 +1099,13 @@ impl LlamaSession {
         let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
         let n_ctx = ctx.n_ctx() as i32;
 
-        let template = self
+        let template_text = self
             .model
             .chat_template(None)
             .ok()
             .and_then(|template| template.to_str().ok().map(str::to_string))
-            .and_then(|text| derive_conversation_template(&text))
+            .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
+        let template = derive_conversation_template(&template_text)
             .ok_or(LlamaSessionError::ConversationTemplateUnavailable)?;
 
         // `n_ctx` (the real, freshly-queried context size) rather than
@@ -1114,6 +1113,18 @@ impl LlamaSession {
         // this is what llama.cpp itself is actually about to fill.
         let tokens = ctx.state_load_file(state_path, n_ctx as usize)?;
         let committed_pos = tokens.len() as i32;
+
+        // A restored conversation's system block and tool list are
+        // already *in* the KV cache being reloaded -- they were decoded
+        // into the opening when it was first created, and re-rendering
+        // them here would either duplicate them or, worse, disagree with
+        // what is physically resident. So no system text and no tool
+        // list is passed: `opening` and `system_for_first_turn` are
+        // moot (`turns` is non-empty, so neither is ever consulted
+        // again), while the tool *format* is re-derived from the same
+        // template, since parsing the next reply still needs it.
+        let ToolSetup { tool_format, tool_result_spans, capabilities, .. } =
+            prepare_tools(&template_text, &template, None, &meta.tools, meta.tool_format.as_ref());
 
         Ok(Conversation {
             ctx,
@@ -1125,6 +1136,13 @@ impl LlamaSession {
             turns: meta.turns,
             overflow: meta.overflow,
             tokens,
+            opening: String::new(),
+            system_for_first_turn: None,
+            tool_format,
+            tool_result_spans,
+            capabilities,
+            tools: meta.tools,
+            configured_tool_format: meta.tool_format,
         })
     }
 
@@ -1225,6 +1243,48 @@ pub enum OverflowPolicy {
 pub struct ConversationOptions {
     pub n_ctx: NonZeroU32,
     pub overflow: OverflowPolicy,
+    /// Instructions rendered into the model's own *system* block rather
+    /// than prepended to the first user message.
+    ///
+    /// Everything this crate's callers send was previously user text --
+    /// `render_with_minijinja` renders exactly one `("user", prompt)`
+    /// message, and there was no `"system"` role anywhere in the crate.
+    /// So a caller's standing instructions ("you are a coding agent,
+    /// here are your tools") competed for attention with the actual
+    /// request, in the position a model is trained to treat as the
+    /// request. Rendered once into the conversation's opening, since
+    /// that is where a template puts it and where the KV cache can hold
+    /// it for the whole conversation.
+    ///
+    /// Ignored, with the text folded into the first user turn instead,
+    /// when the model's template has no system block --
+    /// `crate::tool_format::ChatCapabilities::system` is how that is
+    /// discovered rather than assumed.
+    pub system: Option<String>,
+    /// Tools to offer, rendered in whatever shape this model's template
+    /// renders tools -- see `crate::tool_format`.
+    ///
+    /// Known at open time rather than per turn because that is where
+    /// every template studied puts them: inside the system block, ahead
+    /// of the first message. That also makes them free per turn, since
+    /// the opening is decoded into the KV cache exactly once.
+    ///
+    /// Empty or `None` renders no tool list at all, which is not the
+    /// same as an empty one: a template branching on `tools is defined`
+    /// must see nothing when a caller offers nothing.
+    pub tools: Vec<crate::protocol::ToolSpec>,
+    /// A tool-call format supplied by the host, used when
+    /// `crate::tool_format::derive_tool_call_format` declines to derive
+    /// one from this model's template.
+    ///
+    /// This is the configured half of "ask the model if you can,
+    /// otherwise be told": derivation handles the two families real
+    /// templates use, and a model whose template renders calls some
+    /// third way is a config entry rather than a silent wrong guess or
+    /// a hard failure. Deliberately a *fallback* and not an override --
+    /// a template that can answer for itself is more trustworthy than a
+    /// config file that can drift from the model it describes.
+    pub tool_format: Option<crate::protocol::ToolFormat>,
 }
 
 /// The fixed spans of literal text a [`Conversation`] composes each new
@@ -1370,6 +1430,21 @@ struct ConversationSnapshotMeta {
     n_ctx: i32,
     overflow: OverflowPolicy,
     turns: Vec<TurnBoundary>,
+    /// The tool list this conversation was opened with, so a reopened
+    /// one can re-derive how to parse the next reply's tool calls.
+    ///
+    /// `#[serde(default)]` is load-bearing, not tidiness: real snapshot
+    /// sidecars written before this field existed are sitting on disk
+    /// right now (`~/.agentpipe/hibernated/*.meta.json`), and a
+    /// non-defaulting field would make every one of them fail to parse
+    /// -- turning "this model gained tool support" into "every
+    /// hibernated session is unreadable."
+    #[serde(default)]
+    tools: Vec<crate::protocol::ToolSpec>,
+    /// See `ConversationOptions::tool_format`. `#[serde(default)]` for
+    /// the same snapshot-compatibility reason as `tools` above.
+    #[serde(default)]
+    tool_format: Option<crate::protocol::ToolFormat>,
 }
 
 /// A single, still-open multi-turn exchange against one resident model --
@@ -1402,6 +1477,104 @@ pub struct Conversation<'a> {
     /// actually matches what's physically resident, not just an
     /// approximation of it.
     tokens: Vec<LlamaToken>,
+    /// Text opening the conversation, decoded once before the first
+    /// turn's own content. Usually `template.first_turn_open`, but
+    /// replaced by a real render when a system prompt or tool list has
+    /// to go in it -- see [`prepare_tools`].
+    opening: String,
+    /// System text that could *not* be rendered as a system block
+    /// because this model's template has none, to be folded into the
+    /// first user turn instead. `None` whenever the template does
+    /// support one (the normal case), since then it is already inside
+    /// `opening`.
+    system_for_first_turn: Option<String>,
+    /// How this model writes a tool call, when it was derivable and
+    /// tools were actually offered. `None` means [`Conversation::send`]
+    /// reports no tool calls at all, which is correct for a
+    /// conversation that offered no tools.
+    tool_format: Option<crate::protocol::ToolFormat>,
+    /// How this template renders a sequence of tool results -- see
+    /// `crate::tool_format::ToolResultSpans`.
+    tool_result_spans: Option<crate::tool_format::ToolResultSpans>,
+    capabilities: crate::tool_format::ChatCapabilities,
+    /// The tool list this conversation was opened with, kept only so
+    /// [`Conversation::save_state`] can record it -- a reopened
+    /// conversation needs it to re-derive how to parse tool calls,
+    /// and nothing else here reads it.
+    tools: Vec<crate::protocol::ToolSpec>,
+    /// The host-supplied fallback format, kept only so
+    /// [`Conversation::save_state`] can record it alongside `tools` --
+    /// a reopened conversation needs both to rebuild the same parser.
+    configured_tool_format: Option<crate::protocol::ToolFormat>,
+}
+
+/// What [`prepare_tools`] worked out about this conversation's opening
+/// and this model's tool-calling surface.
+struct ToolSetup {
+    opening: String,
+    system_for_first_turn: Option<String>,
+    tool_format: Option<crate::protocol::ToolFormat>,
+    tool_result_spans: Option<crate::tool_format::ToolResultSpans>,
+    capabilities: crate::tool_format::ChatCapabilities,
+}
+
+/// Decides, once per conversation, how a system prompt and tool list
+/// reach the model -- by asking the model's own template rather than
+/// assuming any of it.
+///
+/// Everything here degrades rather than fails. A template with no
+/// system block still gets the system text, folded into the first user
+/// turn (which is what every caller did unconditionally before). A
+/// template whose tool-call format isn't derivable still renders the
+/// tool list, and simply reports no parsed calls -- leaving a caller
+/// free to fall back to its own prompt-and-grammar arrangement. Nothing
+/// about offering tools is allowed to make a conversation unopenable.
+fn prepare_tools(
+    template_text: &str,
+    template: &ConversationTemplate,
+    system: Option<&str>,
+    tools: &[crate::protocol::ToolSpec],
+    configured_format: Option<&crate::protocol::ToolFormat>,
+) -> ToolSetup {
+    let render = crate::chat_template::probe_renderer();
+    let capabilities = crate::tool_format::derive_capabilities(template_text, &render);
+
+    // An empty list is not the same as no list: a template branching on
+    // `tools is defined` must see nothing when nothing is offered.
+    let offered = (!tools.is_empty() && capabilities.tools).then_some(tools);
+    let system_block = system.filter(|_| capabilities.system);
+
+    // Only re-render the opening when something actually has to go in
+    // it. Otherwise keep the derived span verbatim, so a conversation
+    // that offers neither is byte-identical to before this existed.
+    let rendered_opening = (system_block.is_some() || offered.is_some())
+        .then(|| crate::tool_format::render_opening(template_text, system_block, offered, &render))
+        .flatten();
+
+    let tool_format = offered.is_some().then(|| {
+        crate::tool_format::derive_tool_call_format(template_text, &render)
+            // Derivation first, config second -- see
+            // `ConversationOptions::tool_format`.
+            .or_else(|| configured_format.cloned())
+    }).flatten();
+    let tool_result_spans = (offered.is_some() && capabilities.tool_results)
+        .then(|| crate::tool_format::derive_tool_result_spans(template_text, &render))
+        .flatten();
+
+    let opening_carries_system = system_block.is_some() && rendered_opening.is_some();
+
+    ToolSetup {
+        opening: rendered_opening.unwrap_or_else(|| template.first_turn_open.clone()),
+        // Fold the system text into the first user turn when, and only
+        // when, it did not make it into the opening -- either because
+        // the template has no system block, or because rendering the
+        // opening failed and the derived span (which contains no system
+        // text) is being used instead.
+        system_for_first_turn: system.filter(|_| !opening_carries_system).map(str::to_string),
+        tool_format,
+        tool_result_spans,
+        capabilities,
+    }
 }
 
 impl<'a> Conversation<'a> {
@@ -1436,6 +1609,8 @@ impl<'a> Conversation<'a> {
             n_ctx: self.n_ctx,
             overflow: self.overflow,
             turns: self.turns.clone(),
+            tools: self.tools.clone(),
+            tool_format: self.configured_tool_format.clone(),
         };
         let json = serde_json::to_vec_pretty(&meta)?;
         std::fs::write(meta_path, json)?;
@@ -1466,9 +1641,16 @@ impl<'a> Conversation<'a> {
         let start = Instant::now();
 
         let (opening, add_bos) = if self.turns.is_empty() {
-            (self.template.first_turn_open.as_str(), AddBos::Always)
+            (self.opening.as_str(), AddBos::Always)
         } else {
             (self.template.turn_transition.as_str(), AddBos::Never)
+        };
+        // Only ever on the very first turn, and only for a model whose
+        // template has no system block of its own -- see
+        // `ConversationOptions::system` and `prepare_tools`.
+        let message = match (&self.system_for_first_turn, self.turns.is_empty()) {
+            (Some(system), true) => std::borrow::Cow::Owned(format!("{system}\n\n{message}")),
+            _ => std::borrow::Cow::Borrowed(message),
         };
         let mut user_text = format!("{opening}{message}{}", self.template.generation_open);
         // Prefilling the assistant turn: same technique as
@@ -1534,11 +1716,136 @@ impl<'a> Conversation<'a> {
             None => text,
         };
 
+        let tool_calls = self
+            .tool_format
+            .as_ref()
+            .map(|format| crate::tool_format::parse_tool_calls(&text, format))
+            .unwrap_or_default();
+        let truncated_tool_call = self
+            .tool_format
+            .as_ref()
+            .is_some_and(|format| crate::tool_format::ends_mid_call(&text, format));
+
         Ok(GenerationResult {
             text,
             time_to_first_token,
             tokens_generated,
             formatted_prompt: user_text,
+            tool_calls,
+            truncated_tool_call,
+        })
+    }
+
+    /// Whether tool calls emitted by this conversation can actually be
+    /// decoded -- true only when tools were offered *and* the model's
+    /// template yielded a derivable call format. A caller uses this to
+    /// choose between the tool-calling path and its own
+    /// prompt-and-grammar arrangement, rather than discovering the
+    /// answer from an empty `tool_calls` on a turn that simply didn't
+    /// call anything.
+    pub fn supports_tool_calls(&self) -> bool {
+        self.tool_format.is_some()
+    }
+
+    /// What this model's template was found to accept -- see
+    /// `crate::tool_format::ChatCapabilities`.
+    pub fn capabilities(&self) -> crate::tool_format::ChatCapabilities {
+        self.capabilities
+    }
+
+    /// Feeds executed tool results back and generates the model's next
+    /// turn, as the `tool` role its template defines rather than as an
+    /// ordinary user message.
+    ///
+    /// This is the other half of tool calling, and the reason a caller
+    /// can't just fold results into `send`: the model was trained to
+    /// read results inside its own result markers (Qwen3-Coder wraps
+    /// them in `<tool_response>` inside a user turn), and text arriving
+    /// as a plain user message is a different thing to it than a result
+    /// arriving as a result.
+    ///
+    /// `results` are concatenated in call order into one result turn,
+    /// which is what every template studied renders for several results
+    /// at once. Falls back to [`Conversation::send`] with the results
+    /// joined as ordinary text when this model has no result markers to
+    /// use -- degrading the same way everything else here does, rather
+    /// than refusing.
+    pub fn send_tool_results(
+        &mut self,
+        results: &[String],
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    ) -> Result<GenerationResult, LlamaSessionError> {
+        let Some(spans) = self.tool_result_spans.clone() else {
+            return self.send(&results.join("\n"), max_new_tokens, sampling, grammar, None, grammar_complete);
+        };
+
+        let start = Instant::now();
+        // Each result as its own element, in this template's own shape
+        // -- see `ToolResultSpans`.
+        let text_in = spans.render(results);
+        // Never `AddBos::Always`: a result turn can only ever follow a
+        // model turn that asked for it, so there is always earlier
+        // content and a second BOS would corrupt the sequence.
+        let tokens = self.model.str_to_token(&text_in, AddBos::Never)?;
+        self.ensure_room_for(tokens.len() as i32 + max_new_tokens)?;
+
+        let mut batch = LlamaBatch::new(512, 1);
+        let turn_start = self.committed_pos;
+        decode_chunked(&mut self.ctx, &mut batch, &tokens, &mut self.committed_pos)?;
+        // Recorded as a `User` turn deliberately: `TurnBoundary`'s roles
+        // exist so `drop_oldest_turns_for` can evict whole exchanges,
+        // and a result turn is evicted with the user turn it belongs to.
+        // A third role would have to be threaded through the snapshot
+        // sidecar (and every already-written one on disk) to express a
+        // distinction nothing here acts on.
+        self.turns.push(TurnBoundary {
+            role: Role::User,
+            start_pos: turn_start,
+            end_pos: self.committed_pos,
+        });
+        self.tokens.extend(tokens);
+
+        let assistant_start = self.committed_pos;
+        let (text, generated_tokens, time_to_first_token) = run_generation_loop(
+            &mut self.ctx,
+            self.model,
+            &mut batch,
+            &mut self.committed_pos,
+            self.n_ctx,
+            max_new_tokens,
+            sampling,
+            grammar,
+            grammar_complete,
+            start,
+        )?;
+        self.turns.push(TurnBoundary {
+            role: Role::Assistant,
+            start_pos: assistant_start,
+            end_pos: self.committed_pos,
+        });
+        let tokens_generated = generated_tokens.len();
+        self.tokens.extend(generated_tokens);
+
+        let tool_calls = self
+            .tool_format
+            .as_ref()
+            .map(|format| crate::tool_format::parse_tool_calls(&text, format))
+            .unwrap_or_default();
+        let truncated_tool_call = self
+            .tool_format
+            .as_ref()
+            .is_some_and(|format| crate::tool_format::ends_mid_call(&text, format));
+
+        Ok(GenerationResult {
+            text,
+            time_to_first_token,
+            tokens_generated,
+            formatted_prompt: text_in,
+            tool_calls,
+            truncated_tool_call,
         })
     }
 
@@ -1682,6 +1989,31 @@ impl ConversationHandle for Conversation<'_> {
             sampling,
             grammar,
             assistant_prefill,
+            grammar_complete.as_deref(),
+        )
+        .map_err(ConversationError::Llama)
+    }
+
+    fn supports_tool_calls(&self) -> bool {
+        Conversation::supports_tool_calls(self)
+    }
+
+    fn send_tool_results(
+        &mut self,
+        results: &[String],
+        max_new_tokens: i32,
+        sampling: Sampling,
+        grammar: Option<&str>,
+        grammar_completion: Option<crate::protocol::GrammarCompletion>,
+    ) -> Result<GenerationResult, ConversationError> {
+        let grammar_complete =
+            grammar_completion.map(crate::protocol::GrammarCompletion::into_predicate);
+        Conversation::send_tool_results(
+            self,
+            results,
+            max_new_tokens,
+            sampling,
+            grammar,
             grammar_complete.as_deref(),
         )
         .map_err(ConversationError::Llama)

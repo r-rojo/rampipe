@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use rampipe::client::RampipedClient;
-use rampipe::protocol::{GrammarCompletion, WireSampling};
+use rampipe::protocol::{GrammarCompletion};
 use std::path::PathBuf;
 
 fn main() -> Result<()> {
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
             &model_path,
             prompt,
             5,
-            WireSampling::Greedy,
+            None,
             Some("root ::= \"YES\" | \"NO\"\n"),
             None,
             Some(GrammarCompletion::ExactMatch(vec![
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
         &model_path,
         "hello",
         5,
-        WireSampling::Greedy,
+        None,
         Some("root ::= \"unterminated"),
         None,
         None,

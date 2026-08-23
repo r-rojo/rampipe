@@ -91,6 +91,97 @@ impl GrammarCompletion {
     }
 }
 
+/// One tool offered to a model, in the OpenAI-style shape every chat
+/// template targeted here expects to iterate (`{type: "function",
+/// function: {name, description, parameters}}`).
+///
+/// `parameters` is a JSON Schema object carried as an opaque
+/// `serde_json::Value` rather than a typed schema struct: templates
+/// walk it generically (Qwen3-Coder's own renders every key it doesn't
+/// recognize as its own XML element), so any structure this crate
+/// imposed would be one more thing to keep in sync with a spec it does
+/// not own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolFunction {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+impl ToolSpec {
+    /// `kind` is always `"function"` today -- every template this
+    /// targets branches on `tool.function is defined` and nothing else,
+    /// so a constructor is friendlier than making every call site repeat
+    /// the one legal value.
+    #[must_use]
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+        Self {
+            kind: "function".to_string(),
+            function: ToolFunction {
+                name: name.into(),
+                description: description.into(),
+                parameters,
+            },
+        }
+    }
+}
+
+/// One tool call a model actually emitted, already decoded out of
+/// whatever textual format its template uses (see
+/// `crate::tool_format`). `arguments` is a JSON object; the
+/// one-block-per-argument family carries every value as a string, since
+/// that format has no types of its own -- a caller wanting a number or
+/// bool parses it from the string, exactly as it would have had to from
+/// that format's raw text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+/// How a model writes a tool call, either derived from its own chat
+/// template (`crate::tool_format::derive_tool_call_format`) or, when
+/// that declines, supplied by the host alongside its other per-model
+/// settings.
+///
+/// Serializable because the derivation happens wherever the template
+/// is -- in the daemon, which owns the model -- while a client may want
+/// to know what it is getting back. Two variants, not an open-ended
+/// grammar, because these are the two families real templates actually
+/// use; anything else returns `None` from derivation and needs a config
+/// entry rather than a silent wrong guess.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ToolFormat {
+    /// A single JSON object per call, wrapped in fixed delimiters --
+    /// Hermes and Qwen2.5-style. `name_key`/`arguments_key` are
+    /// recovered by looking for the probe's *values*, never by assuming
+    /// the conventional spellings.
+    Json {
+        call_open: String,
+        call_close: String,
+        name_key: String,
+        arguments_key: String,
+    },
+    /// One delimited block per argument, values unquoted and unescaped
+    /// -- Qwen3-Coder-style:
+    /// `<tool_call><function=NAME><parameter=ARG>value</parameter>...`
+    Delimited {
+        call_open: String,
+        name_close: String,
+        arg_open: String,
+        arg_name_close: String,
+        arg_close: String,
+        call_close: String,
+    },
+}
+
 /// A request to generate against one model. `model_path` is a real,
 /// already-resolved local file path -- HF repo resolution/download stays
 /// entirely a client-side concern (taskpipe already does this), not
@@ -100,7 +191,13 @@ pub struct GenerateRequest {
     pub model_path: PathBuf,
     pub prompt: String,
     pub max_new_tokens: i32,
-    pub sampling: WireSampling,
+    /// `None` means "use whatever this model is configured for" -- the
+    /// same rule as [`ConversationTurnRequest::sampling`], and for the
+    /// same reason: a one-shot generation against a model should get
+    /// that model's own recommended settings without the caller
+    /// carrying them.
+    #[serde(default)]
+    pub sampling: Option<WireSampling>,
     /// A GBNF grammar to constrain generation to, applied on the daemon's
     /// own sampler chain -- see `rampipe::llama::LlamaSession::generate`'s
     /// `grammar` parameter, which this mirrors. `None` behaves exactly as
@@ -328,6 +425,24 @@ pub struct OpenConversationRequest {
     /// own recorded model doesn't match `model_path`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_from: Option<SnapshotRef>,
+    /// Instructions for the model's own system block -- see
+    /// `rampipe::llama::ConversationOptions::system`. `#[serde(default)]`
+    /// throughout, so a client built before these existed keeps talking
+    /// to a newer daemon unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    /// Tools to offer, rendered in this model's own tool-call format --
+    /// see `rampipe::llama::ConversationOptions::tools`. Ignored when
+    /// `restore_from` is set: a restored conversation's tools are
+    /// already in the KV cache being reloaded, and are recorded in its
+    /// own snapshot sidecar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolSpec>,
+    /// Host-supplied fallback for a model whose template can't be
+    /// probed for its call format -- see
+    /// `rampipe::llama::ConversationOptions::tool_format`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_format: Option<ToolFormat>,
 }
 
 /// Where a conversation's saved KV-cache state lives -- both paths are
@@ -366,9 +481,33 @@ pub enum ConversationRequest {
 /// turn's new text).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConversationTurnRequest {
+    /// Executed tool results to feed back, in call order, instead of
+    /// `message` -- see `rampipe::llama::Conversation::send_tool_results`
+    /// for why a result must arrive as a *result* rather than as
+    /// ordinary user text. `message` is ignored when this is `Some`.
+    ///
+    /// A field on the existing turn request rather than a new
+    /// `ConversationRequest` variant: every other parameter here
+    /// (`max_new_tokens`, `sampling`, `grammar`, ...) means exactly the
+    /// same thing for a result turn as for a message turn, so a second
+    /// variant would be this struct again minus one field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_results: Option<Vec<String>>,
     pub message: String,
     pub max_new_tokens: i32,
-    pub sampling: WireSampling,
+    /// `None` means "use whatever this model is configured for" -- see
+    /// `crate::model_settings`.
+    ///
+    /// Optional rather than required so a caller stops having to hold a
+    /// number it read off a model card. It stays overridable because a
+    /// caller sometimes genuinely knows better: a classifier turn wants
+    /// different sampling from a coding turn against the same model.
+    ///
+    /// `#[serde(default)]`, so a client built before this existed keeps
+    /// working unchanged -- it always sends a value, and a value always
+    /// wins.
+    #[serde(default)]
+    pub sampling: Option<WireSampling>,
     #[serde(default)]
     pub grammar: Option<String>,
     #[serde(default)]
@@ -385,10 +524,42 @@ pub struct ConversationTurnRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ConversationResponse {
     Opened,
+    /// Sent in place of [`ConversationResponse::Opened`] when, and only
+    /// when, the open request actually carried tools.
+    ///
+    /// A separate variant rather than a field on `Opened` keeps the
+    /// wire backward-compatible in both directions: an old client never
+    /// sends tools and so never sees this, while a new client that
+    /// sends tools and gets a bare `Opened` back has learned something
+    /// real -- it is talking to a daemon built before tool calling
+    /// existed, and must fall back rather than wait for tool calls that
+    /// can never arrive.
+    ///
+    /// `supports_tool_calls` is `false` when the tools were rendered
+    /// into the prompt but the model's template could not be probed for
+    /// how it emits calls (and no `tool_format` fallback was supplied)
+    /// -- the model will be told the tools exist and its calls will not
+    /// be parseable, which a caller needs to know *before* spending a
+    /// generation on it.
+    OpenedWithTools {
+        supports_tool_calls: bool,
+    },
     Turn {
         text: String,
         tokens_generated: usize,
         time_to_first_token_ms: u64,
+        /// See `rampipe::conversation::GenerationResult::tool_calls` --
+        /// parsed daemon-side, since that is where the model's chat
+        /// template is. `#[serde(default)]` so a newer client stays
+        /// compatible with a daemon built before this field existed
+        /// (which simply never emits tool calls).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<ToolCall>,
+        /// See `rampipe::conversation::GenerationResult::truncated_tool_call`.
+        /// `#[serde(default)]` so an older daemon (which never sets it)
+        /// simply reads as "not truncated".
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        truncated_tool_call: bool,
         /// See `GenerateResponse::Ok::formatted_prompt` -- here, just
         /// this turn's own new text (mirrors
         /// `rampipe::llama::Conversation::send`'s `GenerationResult::
@@ -447,9 +618,17 @@ mod tests {
             n_ctx: 8192,
             overflow: WireOverflowPolicy::DropOldestTurns,
             restore_from: None,
+            system: None,
+            tools: Vec::new(),
+            tool_format: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(!encoded.contains("restore_from"), "{encoded}");
+        // Same contract as `restore_from` above, for the same reason:
+        // a caller offering neither must produce the exact bytes it
+        // did before these fields existed.
+        assert!(!encoded.contains("system"), "{encoded}");
+        assert!(!encoded.contains("tools"), "{encoded}");
     }
 
     #[test]
@@ -462,6 +641,9 @@ mod tests {
                 state_path: PathBuf::from("/state/coder.state"),
                 meta_path: PathBuf::from("/state/coder.meta.json"),
             }),
+            system: None,
+            tools: Vec::new(),
+            tool_format: None,
         };
         let encoded = serde_json::to_string(&request).unwrap();
         assert!(
@@ -481,11 +663,12 @@ mod tests {
     #[test]
     fn a_turn_request_is_tagged_turn() {
         let request = ConversationRequest::Turn(ConversationTurnRequest {
+            tool_results: None,
             message: "hi".to_string(),
             max_new_tokens: 16,
-            sampling: WireSampling::Greedy {
+            sampling: Some(WireSampling::Greedy {
                 penalties: WirePenalties::default(),
-            },
+            }),
             grammar: None,
             assistant_prefill: None,
             grammar_completion: None,

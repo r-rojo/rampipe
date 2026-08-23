@@ -56,6 +56,14 @@ pub struct GenerateOutcome {
     /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
     /// comment.
     pub formatted_prompt: String,
+    /// See `rampipe::conversation::GenerationResult::tool_calls`. Parsed
+    /// daemon-side, where the model's template lives, rather than being
+    /// re-derived here: a client deliberately does not link the template
+    /// machinery (that is the whole point of the `client` feature), so
+    /// it could not parse these itself.
+    pub tool_calls: Vec<crate::protocol::ToolCall>,
+    /// See `rampipe::conversation::GenerationResult::truncated_tool_call`.
+    pub truncated_tool_call: bool,
 }
 
 /// A successful [`RampipedClient::embed`] -- one vector per input text,
@@ -115,7 +123,9 @@ impl RampipedClient {
         model_path: &Path,
         prompt: &str,
         max_new_tokens: i32,
-        sampling: WireSampling,
+        // `None` lets the daemon apply what this model is configured
+        // for -- see `rampipe::model_settings`.
+        sampling: Option<WireSampling>,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
@@ -159,6 +169,10 @@ impl RampipedClient {
                 tokens_generated,
                 time_to_first_token_ms,
                 formatted_prompt,
+                // One-shot `generate` offers no tools -- see
+                // `rampipe::llama::LlamaSession::generate`.
+                tool_calls: Vec::new(),
+                truncated_tool_call: false,
             }),
             GenerateResponse::Err { message } => Err(RampipedError::Remote(message)),
         }
@@ -242,6 +256,12 @@ impl RampipedClient {
 pub struct RampipedConversation {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// What the daemon answered about tool calling when this
+    /// conversation was opened -- see
+    /// `protocol::ConversationResponse::OpenedWithTools`. `false` both
+    /// when no tools were offered and when the daemon is an older build
+    /// that answered a bare `Opened`.
+    supports_tool_calls: bool,
     /// Completed user/assistant exchanges on this conversation, counted
     /// client-side. The daemon owns the real KV cache and its own turn
     /// boundaries; nothing in the wire protocol reports them back, so
@@ -263,12 +283,24 @@ impl RampipedConversation {
     /// fresh -- `n_ctx`/`overflow` are then ignored in favor of whatever
     /// the snapshot itself recorded (see
     /// `OpenConversationRequest::restore_from`'s own doc comment).
+    /// `system` and `tools` are forwarded to
+    /// `rampipe::llama::ConversationOptions`' own fields of the same
+    /// names -- see those for what each does and when each is ignored.
+    /// Both are inert when `restore_from` is set: a restored
+    /// conversation already holds its own in its reloaded KV cache.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each maps one-to-one onto an OpenConversationRequest field; grouping them would just be that struct again"
+    )]
     pub fn open(
         socket_path: impl Into<PathBuf>,
         model_path: &Path,
         n_ctx: u32,
         overflow: WireOverflowPolicy,
         restore_from: Option<SnapshotRef>,
+        system: Option<String>,
+        tools: Vec<crate::protocol::ToolSpec>,
+        tool_format: Option<crate::protocol::ToolFormat>,
     ) -> Result<Self, RampipedError> {
         let socket_path = socket_path.into();
         let stream =
@@ -289,6 +321,9 @@ impl RampipedConversation {
             n_ctx,
             overflow,
             restore_from,
+            system,
+            tools,
+            tool_format,
         });
         let mut payload = serde_json::to_vec(&request).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
@@ -299,10 +334,23 @@ impl RampipedConversation {
         let response: ConversationResponse =
             serde_json::from_str(line.trim()).map_err(RampipedError::Decode)?;
         match response {
+            // A bare `Opened` in reply to a request that *did* carry
+            // tools means an older daemon -- see `OpenedWithTools`'s own
+            // doc comment. Reporting `false` here is what makes a caller
+            // fall back instead of waiting for calls that cannot come.
             ConversationResponse::Opened => Ok(Self {
                 reader,
                 writer,
                 turns: 0,
+                supports_tool_calls: false,
+            }),
+            ConversationResponse::OpenedWithTools {
+                supports_tool_calls,
+            } => Ok(Self {
+                reader,
+                writer,
+                turns: 0,
+                supports_tool_calls,
             }),
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
             ConversationResponse::Turn { .. } | ConversationResponse::Snapshotted => {
@@ -321,19 +369,62 @@ impl RampipedConversation {
         &mut self,
         message: &str,
         max_new_tokens: i32,
-        sampling: WireSampling,
+        sampling: Option<WireSampling>,
         grammar: Option<&str>,
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
     ) -> Result<GenerateOutcome, RampipedError> {
-        let turn = ConversationRequest::Turn(ConversationTurnRequest {
+        self.exchange(ConversationTurnRequest {
+            tool_results: None,
             message: message.to_string(),
             max_new_tokens,
             sampling,
             grammar: grammar.map(str::to_string),
             assistant_prefill: assistant_prefill.map(str::to_string),
             grammar_completion,
-        });
+        })
+    }
+
+    /// Whether the daemon said this conversation's tool calls are
+    /// parseable -- see
+    /// `protocol::ConversationResponse::OpenedWithTools`.
+    #[must_use]
+    pub fn supports_tool_calls(&self) -> bool {
+        self.supports_tool_calls
+    }
+
+    /// Feeds executed tool results back over the wire -- the daemon
+    /// routes these to `rampipe::llama::Conversation::send_tool_results`
+    /// rather than to `send`, so they reach the model as results.
+    pub fn send_tool_results(
+        &mut self,
+        results: &[String],
+        max_new_tokens: i32,
+        sampling: Option<WireSampling>,
+        grammar: Option<&str>,
+        grammar_completion: Option<GrammarCompletion>,
+    ) -> Result<GenerateOutcome, RampipedError> {
+        self.exchange(ConversationTurnRequest {
+            tool_results: Some(results.to_vec()),
+            // Ignored daemon-side whenever `tool_results` is set (see
+            // that field's own doc comment); empty rather than
+            // duplicating the results into it, so a mistaken read of
+            // this field on either side yields nothing rather than
+            // something plausible.
+            message: String::new(),
+            max_new_tokens,
+            sampling,
+            grammar: grammar.map(str::to_string),
+            assistant_prefill: None,
+            grammar_completion,
+        })
+    }
+
+    /// One request/reply round trip on this conversation's own socket --
+    /// shared by `send` and `send_tool_results`, which differ only in
+    /// the request they build.
+    fn exchange(&mut self, turn: ConversationTurnRequest) -> Result<GenerateOutcome, RampipedError> {
+        let turn = ConversationRequest::Turn(turn);
         let mut payload = serde_json::to_vec(&turn).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
         self.writer
@@ -352,6 +443,8 @@ impl RampipedConversation {
                 tokens_generated,
                 time_to_first_token_ms,
                 formatted_prompt,
+                tool_calls,
+                truncated_tool_call,
             } => {
                 self.turns += 1;
                 Ok(GenerateOutcome {
@@ -359,10 +452,14 @@ impl RampipedConversation {
                     tokens_generated,
                     time_to_first_token_ms,
                     formatted_prompt,
+                    tool_calls,
+                    truncated_tool_call,
                 })
             }
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Opened | ConversationResponse::Snapshotted => {
+            ConversationResponse::Opened
+            | ConversationResponse::OpenedWithTools { .. }
+            | ConversationResponse::Snapshotted => {
                 Err(RampipedError::Remote(
                     "rampiped sent an unexpected response to a conversation turn".to_string(),
                 ))
@@ -404,7 +501,9 @@ impl RampipedConversation {
         match response {
             ConversationResponse::Snapshotted => Ok(()),
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
-            ConversationResponse::Opened | ConversationResponse::Turn { .. } => {
+            ConversationResponse::Opened
+            | ConversationResponse::OpenedWithTools { .. }
+            | ConversationResponse::Turn { .. } => {
                 Err(RampipedError::Remote(
                     "rampiped sent an unexpected response to a snapshot request".to_string(),
                 ))
@@ -428,6 +527,35 @@ impl RampipedConversation {
 /// linking `llama-cpp-2`) got `RampipedConversation`'s inherent `send`
 /// and nothing generic. Now that the seam lives in
 /// [`crate::conversation`], this is exactly the build that needs it.
+/// `conversation::Sampling` -> `protocol::WireSampling`. A free
+/// function rather than a closure inside one method, since both trait
+/// methods below need it and duplicating it is exactly how the two
+/// would drift.
+fn sampling_to_wire(sampling: crate::conversation::Sampling) -> WireSampling {
+    let penalties = |p: crate::conversation::Penalties| crate::protocol::WirePenalties {
+        last_n: p.last_n,
+        repeat: p.repeat,
+        freq: p.freq,
+        present: p.present,
+    };
+    match sampling {
+        crate::conversation::Sampling::Greedy { penalties: p } => WireSampling::Greedy {
+            penalties: penalties(p),
+        },
+        crate::conversation::Sampling::Temperature {
+            temperature,
+            top_k,
+            seed,
+            penalties: p,
+        } => WireSampling::Temperature {
+            temperature,
+            top_k,
+            seed,
+            penalties: penalties(p),
+        },
+    }
+}
+
 impl crate::conversation::ConversationHandle for RampipedConversation {
     fn send(
         &mut self,
@@ -438,34 +566,11 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         assistant_prefill: Option<&str>,
         grammar_completion: Option<GrammarCompletion>,
     ) -> Result<crate::conversation::GenerationResult, crate::conversation::ConversationError> {
-        let to_wire_penalties =
-            |p: crate::conversation::Penalties| crate::protocol::WirePenalties {
-                last_n: p.last_n,
-                repeat: p.repeat,
-                freq: p.freq,
-                present: p.present,
-            };
-        let sampling = match sampling {
-            crate::conversation::Sampling::Greedy { penalties } => WireSampling::Greedy {
-                penalties: to_wire_penalties(penalties),
-            },
-            crate::conversation::Sampling::Temperature {
-                temperature,
-                top_k,
-                seed,
-                penalties,
-            } => WireSampling::Temperature {
-                temperature,
-                top_k,
-                seed,
-                penalties: to_wire_penalties(penalties),
-            },
-        };
         let outcome = RampipedConversation::send(
             self,
             message,
             max_new_tokens,
-            sampling,
+            Some(sampling_to_wire(sampling)),
             grammar,
             assistant_prefill,
             grammar_completion,
@@ -480,6 +585,39 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
             time_to_first_token: std::time::Duration::from_millis(outcome.time_to_first_token_ms),
             tokens_generated: outcome.tokens_generated,
             formatted_prompt: outcome.formatted_prompt,
+            tool_calls: outcome.tool_calls,
+            truncated_tool_call: outcome.truncated_tool_call,
+        })
+    }
+
+    fn supports_tool_calls(&self) -> bool {
+        RampipedConversation::supports_tool_calls(self)
+    }
+
+    fn send_tool_results(
+        &mut self,
+        results: &[String],
+        max_new_tokens: i32,
+        sampling: crate::conversation::Sampling,
+        grammar: Option<&str>,
+        grammar_completion: Option<GrammarCompletion>,
+    ) -> Result<crate::conversation::GenerationResult, crate::conversation::ConversationError> {
+        let outcome = RampipedConversation::send_tool_results(
+            self,
+            results,
+            max_new_tokens,
+            Some(sampling_to_wire(sampling)),
+            grammar,
+            grammar_completion,
+        )
+        .map_err(|e| crate::conversation::ConversationError::Backend(e.to_string()))?;
+        Ok(crate::conversation::GenerationResult {
+            text: outcome.text,
+            time_to_first_token: std::time::Duration::from_millis(outcome.time_to_first_token_ms),
+            tokens_generated: outcome.tokens_generated,
+            formatted_prompt: outcome.formatted_prompt,
+            tool_calls: outcome.tool_calls,
+            truncated_tool_call: outcome.truncated_tool_call,
         })
     }
 

@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 use rampipe::client::{RampipedClient, RampipedConversation};
-use rampipe::protocol::{WireOverflowPolicy, WireSampling};
+use rampipe::protocol::{WireOverflowPolicy};
 use std::path::PathBuf;
 
 const MAX_NEW_TOKENS: i32 = 60;
@@ -38,14 +38,14 @@ fn main() -> Result<()> {
 
     println!("=== turn 1: context carryover over the wire ===");
     let mut conversation =
-        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail, None)
+        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail, None, None, Vec::new(), None)
             .context("opening conversation")?;
 
     let turn1 = conversation
         .send(
             "My favorite number is 7492. Just say OK.",
             MAX_NEW_TOKENS,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
         .send(
             "What's my favorite number? Reply with just the digits, nothing else.",
             MAX_NEW_TOKENS,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,
@@ -89,7 +89,7 @@ fn main() -> Result<()> {
         .send(
             "Is 7492 an even number? Answer with exactly one word: YES or NO.",
             5,
-            WireSampling::Greedy,
+            None,
             Some("root ::= \"YES\" | \"NO\"\n"),
             None,
             Some(rampipe::protocol::GrammarCompletion::ExactMatch(vec![
@@ -118,7 +118,7 @@ fn main() -> Result<()> {
             &model_b,
             "Say hello in exactly one word.",
             10,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,
@@ -136,7 +136,7 @@ fn main() -> Result<()> {
         .send(
             "One more time, what's my favorite number? Just the digits.",
             MAX_NEW_TOKENS,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,

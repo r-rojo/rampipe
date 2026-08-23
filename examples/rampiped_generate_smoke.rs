@@ -15,7 +15,6 @@
 use anyhow::{Context, Result, bail};
 use hf_hub::HFClientSync;
 use rampipe::client::RampipedClient;
-use rampipe::protocol::WireSampling;
 use std::path::PathBuf;
 
 const REPO_OWNER: &str = "Qwen";
@@ -53,7 +52,7 @@ fn main() -> Result<()> {
             &model_path,
             "What is the capital of France? Reply with just the city name.",
             MAX_NEW_TOKENS,
-            WireSampling::Greedy,
+            None,
             None,
             None,
             None,

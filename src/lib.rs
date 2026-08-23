@@ -11,7 +11,11 @@ pub mod client;
 pub mod conversation;
 #[cfg(feature = "llama")]
 pub mod llama;
+#[cfg(feature = "template")]
+pub mod chat_template;
+pub mod model_settings;
 pub mod protocol;
+pub mod tool_format;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const PAGE_SIZE: usize = 4096;
