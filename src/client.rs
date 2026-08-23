@@ -551,11 +551,15 @@ fn sampling_to_wire(sampling: crate::conversation::Sampling) -> WireSampling {
         crate::conversation::Sampling::Temperature {
             temperature,
             top_k,
+            top_p,
+            min_p,
             seed,
             penalties: p,
         } => WireSampling::Temperature {
             temperature,
             top_k,
+            top_p,
+            min_p,
             seed,
             penalties: penalties(p),
         },

@@ -416,11 +416,25 @@ fn run_generation_loop(
             Sampling::Temperature {
                 temperature,
                 top_k,
+                top_p,
+                min_p,
                 seed,
                 penalties,
             } => {
                 push_penalties(&mut stages, penalties);
                 stages.push(LlamaSampler::top_k(top_k));
+                // top_k, then top_p, then min_p, then temp, then dist --
+                // llama.cpp's own default chain order. Each is a filter
+                // over the candidate set and the order decides what each
+                // one sees; a disabled stage is skipped rather than
+                // pushed with a no-op value, so a chain built from a
+                // model's card carries only what the card asked for.
+                if top_p < 1.0 {
+                    stages.push(LlamaSampler::top_p(top_p, 1));
+                }
+                if min_p > 0.0 {
+                    stages.push(LlamaSampler::min_p(min_p, 1));
+                }
                 stages.push(LlamaSampler::temp(temperature));
                 stages.push(LlamaSampler::dist(seed));
             }

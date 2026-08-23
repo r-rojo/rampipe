@@ -154,11 +154,15 @@ fn wire_sampling_to_sampling(sampling: WireSampling) -> Sampling {
         WireSampling::Temperature {
             temperature,
             top_k,
+            top_p,
+            min_p,
             seed,
             penalties,
         } => Sampling::Temperature {
             temperature,
             top_k,
+            top_p,
+            min_p,
             seed,
             penalties: wire_penalties_to_penalties(penalties),
         },

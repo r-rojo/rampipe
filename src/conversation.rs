@@ -35,6 +35,21 @@ pub enum Sampling {
     Temperature {
         temperature: f32,
         top_k: i32,
+        /// Nucleus sampling: keep the smallest set of candidates whose
+        /// probabilities sum to this. `1.0` disables it.
+        ///
+        /// Added because it was not expressible, and the models this
+        /// serves ask for it by name -- Qwen3-Coder's own card says
+        /// `temperature=0.7, top_p=0.8, top_k=20`. Two of those three
+        /// could be set and the third could not, so "run it the way its
+        /// card says" was not a thing this crate could do.
+        top_p: f32,
+        /// Floor on a candidate's probability relative to the most
+        /// likely one. `0.0` disables it. Qwen3's guidance pairs it with
+        /// the above as `min_p=0`, which is the disabled value -- but a
+        /// setting a model asks for explicitly should be sayable even
+        /// when what it asks for is "off".
+        min_p: f32,
         seed: u32,
         penalties: Penalties,
     },

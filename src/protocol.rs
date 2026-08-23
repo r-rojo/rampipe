@@ -19,6 +19,10 @@ use std::path::PathBuf;
 /// (and of the `llama` feature) so this module compiles without
 /// `llama-cpp-2` in the dependency graph. `src/bin/rampiped.rs` converts
 /// between the two at the one point that actually needs both.
+const fn one() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum WireSampling {
     Greedy {
@@ -27,6 +31,13 @@ pub enum WireSampling {
     Temperature {
         temperature: f32,
         top_k: i32,
+        /// Nucleus sampling. `1.0` disables it. See
+        /// `conversation::Sampling::Temperature::top_p`.
+        #[serde(default = "one")]
+        top_p: f32,
+        /// Relative probability floor. `0.0` disables it.
+        #[serde(default)]
+        min_p: f32,
         seed: u32,
         penalties: WirePenalties,
     },

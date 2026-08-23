@@ -80,6 +80,12 @@ pub struct Entry {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_k: Option<i32>,
+    /// Nucleus sampling. Absent leaves it disabled.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Relative probability floor. Absent leaves it disabled.
+    #[serde(default)]
+    pub min_p: Option<f32>,
     #[serde(default)]
     pub seed: Option<u32>,
     #[serde(default = "one")]
@@ -129,6 +135,8 @@ impl Entry {
             Some(temperature) => WireSampling::Temperature {
                 temperature,
                 top_k: self.top_k.unwrap_or(40),
+                top_p: self.top_p.unwrap_or(1.0),
+                min_p: self.min_p.unwrap_or(0.0),
                 seed: self.seed.unwrap_or(0),
                 penalties,
             },
@@ -210,6 +218,44 @@ mod tests {
 
     fn settings(text: &str) -> ModelSettings {
         toml::from_str(text).expect("parse")
+    }
+
+    /// The settings a card actually asks for have to be sayable in full.
+    ///
+    /// Qwen3-Coder's own card says `temperature=0.7, top_p=0.8,
+    /// top_k=20, repetition_penalty=1.05`. Before `top_p` existed here,
+    /// two of those three could be set and the third could not, so
+    /// "run it the way its card says" was not something this crate
+    /// could do.
+    #[test]
+    fn a_cards_full_recommendation_is_expressible() {
+        let config = settings(
+            "[models.\"Qwen3-Coder\"]\ntemperature = 0.7\ntop_p = 0.8\ntop_k = 20\nmin_p = 0.0\n\
+             repeat_penalty = 1.05\n",
+        );
+        let WireSampling::Temperature { temperature, top_k, top_p, min_p, penalties, .. } =
+            config.sampling_for(Path::new("/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"))
+        else {
+            panic!("a temperature was configured, so not greedy");
+        };
+        assert_eq!(temperature, 0.7);
+        assert_eq!(top_k, 20);
+        assert_eq!(top_p, 0.8);
+        assert_eq!(min_p, 0.0);
+        assert_eq!(penalties.repeat, 1.05);
+    }
+
+    /// An entry that says nothing about them leaves both disabled --
+    /// `top_p = 1.0` and `min_p = 0.0` are the off values, and a stage
+    /// that is off is not pushed onto the chain at all.
+    #[test]
+    fn top_p_and_min_p_default_to_disabled() {
+        let config = settings("[models.x]\ntemperature = 0.7\n");
+        let WireSampling::Temperature { top_p, min_p, .. } = config.sampling_for(Path::new("/m/x.gguf")) else {
+            panic!("temperature");
+        };
+        assert_eq!(top_p, 1.0);
+        assert_eq!(min_p, 0.0);
     }
 
     /// The cap belongs to the model, not to whichever program is
