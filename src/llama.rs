@@ -1069,6 +1069,7 @@ impl LlamaSession {
             overflow,
             tokens: Vec::new(),
             opening,
+            protected_prefix: 0,
             system_for_first_turn,
             tool_format,
             tool_result_spans,
@@ -1154,6 +1155,8 @@ impl LlamaSession {
             overflow: meta.overflow,
             tokens,
             opening: String::new(),
+            // See the field's doc: not recoverable from a snapshot.
+            protected_prefix: 0,
             system_for_first_turn: None,
             tool_format,
             tool_result_spans,
@@ -1498,7 +1501,25 @@ pub struct Conversation<'a> {
     /// turn's own content. Usually `template.first_turn_open`, but
     /// replaced by a real render when a system prompt or tool list has
     /// to go in it -- see [`prepare_tools`].
+    ///
+    /// Note that this is *concatenated into the first user turn's text*
+    /// rather than decoded on its own -- see [`Conversation::send`]. Its
+    /// tokens therefore sit at the front of `turns[0]`'s span, which is
+    /// what `protected_prefix` exists to keep `drop_oldest_turns_for`
+    /// from reclaiming.
     opening: String,
+    /// How many tokens at the front of the KV cache are the `opening`,
+    /// and so must never be evicted.
+    ///
+    /// Zero means "not known", and eviction then behaves as it did
+    /// before this existed. That is the case for a conversation restored
+    /// from a snapshot: its opening was decoded by the session that
+    /// saved it, and the boundary is not recoverable from the snapshot
+    /// without re-deriving a tokenisation that has to match the resident
+    /// cache exactly. Guessing it wrong would remove the wrong positions
+    /// and corrupt the cache, which is worse than the old behaviour, so
+    /// the restore path does not guess.
+    protected_prefix: i32,
     /// System text that could *not* be rendered as a system block
     /// because this model's template has none, to be folded into the
     /// first user turn instead. `None` whenever the template does
@@ -1680,6 +1701,32 @@ impl<'a> Conversation<'a> {
             user_text.push_str(prefill);
         }
         let user_tokens = self.model.str_to_token(&user_text, add_bos)?;
+
+        // Where the opening ends and this turn's own content begins.
+        //
+        // Established once, on the first turn, because that is the only
+        // turn whose span contains the opening. `render_opening` cuts the
+        // rendered template at the user content placeholder, so the seam
+        // falls immediately after a turn-opening control token
+        // (`<|im_start|>user\n` and its equivalents) -- a boundary BPE
+        // does not merge across. Verified rather than assumed: if
+        // tokenising the two halves separately does not reproduce the
+        // whole, the boundary is not where it is believed to be, and the
+        // prefix stays unprotected rather than being protected in the
+        // wrong place. Removing the wrong KV positions would corrupt the
+        // cache, which is a worse failure than the one this prevents.
+        if self.turns.is_empty() && !opening.is_empty() {
+            let opening_tokens = self.model.str_to_token(opening, add_bos)?;
+            if user_tokens.starts_with(&opening_tokens) {
+                self.protected_prefix = opening_tokens.len() as i32;
+            } else {
+                eprintln!(
+                    "rampiped: the opening does not tokenise as a prefix of the first turn, so it \
+                     cannot be protected from context eviction. A long conversation may lose its \
+                     system block and tool definitions."
+                );
+            }
+        }
 
         // `max_new_tokens`, not just the incoming message, or a
         // conversation whose running budget is merely *tight* (not yet
@@ -1894,10 +1941,21 @@ impl<'a> Conversation<'a> {
     /// `kv_cache_seq_add` with a negative delta shifts every later
     /// position down to close the gap (RoPE-aware, per llama.cpp -- the
     /// same "context shift" its own server implements for the same
-    /// reason). Dropping the conversation's *original* first turn also
-    /// drops whatever `first_turn_open` preamble only that turn carried
-    /// -- accepted here as the same approximation a real context-shifting
-    /// inference server already makes, not fixed by re-synthesizing it.
+    /// reason).
+    ///
+    /// The opening is exempt. This used to drop it along with the first
+    /// turn, because `send` concatenates it into that turn's text and so
+    /// its tokens sit at the front of `turns[0]`'s span -- and that was
+    /// documented as an accepted approximation, "the same a real
+    /// context-shifting inference server already makes". It is not an
+    /// acceptable approximation for a caller whose system block *is* the
+    /// task. Measured: an agent whose window filled at turn 12 had its
+    /// system block and tool definitions removed and then emitted the
+    /// same malformed tool call several hundred times, because what
+    /// remained was file contents with nothing describing what a tool
+    /// call looked like or what the work was. Now `protected_prefix`
+    /// tokens at the front are never reclaimed, and the first turn is
+    /// evicted from the end of the opening rather than from position 0.
     fn drop_oldest_turns_for(&mut self, needed: i32) -> Result<(), LlamaSessionError> {
         let mut freed = 0i32;
         while self.committed_pos + needed - freed >= self.n_ctx {
@@ -1906,21 +1964,20 @@ impl<'a> Conversation<'a> {
             }
             let user = self.turns.remove(0);
             let assistant = self.turns.remove(0);
-            // Said out loud, because a caller cannot infer it and the
-            // consequence is severe. Dropping the oldest pair drops the
-            // *first* user turn -- and a caller that put its
-            // instructions there has just had them evicted. Measured: an
-            // agent whose task briefing was its first user message
-            // collapsed into repeated tokens on every turn after this
-            // fired, with a context full of file contents and nothing
-            // left telling it what it was doing. The opening (system
-            // block and tools) is decoded before any turn and survives;
-            // turn zero does not.
+            // Never into the opening. For every turn but the first this
+            // is a no-op, since their spans start past it.
+            let start = user.start_pos.max(self.protected_prefix);
+            // Said out loud, because a caller cannot infer it from the
+            // response and the consequence is severe: an exchange it
+            // believes the model can still see is gone. The first
+            // `protected_prefix` tokens -- system block and tool
+            // definitions -- are excluded, so what is named here really
+            // is only conversation.
             eprintln!(
-                "rampiped: context full ({}/{}) -- dropping the oldest exchange (positions {}..{}). \
-                 Anything a caller put in its first user turn is now gone; instructions belong in the \
-                 system block, which is never dropped.",
-                self.committed_pos, self.n_ctx, user.start_pos, assistant.end_pos
+                "rampiped: context full ({}/{}) -- dropping the oldest exchange (positions {start}..{}), \
+                 keeping the first {} tokens of opening. Anything a caller sent in that exchange is no \
+                 longer visible to the model.",
+                self.committed_pos, self.n_ctx, assistant.end_pos, self.protected_prefix
             );
             // `turns` must strictly alternate User/Assistant starting
             // with User -- every push site above maintains that, so a
@@ -1928,13 +1985,15 @@ impl<'a> Conversation<'a> {
             // just an unlucky conversation shape.
             debug_assert_eq!(user.role, Role::User);
             debug_assert_eq!(assistant.role, Role::Assistant);
-            let removed = assistant.end_pos - user.start_pos;
+            let removed = assistant.end_pos - start;
+            if removed <= 0 {
+                // The whole pair is inside the protected prefix. Nothing
+                // can be freed by dropping it, and looping would spin.
+                return Err(LlamaSessionError::ConversationTooLargeToTrim);
+            }
 
-            self.ctx.kv_cache_seq_rm(
-                0,
-                Some(user.start_pos as u32),
-                Some(assistant.end_pos as u32),
-            )?;
+            self.ctx
+                .kv_cache_seq_rm(0, Some(start as u32), Some(assistant.end_pos as u32))?;
             self.ctx
                 .kv_cache_seq_add(0, Some(assistant.end_pos as u32), None, -removed)?;
 
@@ -1944,12 +2003,11 @@ impl<'a> Conversation<'a> {
             }
             self.committed_pos -= removed;
             // Keeps `self.tokens` in the same lockstep with the real KV
-            // cache the position bookkeeping above maintains -- the
-            // dropped turn is always the front of the cache (nothing
-            // remaining starts before position 0 once every earlier drop
-            // has already shifted things down), so it's always the
-            // front `removed` tokens being trimmed here too.
-            self.tokens.drain(0..removed as usize);
+            // cache the position bookkeeping above maintains. The dropped
+            // span begins at `start`, not at zero: the opening stays put
+            // at the front, and every earlier drop has already shifted
+            // what follows down to meet it.
+            self.tokens.drain(start as usize..assistant.end_pos as usize);
             freed += removed;
         }
         Ok(())

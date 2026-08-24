@@ -87,6 +87,10 @@ name = "conversation_overflow_smoke"
 required-features = ["llama"]
 
 [[example]]
+name = "conversation_keeps_its_opening"
+required-features = ["llama"]
+
+[[example]]
 name = "rampiped_embed_smoke"
 required-features = ["client"]
 
