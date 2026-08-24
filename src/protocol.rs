@@ -164,10 +164,17 @@ pub struct ToolCall {
 ///
 /// Serializable because the derivation happens wherever the template
 /// is -- in the daemon, which owns the model -- while a client may want
-/// to know what it is getting back. Two variants, not an open-ended
-/// grammar, because these are the two families real templates actually
-/// use; anything else returns `None` from derivation and needs a config
-/// entry rather than a silent wrong guess.
+/// to know what it is getting back. Three named families, not an
+/// open-ended grammar, because these are the shapes real templates
+/// actually use; anything else returns `None` from derivation and needs
+/// a config entry rather than a silent wrong guess.
+///
+/// The count is load bearing in one direction only: a fourth family is
+/// a variant here plus a body reader in `tool_format::scan_calls`, and
+/// nothing else. It was two families until Gemma 4 arrived needing
+/// `Separated`, and this comment still said two afterwards -- which is
+/// the argument for keeping the number in one place rather than in
+/// prose.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolFormat {
     /// A single JSON object per call, wrapped in fixed delimiters --

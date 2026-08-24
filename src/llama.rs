@@ -371,6 +371,10 @@ fn run_generation_loop(
     sampling: Sampling,
     grammar: Option<&str>,
     grammar_complete: Option<&dyn Fn(&str) -> bool>,
+    // Ends the turn when the model stops calling tools and starts
+    // writing the harness's half of the conversation. See
+    // `crate::tool_format::TurnEnd` for the run this cost.
+    turn_end: Option<&crate::tool_format::TurnEnd>,
     start: Instant,
 ) -> Result<(String, Vec<LlamaToken>, Duration), LlamaSessionError> {
     let mut decoder = encoding_rs::UTF_8.new_decoder();
@@ -580,6 +584,18 @@ fn run_generation_loop(
         if let Some(is_complete) = grammar_complete
             && is_complete(&text)
         {
+            break;
+        }
+
+        // The model has finished calling tools and moved on to inventing
+        // their results. Everything from the last closer onward is
+        // discarded, and the turn ends here rather than at the token cap.
+        //
+        // Checked on the accumulated text rather than the token, because
+        // a closer is not a token: `}<tool_call|>` arrives in pieces and
+        // may land alongside whatever follows it in the same piece.
+        if let Some(cut) = turn_end.and_then(|end| end.reached(&text)) {
+            text.truncate(cut);
             break;
         }
 
@@ -928,6 +944,9 @@ impl LlamaSession {
         let mut n_cur = 0i32;
         let mut batch = LlamaBatch::new(512, 1);
         decode_chunked(&mut ctx, &mut batch, &tokens_list, &mut n_cur)?;
+        // No conversation, so no derived format to end a turn with.
+        // This path is one-shot completion, not the agent loop.
+        let turn_end: Option<crate::tool_format::TurnEnd> = None;
         let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut ctx,
             &self.model,
@@ -938,6 +957,7 @@ impl LlamaSession {
             sampling,
             grammar,
             grammar_complete,
+            turn_end.as_ref(),
             start,
         )?;
         let tokens_generated = generated_tokens.len();
@@ -1755,6 +1775,10 @@ impl<'a> Conversation<'a> {
         self.tokens.extend(user_tokens);
 
         let assistant_start = self.committed_pos;
+        // Built per turn from the format this conversation derived, so a
+        // model that keeps generating past its own tool call is stopped
+        // rather than left to invent the results. See `TurnEnd`.
+        let turn_end = self.tool_format.as_ref().map(crate::tool_format::TurnEnd::of);
         let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut self.ctx,
             self.model,
@@ -1765,6 +1789,7 @@ impl<'a> Conversation<'a> {
             sampling,
             grammar,
             grammar_complete,
+            turn_end.as_ref(),
             start,
         )?;
         self.turns.push(TurnBoundary {
@@ -1875,6 +1900,10 @@ impl<'a> Conversation<'a> {
         self.tokens.extend(tokens);
 
         let assistant_start = self.committed_pos;
+        // Built per turn from the format this conversation derived, so a
+        // model that keeps generating past its own tool call is stopped
+        // rather than left to invent the results. See `TurnEnd`.
+        let turn_end = self.tool_format.as_ref().map(crate::tool_format::TurnEnd::of);
         let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut self.ctx,
             self.model,
@@ -1885,6 +1914,7 @@ impl<'a> Conversation<'a> {
             sampling,
             grammar,
             grammar_complete,
+            turn_end.as_ref(),
             start,
         )?;
         self.turns.push(TurnBoundary {

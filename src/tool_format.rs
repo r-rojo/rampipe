@@ -566,28 +566,47 @@ pub fn parse_tool_calls(text: &str, format: &ToolFormat) -> Vec<ToolCall> {
     }
 }
 
-fn parse_json_calls(
+/// Walks every call in `text` and hands each one's body to `read_body`.
+///
+/// # Why the three families share this
+///
+/// They differ only in how a call's *body* becomes a name and
+/// arguments. Finding the bodies is identical -- scan for the opener,
+/// take everything up to the closer, continue after it -- and it was
+/// written out three times, once per family, along with the same two
+/// off-by-one slices and the same "no closer means severed" comment.
+/// A fourth family should have to describe only what is different
+/// about it.
+///
+/// The missing-closer case is the one worth keeping in one place: a
+/// call generation ran out of tokens part-way through still has its
+/// arguments read, because a severed call should cost that call rather
+/// than the whole turn. Getting that wrong in one family and right in
+/// the other two is precisely the kind of drift copying invites.
+///
+/// Every family now finds its closer through [`find_close`] rather than
+/// a plain `find`. That was already the general rule -- see
+/// `close_candidates`, whose own documentation notes that a closer with
+/// no internal tag boundary "yields only itself, which is why this costs
+/// the other families nothing". Two of the three simply were not using
+/// it, so a template whose closer carried trailing framing would have
+/// been handled in one family and not the others.
+fn scan_calls(
     text: &str,
     call_open: &str,
     call_close: &str,
-    name_key: &str,
-    arguments_key: &str,
+    mut read_body: impl FnMut(&str) -> Option<ToolCall>,
 ) -> Vec<ToolCall> {
     let mut calls = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find(call_open) {
         let after_open = &rest[start + call_open.len()..];
-        // An unterminated final call means generation was cut off --
-        // take what's there rather than losing it silently.
-        let (body, remainder) = match after_open.find(call_close) {
-            Some(end) => (&after_open[..end], &after_open[end + call_close.len()..]),
+        let (body, remainder) = match find_close(after_open, call_close) {
+            Some((end, len)) => (&after_open[..end], &after_open[end + len..]),
             None => (after_open, ""),
         };
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim())
-            && let Some(name) = value.get(name_key).and_then(serde_json::Value::as_str)
-        {
-            let arguments = value.get(arguments_key).cloned().unwrap_or(serde_json::Value::Null);
-            calls.push(ToolCall { name: name.to_string(), arguments });
+        if let Some(call) = read_body(body) {
+            calls.push(call);
         }
         if remainder.is_empty() {
             break;
@@ -597,20 +616,32 @@ fn parse_json_calls(
     calls
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one independently-derived span of the format being parsed; grouping them would just be ToolFormat::Delimited destructured again"
-)]
-/// Extracts calls in the separated family.
+/// A name and its arguments, once a family has read them out of a body.
 ///
-/// The value of the *last* argument runs to the call's close rather than
-/// to a separator, which is the whole difference from
-/// [`parse_delimited_calls`] and the reason this is its own function
-/// rather than a flag on that one.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one independently-derived span of the format being parsed; grouping them would just be ToolFormat::Separated destructured again"
-)]
+/// `None` for a body with no name in it: an empty name is not a call,
+/// and every family agreed on that separately before this existed.
+fn named(name: String, arguments: serde_json::Map<String, serde_json::Value>) -> Option<ToolCall> {
+    if name.is_empty() {
+        return None;
+    }
+    Some(ToolCall { name, arguments: serde_json::Value::Object(arguments) })
+}
+
+fn parse_json_calls(
+    text: &str,
+    call_open: &str,
+    call_close: &str,
+    name_key: &str,
+    arguments_key: &str,
+) -> Vec<ToolCall> {
+    scan_calls(text, call_open, call_close, |body| {
+        let value = serde_json::from_str::<serde_json::Value>(body.trim()).ok()?;
+        let name = value.get(name_key)?.as_str()?.to_string();
+        let arguments = value.get(arguments_key).cloned().unwrap_or(serde_json::Value::Null);
+        (!name.is_empty()).then_some(ToolCall { name, arguments })
+    })
+}
+
 /// Where a call ends, and how much of `call_close` closed it.
 ///
 /// # Why the whole closer is not always there
@@ -735,6 +766,16 @@ fn find_sep(text: &str, arg_sep: &str) -> Option<usize> {
     text.find(arg_sep)
 }
 
+/// Extracts calls in the separated family.
+///
+/// The value of the *last* argument runs to the call's close rather than
+/// to a separator, which is the whole difference from
+/// [`parse_delimited_calls`] and the reason this is its own function
+/// rather than a flag on that one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independently-derived span of the format being parsed; grouping them would just be ToolFormat::Separated destructured again"
+)]
 fn parse_separated_calls(
     text: &str,
     call_open: &str,
@@ -745,36 +786,16 @@ fn parse_separated_calls(
     arg_sep: &str,
     call_close: &str,
 ) -> Vec<ToolCall> {
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(call_open) {
-        let after_open = &rest[start + call_open.len()..];
-        let (body, remainder) = match find_close(after_open, call_close) {
-            Some((end, len)) => (&after_open[..end], &after_open[end + len..]),
-            // No closer means a call the generation ran out of tokens
-            // part-way through. Its arguments are still read: a severed
-            // call should cost that call, not the whole turn.
-            None => (after_open, ""),
-        };
-
-        if let Some(name_end) = body.find(name_close) {
-            let name = body[..name_end].trim().to_string();
-            let mut arguments = serde_json::Map::new();
-            let args = &body[name_end + name_close.len()..];
-            for (key, value) in split_args(args, arg_name_close, value_open, arg_close, arg_sep) {
-                arguments.insert(key, serde_json::Value::String(value.to_string()));
-            }
-            if !name.is_empty() {
-                calls.push(ToolCall { name, arguments: serde_json::Value::Object(arguments) });
-            }
+    scan_calls(text, call_open, call_close, |body| {
+        let name_end = body.find(name_close)?;
+        let name = body[..name_end].trim().to_string();
+        let mut arguments = serde_json::Map::new();
+        let args = &body[name_end + name_close.len()..];
+        for (key, value) in split_args(args, arg_name_close, value_open, arg_close, arg_sep) {
+            arguments.insert(key, serde_json::Value::String(value.to_string()));
         }
-
-        if remainder.is_empty() {
-            break;
-        }
-        rest = remainder;
-    }
-    calls
+        named(name, arguments)
+    })
 }
 
 fn parse_delimited_calls(
@@ -786,49 +807,125 @@ fn parse_delimited_calls(
     arg_close: &str,
     call_close: &str,
 ) -> Vec<ToolCall> {
-    let mut calls = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(call_open) {
-        let after_open = &rest[start + call_open.len()..];
-        let (body, remainder) = match after_open.find(call_close) {
-            Some(end) => (&after_open[..end], &after_open[end + call_close.len()..]),
-            None => (after_open, ""),
+    scan_calls(text, call_open, call_close, |body| {
+        let name_end = body.find(name_close)?;
+        let name = body[..name_end].trim().to_string();
+        let mut arguments = serde_json::Map::new();
+        let mut args_rest = &body[name_end + name_close.len()..];
+        while let Some(arg_start) = args_rest.find(arg_open) {
+            let after_arg_open = &args_rest[arg_start + arg_open.len()..];
+            let Some(arg_name_end) = after_arg_open.find(arg_name_close) else { break };
+            let arg_name = after_arg_open[..arg_name_end].trim().to_string();
+            let after_name = &after_arg_open[arg_name_end + arg_name_close.len()..];
+            // A value is whatever sits before the closer, verbatim
+            // -- this family quotes and escapes nothing, so trimming
+            // beyond the delimiters' own newlines would corrupt
+            // file content passed as an argument.
+            let (value, next) = match after_name.find(arg_close) {
+                Some(value_end) => (&after_name[..value_end], &after_name[value_end + arg_close.len()..]),
+                None => (after_name, ""),
+            };
+            arguments.insert(arg_name, serde_json::Value::String(value.to_string()));
+            if next.is_empty() {
+                break;
+            }
+            args_rest = next;
+        }
+        named(name, arguments)
+    })
+}
+
+/// When a turn is over because the model has stopped making tool calls
+/// and started writing the harness's half of the conversation.
+///
+/// # The failure this exists for
+///
+/// Nothing here ever ended generation except the model's own
+/// end-of-generation token or the token cap. That is fine for a model
+/// that reliably stops after a tool call, which Qwen3-Coder does, and it
+/// is why this gap went unnoticed for the entire life of the crate.
+///
+/// Gemma 4 12B QAT does not. Measured on `pcapgen` task 6: it emitted
+/// one correct `read`, then kept generating -- and wrote its own tool
+/// result, verbatim, `Read /home/rrojo/.agent99/workspace/pcapgen/
+/// src/timeline.rs (lines 111-120):` followed by invented file content.
+/// It role-played the whole agent loop inside a single 4096-token
+/// generation: 166 tool calls in one turn, alternating two `cargo test`
+/// invocations about eighty times each, until the conversation
+/// overflowed its context window and the run died.
+///
+/// The harness then *ran* those calls. They parsed perfectly -- they
+/// were syntactically ideal -- so a hundred and sixty commands the model
+/// invented while imagining a debugging session were executed for real.
+/// They happened to be `cargo test`. A hallucinated `write` would have
+/// landed on disk, which is the same family as the truncated call that
+/// wrote a source fragment and cost a run.
+///
+/// # Why not simply stop at the first closer
+///
+/// Because a turn holding two genuine calls is legitimate and used --
+/// `parse_tool_calls` returns a `Vec` and both loops iterate it. Cutting
+/// at the first closer would silently discard the second call of every
+/// multi-call turn, trading this bug for a quieter one.
+///
+/// So the rule is: after a call closes, keep going while what follows
+/// could still *be* another call -- whitespace, or the opener, or a
+/// prefix of the opener that has not finished arriving. The moment the
+/// model writes something that is none of those, it has moved on from
+/// calling tools, and everything from that closer onward is discarded.
+#[derive(Debug, Clone)]
+pub struct TurnEnd {
+    call_open: String,
+    closers: Vec<String>,
+}
+
+impl TurnEnd {
+    /// Reads the openers and closers out of a derived format.
+    #[must_use]
+    pub fn of(format: &ToolFormat) -> Self {
+        let (call_open, call_close) = match format {
+            ToolFormat::Json { call_open, call_close, .. }
+            | ToolFormat::Delimited { call_open, call_close, .. }
+            | ToolFormat::Separated { call_open, call_close, .. } => (call_open, call_close),
         };
-
-        if let Some(name_end) = body.find(name_close) {
-            let name = body[..name_end].trim().to_string();
-            let mut arguments = serde_json::Map::new();
-            let mut args_rest = &body[name_end + name_close.len()..];
-            while let Some(arg_start) = args_rest.find(arg_open) {
-                let after_arg_open = &args_rest[arg_start + arg_open.len()..];
-                let Some(arg_name_end) = after_arg_open.find(arg_name_close) else { break };
-                let arg_name = after_arg_open[..arg_name_end].trim().to_string();
-                let after_name = &after_arg_open[arg_name_end + arg_name_close.len()..];
-                // A value is whatever sits before the closer, verbatim
-                // -- this family quotes and escapes nothing, so trimming
-                // beyond the delimiters' own newlines would corrupt
-                // file content passed as an argument.
-                let (value, next) = match after_name.find(arg_close) {
-                    Some(value_end) => (&after_name[..value_end], &after_name[value_end + arg_close.len()..]),
-                    None => (after_name, ""),
-                };
-                arguments.insert(arg_name, serde_json::Value::String(value.to_string()));
-                if next.is_empty() {
-                    break;
-                }
-                args_rest = next;
-            }
-            if !name.is_empty() {
-                calls.push(ToolCall { name, arguments: serde_json::Value::Object(arguments) });
-            }
+        Self {
+            call_open: call_open.clone(),
+            // Same candidate list the parser and `ends_mid_call` use, so
+            // a family whose model emits a shorter closer than the
+            // template renders stops where it actually stops.
+            closers: close_candidates(call_close).into_iter().map(str::to_string).collect(),
         }
-
-        if remainder.is_empty() {
-            break;
-        }
-        rest = remainder;
     }
-    calls
+
+    /// Where to cut `text` and stop, or `None` to keep generating.
+    ///
+    /// `None` while the answer is still open: no call has closed yet, or
+    /// one has and what follows might still become another.
+    #[must_use]
+    pub fn reached(&self, text: &str) -> Option<usize> {
+        if self.call_open.is_empty() {
+            return None;
+        }
+        // The *last* closer, not the first: earlier calls in a
+        // multi-call turn are already settled and only the newest one
+        // decides whether the turn continues.
+        let end = self
+            .closers
+            .iter()
+            .filter_map(|closer| text.rfind(closer.as_str()).map(|at| at + closer.len()))
+            .max()?;
+        let tail = &text[end..];
+        if tail.trim_start().is_empty() {
+            // Nothing but whitespace yet -- undecided.
+            return None;
+        }
+        let after = tail.trim_start();
+        // Another call, or the beginning of one still arriving.
+        if after.starts_with(self.call_open.as_str()) || self.call_open.starts_with(after) {
+            return None;
+        }
+        Some(end)
+    }
 }
 
 /// Whether `text` stops part-way into what would have been a tool call,
@@ -886,9 +983,33 @@ pub fn ends_mid_call(text: &str, format: &ToolFormat) -> bool {
     //
     // A caller cannot defend against that without being told, and this
     // is the only place that knows what a complete call looks like.
+    // Matched through `find_close`, exactly as the parser matches it,
+    // and that is the whole point rather than a tidiness note.
+    //
+    // A derived `call_close` can carry framing the model never emits --
+    // Gemma's derives as `}<tool_call|><|tool_response>` because the
+    // template appends the response opener unconditionally, while the
+    // model writes `}<tool_call|>` and stops. `close_candidates` exists
+    // for precisely that and the parser has used it since Gemma landed.
+    // This function did not: a plain `contains` of the full closer never
+    // matched, so **every** Gemma reply was reported as cut off inside a
+    // call, including complete twenty-token ones.
+    //
+    // Measured on the task 6 rework. The model emitted one correct
+    // `read src/timeline.rs`, the parser recovered it, this said the
+    // turn was severed, `agent99` discarded every call in it and asked
+    // again with nothing new to say -- four turns, zero tool calls
+    // executed, and the model finally degenerated into two hundred
+    // copies of that same call until it hit the token cap. The collapse
+    // read as the failure; it was the symptom. The reviewer loop looked
+    // healthy on the identical model only because it ignored this flag
+    // altogether.
+    //
+    // One derived span, two readers, and they disagreed. Sharing the
+    // matcher is what stops the next family from finding the same seam.
     if let Some(opened) = trimmed.rfind(call_open.as_str()) {
         let after = &trimmed[opened + call_open.len()..];
-        if call_close.is_empty() || !after.contains(call_close.as_str()) {
+        if call_close.is_empty() || find_close(after, call_close).is_none() {
             return true;
         }
     }
@@ -1503,6 +1624,86 @@ mod tests {
     /// file being present.
     /// Prose, with the separator inside it.
     ///
+    /// The turn that ran a hundred and sixty invented commands.
+    ///
+    /// Text taken from the task 6 log: one real `read`, then the model
+    /// writing its own tool result. Everything from the closer onward is
+    /// fabrication and must not reach the harness.
+    #[cfg(feature = "template")]
+    #[test]
+    fn a_model_that_writes_its_own_tool_result_ends_the_turn() {
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else {
+            eprintln!("skipping absent fixture");
+            return;
+        };
+        let render = crate::chat_template::probe_renderer();
+        let format = derive_tool_call_format(&template, &render).expect("derivable");
+        let end = TurnEnd::of(&format);
+
+        let call = "<|tool_call>call:read{path:<|\"|>src/timeline.rs<|\"|>}<tool_call|>";
+
+        // Mid-call: nothing has closed, so nothing is decided.
+        assert_eq!(end.reached("<|tool_call>call:read{path:<|\"|>src/tim"), None);
+        // Closed, nothing after it yet: still undecided, the model may
+        // be about to open another call.
+        assert_eq!(end.reached(call), None);
+        assert_eq!(end.reached(&format!("{call}\n")), None);
+
+        // A second genuine call must survive -- this is the case that
+        // makes "stop at the first closer" wrong.
+        let two = format!("{call}\n<|tool_call>call:verify{{}}<tool_call|>");
+        assert_eq!(end.reached(&two), None, "a turn may hold more than one call");
+        // ...including while the second opener is still arriving.
+        assert_eq!(end.reached(&format!("{call}\n<|tool")), None, "an opener half-emitted is not prose");
+
+        // The real failure: the model narrating a result it invented.
+        let invented = format!(
+            "{call}\n<|channel>thought\n<channel|>Read /home/rrojo/.agent99/workspace/pcapgen/src/timeline.rs \
+             (lines 111-120):\n        }})\n            .collect();"
+        );
+        let at = end.reached(&invented).expect("the model moved on from calling tools");
+        assert_eq!(&invented[..at], call, "the turn keeps the real call and drops the fabrication");
+    }
+
+    /// A complete Gemma call is not a severed one.
+    ///
+    /// The bug this pins cost a whole run. Gemma's derived `call_close`
+    /// is `}<tool_call|><|tool_response>` -- the template appends the
+    /// response opener unconditionally -- and the model emits
+    /// `}<tool_call|>` and stops. `ends_mid_call` compared against the
+    /// full derived closer, never matched, and reported every reply as
+    /// cut off mid-call. `agent99` then discarded each turn's calls and
+    /// asked again, so the model saw no result, repeated itself, and
+    /// eventually collapsed. Zero tool calls ran in four turns.
+    ///
+    /// The parser had been right about this since Gemma landed; only
+    /// this function was reading the closer literally.
+    #[cfg(feature = "template")]
+    #[test]
+    fn a_complete_gemma_call_is_not_reported_as_cut_off() {
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else {
+            eprintln!("skipping absent fixture");
+            return;
+        };
+        let render = crate::chat_template::probe_renderer();
+        let format = derive_tool_call_format(&template, &render).expect("derivable");
+
+        // Verbatim from the task 6 rework log, thought channel included.
+        let complete = "<|channel>thought\n<channel|><|tool_call>call:read{path:<|\"|>src/timeline.rs<|\"|>}<tool_call|>";
+        assert!(
+            !parse_tool_calls(complete, &format).is_empty(),
+            "the parser reads this fine, which is what made the disagreement invisible"
+        );
+        assert!(
+            !ends_mid_call(complete, &format),
+            "a call the parser recovers in full is not a call generation stopped inside of"
+        );
+
+        // ...and a genuinely severed one still reports as severed.
+        let severed = "<|channel>thought\n<channel|><|tool_call>call:read{path:<|\"|>src/tim";
+        assert!(ends_mid_call(severed, &format), "this one really was cut off mid-argument");
+    }
+
     /// The comment a review records is a sentence, and a sentence has
     /// commas in it. Gemma separates arguments with `,`, so a naive
     /// split truncated the finding at the first one and recorded the
@@ -1754,3 +1955,4 @@ mod tests {
         assert_eq!(rendered.matches("<tool_response>").count(), 1, "{rendered}");
     }
 }
+
