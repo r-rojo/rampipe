@@ -15,6 +15,11 @@ pub mod llama;
 pub mod chat_template;
 pub mod model_settings;
 pub mod protocol;
+/// A `rampiped` that says what you tell it to -- see the module docs.
+///
+/// Deliberately not behind the `llama` feature: its whole value is that
+/// a harness can be tested without a model, a GPU, or forty minutes.
+pub mod scripted;
 pub mod tool_format;
 
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";

@@ -1,0 +1,24 @@
+# A reply cut off inside a tool call, which is what a token limit does.
+#
+# The real one: `max_new_tokens = 1500` cut a 136-line file mid
+# `assert_eq!(&buffer` and the fragment was written to disk. Three
+# separate defects had to line up for that, and every one of them is
+# reachable from here.
+#
+# What to check: the fragment must not be applied, the turn must not be
+# charged against the budget as though it were work, and the model must
+# be told what happened -- not handed a `<tool_response>` for a call that
+# never completed.
+context_size = 8192
+
+[[turn]]
+text = "Writing the test now."
+truncated_tool_call = true
+committed_tokens = 7900
+
+[[turn]]
+text = "Writing the test now, shorter this time."
+tool_calls = [{ name = "write", arguments = { path = "src/t.rs", content = "// short enough" } }]
+
+[[turn]]
+text = "Done."

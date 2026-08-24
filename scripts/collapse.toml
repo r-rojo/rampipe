@@ -1,0 +1,32 @@
+# A context window filling up, and a model collapsing once it does.
+#
+# The shape of pcapgen run 15: healthy turns below 75% fill, then a reply
+# that is one phrase repeated until the token budget runs out. What that
+# run cost to reproduce: forty minutes and a GPU. What it costs here: one
+# `cargo run`.
+#
+# What to check: the harness must NOT read the last turn as "the model
+# stopped calling tools, so it must be finished". That mistake shipped a
+# pull request once.
+context_size = 12288
+
+[[turn]]
+text = "I'll look at the file first."
+tool_calls = [{ name = "read", arguments = { path = "src/lib.rs" } }]
+committed_tokens = 4000
+
+[[turn]]
+text = "Now the edit."
+tool_calls = [{ name = "edit", arguments = { path = "src/lib.rs", old = "not there", new = "x" } }]
+committed_tokens = 9266
+
+# 93% full. Every collapse in the real run was at or above 91%, and
+# nothing below it collapsed.
+#
+# Long on purpose: `is_degenerate` needs 60 words before it will judge a
+# reply at all, because "OK" and "Done." are legitimately low-variety and
+# are exactly what a finished model says. A 42-word version of this slips
+# through -- worth knowing, and not worth lowering the threshold for.
+[[turn]]
+text = "I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if I'm in the world and if"
+committed_tokens = 11448

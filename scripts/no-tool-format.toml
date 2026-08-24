@@ -1,0 +1,9 @@
+# A model whose template yields no parseable tool-call format.
+#
+# What to check: the harness refuses before spending a single token.
+# Without that check every reply is prose the loop cannot act on, and a
+# run burns its whole budget discovering that one empty turn at a time.
+supports_tool_calls = false
+
+[[turn]]
+text = "this should never be reached"
