@@ -947,6 +947,9 @@ impl LlamaSession {
         };
 
         Ok(GenerationResult {
+            // A one-shot generate holds only this prompt and its reply.
+            committed_tokens: tokens_list.len() + tokens_generated,
+            context_size: n_ctx.max(0) as usize,
             text,
             time_to_first_token,
             tokens_generated,
@@ -1741,6 +1744,8 @@ impl<'a> Conversation<'a> {
             .is_some_and(|format| crate::tool_format::ends_mid_call(&text, format));
 
         Ok(GenerationResult {
+            committed_tokens: self.committed_pos.max(0) as usize,
+            context_size: self.n_ctx as usize,
             text,
             time_to_first_token,
             tokens_generated,
@@ -1854,6 +1859,8 @@ impl<'a> Conversation<'a> {
             .is_some_and(|format| crate::tool_format::ends_mid_call(&text, format));
 
         Ok(GenerationResult {
+            committed_tokens: self.committed_pos.max(0) as usize,
+            context_size: self.n_ctx as usize,
             text,
             time_to_first_token,
             tokens_generated,
@@ -1899,6 +1906,22 @@ impl<'a> Conversation<'a> {
             }
             let user = self.turns.remove(0);
             let assistant = self.turns.remove(0);
+            // Said out loud, because a caller cannot infer it and the
+            // consequence is severe. Dropping the oldest pair drops the
+            // *first* user turn -- and a caller that put its
+            // instructions there has just had them evicted. Measured: an
+            // agent whose task briefing was its first user message
+            // collapsed into repeated tokens on every turn after this
+            // fired, with a context full of file contents and nothing
+            // left telling it what it was doing. The opening (system
+            // block and tools) is decoded before any turn and survives;
+            // turn zero does not.
+            eprintln!(
+                "rampiped: context full ({}/{}) -- dropping the oldest exchange (positions {}..{}). \
+                 Anything a caller put in its first user turn is now gone; instructions belong in the \
+                 system block, which is never dropped.",
+                self.committed_pos, self.n_ctx, user.start_pos, assistant.end_pos
+            );
             // `turns` must strictly alternate User/Assistant starting
             // with User -- every push site above maintains that, so a
             // mismatch here means the bookkeeping itself is broken, not

@@ -108,6 +108,21 @@ pub struct GenerationResult {
     /// first time.
     pub time_to_first_token: Duration,
     pub tokens_generated: usize,
+    /// How much of the context window this conversation now occupies,
+    /// and how big it is.
+    ///
+    /// Reported per turn because it was not, and that absence cost real
+    /// time. A model repeatedly collapsed into repeated tokens partway
+    /// through agentic runs, and "the context is filling up" was
+    /// proposed as the cause three separate times without anyone being
+    /// able to see the number -- the daemon tracked it and only ever
+    /// mentioned it in the text of an overflow error.
+    ///
+    /// A caller that can watch this can tell a context problem from a
+    /// sampling problem by looking, which is the whole difference
+    /// between measuring and guessing.
+    pub committed_tokens: usize,
+    pub context_size: usize,
     /// The exact text tokenized and decoded onto the model for this
     /// call -- for `generate()`, the whole formatted prompt; for
     /// `Conversation::send()`, just this turn's own new text (the prior

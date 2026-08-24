@@ -569,6 +569,13 @@ pub enum ConversationResponse {
     Turn {
         text: String,
         tokens_generated: usize,
+        /// See `conversation::GenerationResult::committed_tokens`.
+        /// `#[serde(default)]` so an older daemon that does not send
+        /// these reports zero rather than failing to decode.
+        #[serde(default)]
+        committed_tokens: usize,
+        #[serde(default)]
+        context_size: usize,
         time_to_first_token_ms: u64,
         /// See `rampipe::conversation::GenerationResult::tool_calls` --
         /// parsed daemon-side, since that is where the model's chat

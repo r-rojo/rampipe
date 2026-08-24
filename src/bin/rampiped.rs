@@ -63,10 +63,11 @@ rampiped: a daemon that holds GGUF model(s) resident in memory and
 serves generation requests from local clients over a Unix socket.
 
 USAGE:
-    rampiped [--socket <path>] [--budget-fraction <0.0-1.0>]
+    rampiped [--socket <path>] [--budget-fraction <0.0-1.0>] [--model-settings <path>]
 
 OPTIONS:
     --socket <path>            Unix socket to listen on
+    --model-settings <path>    Per-model sampling settings (default ~/.rampipe/models.toml)
                                 (default: ~/.rampipe/rampiped.sock)
     --budget-fraction <float>  fraction of available memory the swap
                                 registry may use before evicting
@@ -111,6 +112,13 @@ fn parse_args() -> Result<ParsedArgs> {
         })
         .transpose()?
         .unwrap_or(DEFAULT_BUDGET_FRACTION);
+    // Taken before the unrecognized-argument check, not after it. This
+    // was below the `bail!` and below the struct it feeds: the flag was
+    // always still in `args` when the check ran, so passing it was a
+    // hard error, and the `take_flag_value` that fed the field ran
+    // against an already-drained vector and always yielded `None`. The
+    // flag could not be used and the default was taken silently.
+    let model_settings = take_flag_value(&mut args, "--model-settings")?.map(PathBuf::from);
     if !args.is_empty() {
         bail!("unrecognized argument(s): {}", args.join(" "));
     }
@@ -124,7 +132,7 @@ fn parse_args() -> Result<ParsedArgs> {
     Ok(ParsedArgs::Run(Args {
         socket,
         budget_fraction,
-        model_settings: take_flag_value(&mut args, "--model-settings")?.map(PathBuf::from),
+        model_settings,
     }))
 }
 
@@ -861,6 +869,8 @@ fn run_conversation_turn(
         Ok(result) => ConversationResponse::Turn {
             text: result.text,
             tokens_generated: result.tokens_generated,
+            committed_tokens: result.committed_tokens,
+            context_size: result.context_size,
             time_to_first_token_ms: result.time_to_first_token.as_millis() as u64,
             formatted_prompt: result.formatted_prompt,
             tool_calls: result.tool_calls,

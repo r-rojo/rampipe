@@ -52,6 +52,10 @@ pub enum RampipedError {
 pub struct GenerateOutcome {
     pub text: String,
     pub tokens_generated: usize,
+    /// How full the conversation's context window is, and how big it
+    /// is. See `conversation::GenerationResult::committed_tokens`.
+    pub committed_tokens: usize,
+    pub context_size: usize,
     pub time_to_first_token_ms: u64,
     /// See `rampipe::llama::GenerationResult::formatted_prompt`'s doc
     /// comment.
@@ -169,6 +173,10 @@ impl RampipedClient {
             } => Ok(GenerateOutcome {
                 text,
                 tokens_generated,
+                // A one-shot generate holds no conversation, so there is
+                // no accumulating context to report.
+                committed_tokens: 0,
+                context_size: 0,
                 time_to_first_token_ms,
                 formatted_prompt,
                 // One-shot `generate` offers no tools -- see
@@ -447,6 +455,8 @@ impl RampipedConversation {
             ConversationResponse::Turn {
                 text,
                 tokens_generated,
+                committed_tokens,
+                context_size,
                 time_to_first_token_ms,
                 formatted_prompt,
                 tool_calls,
@@ -456,6 +466,8 @@ impl RampipedConversation {
                 Ok(GenerateOutcome {
                     text,
                     tokens_generated,
+                    committed_tokens,
+                    context_size,
                     time_to_first_token_ms,
                     formatted_prompt,
                     tool_calls,
@@ -587,6 +599,8 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         )
         .map_err(|e| crate::conversation::ConversationError::Backend(e.to_string()))?;
         Ok(crate::conversation::GenerationResult {
+            committed_tokens: outcome.committed_tokens,
+            context_size: outcome.context_size,
             text: outcome.text,
             // Back to a `Duration` from the milliseconds the wire format
             // flattens it to (see `GenerateOutcome`'s own doc comment) --
@@ -622,6 +636,8 @@ impl crate::conversation::ConversationHandle for RampipedConversation {
         )
         .map_err(|e| crate::conversation::ConversationError::Backend(e.to_string()))?;
         Ok(crate::conversation::GenerationResult {
+            committed_tokens: outcome.committed_tokens,
+            context_size: outcome.context_size,
             text: outcome.text,
             time_to_first_token: std::time::Duration::from_millis(outcome.time_to_first_token_ms),
             tokens_generated: outcome.tokens_generated,
