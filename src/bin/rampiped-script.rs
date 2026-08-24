@@ -23,6 +23,8 @@ fn main() {
              Serves the rampiped conversation protocol from a written script -- no model,\n\
              no GPU. Records what the harness sends (system block, tools, messages, tool\n\
              results) and prints it, which is the half that catches harness bugs.\n\n\
+             --transcript <path> also writes every exchange in full, unclipped -- the printed\n\
+             form is for reading, the file is for checking.\n\n\
              Stops on Ctrl-C, or when the script runs out and the client disconnects."
         );
         return;
@@ -35,6 +37,14 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // Where to write the transcript in full.
+    //
+    // The printed form is clipped to keep a live run readable, and twice
+    // that clipping has hidden the very thing being checked -- once the
+    // raw `old` of a failing edit, once whether an index reached the
+    // model at all. A readable stream and a complete record are
+    // different jobs.
+    let transcript = take(&mut args, "--transcript").map(PathBuf::from);
     let Some(script_path) = take(&mut args, "--script") else {
         eprintln!("rampiped-script: --script is required");
         std::process::exit(2);
@@ -75,11 +85,35 @@ fn main() {
     let mut printed = 0usize;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let transcript = daemon.transcript();
-        for said in transcript.iter().skip(printed) {
+        let said_so_far = daemon.transcript();
+        for said in said_so_far.iter().skip(printed) {
             eprintln!("{}", render(said));
         }
-        printed = transcript.len();
+        if said_so_far.len() != printed {
+            if let Some(path) = &transcript {
+                let full: String = said_so_far.iter().map(full_record).collect();
+                let _ = std::fs::write(path, full);
+            }
+        }
+        printed = said_so_far.len();
+    }
+}
+
+/// One exchange, complete. No clipping and no indentation, so a test
+/// can grep it and a person can diff it.
+fn full_record(said: &Said) -> String {
+    match said {
+        Said::Opened { system, tools, n_ctx } => format!(
+            "===== OPENED n_ctx={n_ctx} tools=[{}]\n{}\n",
+            tools.join(", "),
+            system.clone().unwrap_or_else(|| "(no system block)".to_string())
+        ),
+        Said::Message(text) => format!("===== MESSAGE\n{text}\n"),
+        Said::ToolResults(results) => format!(
+            "===== TOOL RESULTS ({})\n{}\n",
+            results.len(),
+            results.join("\n----- next result -----\n")
+        ),
     }
 }
 
