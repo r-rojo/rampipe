@@ -277,7 +277,16 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
     if !(name_at < arg1_at && arg1_at < val1_at && val1_at < arg2_at && arg2_at < val2_at) {
         return None;
     }
-    derive_delimited_format(&region, &no_args_region, name_at, arg1_at, val1_at, arg2_at, val2_at)
+    // Delimited first, then separated. Order matters and is not
+    // arbitrary: `Delimited` is the stricter shape -- it requires a
+    // non-empty opener before every argument -- so a format it accepts
+    // is unambiguously that one. `Separated` is what remains when there
+    // is no per-argument opener at all.
+    let format = derive_delimited_format(&region, &no_args_region, name_at, arg1_at, val1_at, arg2_at, val2_at)
+        .or_else(|| {
+            derive_separated_format(&region, &no_args_region, name_at, arg1_at, val1_at, arg2_at, val2_at)
+        })?;
+    Some(format)
 }
 
 /// The span in which `with_calls` differs from `plain` -- i.e. the
@@ -417,6 +426,104 @@ fn derive_delimited_format(
     })
 }
 
+/// Recovers a [`ToolFormat::Separated`] -- Gemma-style, where a
+/// separator sits *between* arguments rather than a closer after each.
+///
+/// The real shape, from Gemma 4's own template:
+///
+/// ```text
+/// with args:  <|tool_call>call:NAME{ARG1:<|"|>VAL1<|"|>,ARG2:<|"|>VAL2<|"|>}<tool_call|>
+/// no args:    <|tool_call>call:NAME{}<tool_call|>
+/// ```
+///
+/// `Delimited` cannot express it. Reading `,` as an `arg_close` is wrong
+/// for the last argument, which is followed by the call's close instead;
+/// reading `,` as an `arg_open` is wrong for the first, which has
+/// nothing before it. The asymmetry is the definition of the family.
+///
+/// `call_close` comes from the **no-argument** probe rather than from
+/// the end of the with-arguments region. That region trails whatever the
+/// template emits after an assistant tool-call message -- Gemma's adds a
+/// `<|tool_response>` opener in anticipation of one -- and a `call_close`
+/// carrying that would never match text a model actually generates.
+fn derive_separated_format(
+    region: &str,
+    no_args_region: &str,
+    name_at: usize,
+    arg1_at: usize,
+    val1_at: usize,
+    arg2_at: usize,
+    val2_at: usize,
+) -> Option<ToolFormat> {
+    let name_close = region.get(name_at + NAME.len()..arg1_at)?;
+    let arg_name_close = region.get(arg1_at + ARG1.len()..val1_at)?;
+    let val1_to_arg2 = region.get(val1_at + VAL1.len()..arg2_at)?;
+    let after_val2 = region.get(val2_at + VAL2.len()..)?;
+
+    // The call's own close, from the probe that has no arguments and so
+    // no value wrappers to confuse it.
+    let no_args_name_at = no_args_region.find(NAME)?;
+    let after_name_no_args = no_args_region.get(no_args_name_at + NAME.len()..)?;
+    let call_close = after_name_no_args.strip_prefix(name_close)?;
+
+    // What closes a value is whatever separates the last one from the
+    // call's close.
+    let closing_at = after_val2.find(call_close)?;
+    let arg_close = &after_val2[..closing_at];
+
+    // ...and the separator is what remains between one value's close and
+    // the next argument's name.
+    let arg_sep = val1_to_arg2.strip_prefix(arg_close)?;
+
+    // The second argument must be introduced exactly as the first was,
+    // or this is not a uniform repeating unit and reading it as one
+    // would invent arguments. Checked here, against the *full* span,
+    // before the wrapper is split back out of it below.
+    if region.get(arg2_at + ARG2.len()..val2_at)? != arg_name_close {
+        return None;
+    }
+
+    // A value's *opening* wrapper, split back out of `arg_name_close`.
+    //
+    // The probes only ever pass strings, and this family wraps strings
+    // -- so what looked like "the separator between a name and its
+    // value" is really that separator plus the wrapper. Numbers are
+    // emitted bare: Gemma writes `line:38`, not `line:<|"|>38<|"|>`.
+    //
+    // Measured. With the wrapper welded on, `line:38` matched no
+    // argument at all, so every `comment` call arrived without the line
+    // it needed and was refused -- four turns in a row, on a review that
+    // had already found the bug it was trying to report.
+    let (arg_name_close, value_open) = match arg_name_close.strip_suffix(arg_close) {
+        Some(bare) if !arg_close.is_empty() && !bare.is_empty() => (bare, arg_close),
+        _ => (arg_name_close, ""),
+    };
+
+    // An empty span matches at every offset and would silently produce
+    // empty names, values, or an unbounded call. `arg_close` may
+    // legitimately be empty -- a family that does not wrap its values --
+    // which is why it is not on this list.
+    if name_close.is_empty() || arg_name_close.is_empty() || arg_sep.is_empty() || call_close.is_empty() {
+        return None;
+    }
+
+    // A separator that could be mistaken for a value's close, or for the
+    // call's, makes every boundary ambiguous.
+    if arg_sep.contains(arg_name_close) || call_close.starts_with(arg_sep) {
+        return None;
+    }
+
+    Some(ToolFormat::Separated {
+        call_open: region[..name_at].to_string(),
+        name_close: name_close.to_string(),
+        arg_name_close: arg_name_close.to_string(),
+        value_open: value_open.to_string(),
+        arg_close: arg_close.to_string(),
+        arg_sep: arg_sep.to_string(),
+        call_close: call_close.to_string(),
+    })
+}
+
 fn shared_prefix<'a>(a: &'a str, b: &str) -> &'a str {
     let shared = common_prefix_len(a.as_bytes(), b.as_bytes());
     a.get(..shared).unwrap_or("")
@@ -438,6 +545,24 @@ pub fn parse_tool_calls(text: &str, format: &ToolFormat) -> Vec<ToolCall> {
         ToolFormat::Delimited { call_open, name_close, arg_open, arg_name_close, arg_close, call_close } => {
             parse_delimited_calls(text, call_open, name_close, arg_open, arg_name_close, arg_close, call_close)
         }
+        ToolFormat::Separated {
+            call_open,
+            name_close,
+            arg_name_close,
+            value_open,
+            arg_close,
+            arg_sep,
+            call_close,
+        } => parse_separated_calls(
+            text,
+            call_open,
+            name_close,
+            arg_name_close,
+            value_open,
+            arg_close,
+            arg_sep,
+            call_close,
+        ),
     }
 }
 
@@ -476,6 +601,182 @@ fn parse_json_calls(
     clippy::too_many_arguments,
     reason = "each is one independently-derived span of the format being parsed; grouping them would just be ToolFormat::Delimited destructured again"
 )]
+/// Extracts calls in the separated family.
+///
+/// The value of the *last* argument runs to the call's close rather than
+/// to a separator, which is the whole difference from
+/// [`parse_delimited_calls`] and the reason this is its own function
+/// rather than a flag on that one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one independently-derived span of the format being parsed; grouping them would just be ToolFormat::Separated destructured again"
+)]
+/// Where a call ends, and how much of `call_close` closed it.
+///
+/// # Why the whole closer is not always there
+///
+/// `call_close` is derived by rendering a call through the template and
+/// reading what comes after the arguments. For most families that is
+/// exactly the terminator the model emits. Gemma's template appends one
+/// more token the model never writes: it renders
+///
+/// ```text
+/// <|tool_call>call:NAME{}<tool_call|><|tool_response>
+/// ```
+///
+/// unconditionally -- measured with zero results following as well as
+/// two, so it is framing for whatever comes next, not part of the call.
+/// The model emits `}<tool_call|>` and stops at end-of-turn, so a
+/// literal search for the derived closer finds nothing, every call reads
+/// as severed, and the final argument swallows the terminator. That is
+/// how `line:38` came back as `38}<tool_call|>`.
+///
+/// The template cannot tell the two apart -- both probes render the same
+/// bytes. So the closer is matched longest-first and allowed to fall
+/// back to a shorter prefix that still ends a tag. Families whose closer
+/// the model does emit in full match on the first try and are unchanged.
+fn find_close(text: &str, call_close: &str) -> Option<(usize, usize)> {
+    for candidate in close_candidates(call_close) {
+        if let Some(at) = text.find(candidate) {
+            return Some((at, candidate.len()));
+        }
+    }
+    None
+}
+
+/// `call_close`, then its shorter tag-ending prefixes, longest first.
+///
+/// A cut is only allowed after a `>`, so a prefix is always a whole
+/// number of tags: `}<tool_call|><|tool_response>` yields itself and
+/// `}<tool_call|>`, never `}<tool_c`. A closer with no internal tag
+/// boundary -- `</tool_call>`, `\n` -- yields only itself, which is why
+/// this costs the other families nothing.
+fn close_candidates(call_close: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    if !call_close.is_empty() {
+        out.push(call_close);
+    }
+    for (at, _) in call_close.char_indices().rev() {
+        if call_close[at..].starts_with('>') {
+            let prefix = &call_close[..at + 1];
+            if prefix != call_close && !prefix.is_empty() {
+                out.push(prefix);
+            }
+        }
+    }
+    out
+}
+
+/// The `name: value` pairs in a separated call's argument block.
+///
+/// # Why this cannot be a `split`
+///
+/// Splitting the block on `arg_sep` first is the obvious reading, and it
+/// is wrong for any value that contains the separator. Gemma's separator
+/// is `,`, and the argument this harness cares most about is a review
+/// comment -- English prose, full of commas. Measured: a comment reading
+/// `... field of the timestamp. While the test X passes, ...` came back
+/// truncated at the first comma, with the rest of the sentence recorded
+/// as a second argument whose name was the prose before its first `:`.
+/// Nothing errored. The finding was simply mutilated on its way in.
+///
+/// So the block is walked instead. A value wrapped in `value_open` runs
+/// to its closer no matter what it contains; only a bare value -- a
+/// number, in practice -- ends at the next separator.
+fn split_args<'a>(
+    args: &'a str,
+    arg_name_close: &str,
+    value_open: &str,
+    arg_close: &str,
+    arg_sep: &str,
+) -> Vec<(String, &'a str)> {
+    let mut out: Vec<(String, &'a str)> = Vec::new();
+    let mut rest = args;
+    while !rest.is_empty() {
+        // A piece with no name separator is malformed, and ends the
+        // walk rather than being fatal -- the same treatment the
+        // delimited parser gives a severed argument.
+        let Some(at) = rest.find(arg_name_close) else { break };
+        let key = rest[..at].trim().to_string();
+        let after_name = &rest[at + arg_name_close.len()..];
+
+        let (value, remainder) = match after_name.strip_prefix(value_open) {
+            // Wrapped: runs to its closer verbatim. This family escapes
+            // nothing, so trimming would corrupt file content passed as
+            // an argument. A missing closer means generation was severed
+            // mid-value; keep what there is.
+            Some(inner) if !value_open.is_empty() => match inner.find(arg_close) {
+                Some(end) => (&inner[..end], &inner[end + arg_close.len()..]),
+                None => (inner, ""),
+            },
+            // Bare: ends at the next separator, or at the end.
+            _ => match find_sep(after_name, arg_sep) {
+                Some(end) => (after_name[..end].trim(), &after_name[end..]),
+                None => (after_name.trim(), ""),
+            },
+        };
+        if !key.is_empty() {
+            out.push((key, value));
+        }
+
+        rest = match find_sep(remainder, arg_sep) {
+            Some(at) => &remainder[at + arg_sep.len()..],
+            None => "",
+        };
+    }
+    out
+}
+
+/// The next `arg_sep` in `text`, or `None` if there is none.
+fn find_sep(text: &str, arg_sep: &str) -> Option<usize> {
+    if arg_sep.is_empty() {
+        return None;
+    }
+    text.find(arg_sep)
+}
+
+fn parse_separated_calls(
+    text: &str,
+    call_open: &str,
+    name_close: &str,
+    arg_name_close: &str,
+    value_open: &str,
+    arg_close: &str,
+    arg_sep: &str,
+    call_close: &str,
+) -> Vec<ToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(call_open) {
+        let after_open = &rest[start + call_open.len()..];
+        let (body, remainder) = match find_close(after_open, call_close) {
+            Some((end, len)) => (&after_open[..end], &after_open[end + len..]),
+            // No closer means a call the generation ran out of tokens
+            // part-way through. Its arguments are still read: a severed
+            // call should cost that call, not the whole turn.
+            None => (after_open, ""),
+        };
+
+        if let Some(name_end) = body.find(name_close) {
+            let name = body[..name_end].trim().to_string();
+            let mut arguments = serde_json::Map::new();
+            let args = &body[name_end + name_close.len()..];
+            for (key, value) in split_args(args, arg_name_close, value_open, arg_close, arg_sep) {
+                arguments.insert(key, serde_json::Value::String(value.to_string()));
+            }
+            if !name.is_empty() {
+                calls.push(ToolCall { name, arguments: serde_json::Value::Object(arguments) });
+            }
+        }
+
+        if remainder.is_empty() {
+            break;
+        }
+        rest = remainder;
+    }
+    calls
+}
+
 fn parse_delimited_calls(
     text: &str,
     call_open: &str,
@@ -555,7 +856,9 @@ fn parse_delimited_calls(
 #[must_use]
 pub fn ends_mid_call(text: &str, format: &ToolFormat) -> bool {
     let (call_open, call_close) = match format {
-        ToolFormat::Json { call_open, call_close, .. } | ToolFormat::Delimited { call_open, call_close, .. } => {
+        ToolFormat::Json { call_open, call_close, .. }
+        | ToolFormat::Delimited { call_open, call_close, .. }
+        | ToolFormat::Separated { call_open, call_close, .. } => {
             (call_open, call_close)
         }
     };
@@ -682,6 +985,13 @@ impl ToolResultSpans {
 /// assembled.
 #[must_use]
 pub fn derive_tool_result_spans(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
+    derive_tool_result_spans_by_role(template_text, render)
+        .or_else(|| derive_tool_result_spans_native(template_text, render))
+}
+
+/// The `{"role": "tool"}` convention -- what the OpenAI-shaped families
+/// use, and what this crate assumed was the only one.
+fn derive_tool_result_spans_by_role(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
     let rendered = render(
         template_text,
         &serde_json::json!([
@@ -702,6 +1012,72 @@ pub fn derive_tool_result_spans(template_text: &str, render: RenderFn<'_>) -> Op
     }
     Some(ToolResultSpans {
         open: rendered.get(assistant_at + PLAIN.len()..first_at)?.to_string(),
+        separator: rendered.get(first_at + RESULT.len()..second_at)?.to_string(),
+        close: rendered.get(second_at + RESULT2.len()..reply_at)?.to_string(),
+    })
+}
+
+/// The same spans, for a template that carries results on the assistant
+/// message instead of as `tool` messages.
+///
+/// # Why a second convention exists at all
+///
+/// `derive_tool_result_spans` probes with `{"role": "tool"}`, which is
+/// what the OpenAI-shaped families use. Gemma's template branches on
+/// `assistant` and `user` and **nothing else**: a `tool` message is not
+/// rejected, it is silently dropped, so the probe rendered a
+/// conversation with no results in it and the spans came back as the
+/// distance between two adjacent assistant turns.
+///
+/// Its own comment calls this "Google/Gemma native": results ride on the
+/// message as a `tool_responses` array. Same three spans out the other
+/// end, so everything downstream is unchanged -- only the question being
+/// asked of the template differs.
+fn derive_tool_result_spans_native(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
+    let rendered = render(
+        template_text,
+        &serde_json::json!([
+            { "role": "user", "content": USER },
+            {
+                // No content of its own: this family emits the responses
+                // *before* the message's text, so a `PLAIN` here would
+                // land after them and could not anchor the opening span.
+                "role": "assistant",
+                "content": "",
+                // An empty name, deliberately. This family embeds the
+                // answering tool's name in each result block, and
+                // `ToolResultSpans` has nowhere to put a per-result one
+                // -- so a probe naming a tool would bake that name into
+                // the separator and every real result would claim to
+                // come from it. Worse, the name here is a private-use
+                // sentinel, which would then appear as invisible garbage
+                // in every prompt.
+                //
+                // The template's own `| default('unknown', true)` fills
+                // the gap. The cost is real and worth stating: a Gemma
+                // conversation cannot say which call a result answers,
+                // so parallel calls in one turn are ambiguous to it.
+                // Single-call turns, which is what this harness issues,
+                // are unaffected.
+                "tool_responses": [
+                    { "name": "", "response": RESULT },
+                    { "name": "", "response": RESULT2 },
+                ],
+            },
+            { "role": "assistant", "content": REPLY },
+        ]),
+        None,
+    )?;
+    // Anchored on the *user* turn, for the same reason.
+    let anchor_at = rendered.find(USER)?;
+    let first_at = rendered.find(RESULT)?;
+    let second_at = rendered.find(RESULT2)?;
+    let reply_at = rendered.find(REPLY)?;
+    if !(anchor_at < first_at && first_at < second_at && second_at < reply_at) {
+        return None;
+    }
+    Some(ToolResultSpans {
+        open: rendered.get(anchor_at + USER.len()..first_at)?.to_string(),
         separator: rendered.get(first_at + RESULT.len()..second_at)?.to_string(),
         close: rendered.get(second_at + RESULT2.len()..reply_at)?.to_string(),
     })
@@ -1125,13 +1501,115 @@ mod tests {
     /// templates extracted from GGUFs, and requiring every checkout to
     /// carry one would tie this crate's tests to a multi-gigabyte model
     /// file being present.
+    /// Prose, with the separator inside it.
+    ///
+    /// The comment a review records is a sentence, and a sentence has
+    /// commas in it. Gemma separates arguments with `,`, so a naive
+    /// split truncated the finding at the first one and recorded the
+    /// rest of it as a second argument. This is that call, verbatim from
+    /// the run that caught it.
+    #[cfg(feature = "template")]
+    #[test]
+    fn a_separator_inside_a_wrapped_value_does_not_end_it() {
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else {
+            eprintln!("skipping absent fixture");
+            return;
+        };
+        let render = crate::chat_template::probe_renderer();
+        let format = derive_tool_call_format(&template, &render).expect("derivable");
+
+        let prose = "The sort uses only `seconds`. While the test passes, \
+                     the fit criterion requires microseconds, too.";
+        let text = format!(
+            "<|tool_call>call:comment{{comment:<|\"|>{prose}<|\"|>,file:<|\"|>src/timeline.rs<|\"|>,line:38}}<tool_call|>"
+        );
+        let calls = parse_tool_calls(&text, &format);
+
+        assert_eq!(calls.len(), 1, "one call");
+        let arguments = calls[0].arguments.as_object().expect("object");
+        assert_eq!(
+            arguments.len(),
+            3,
+            "three arguments -- the prose is one value, not several: {arguments:#?}"
+        );
+        assert_eq!(arguments["comment"], serde_json::json!(prose), "the whole sentence");
+        assert_eq!(arguments["file"], serde_json::json!("src/timeline.rs"));
+        assert_eq!(arguments["line"], serde_json::json!("38"));
+    }
+
+    /// A value the family does not wrap.
+    ///
+    /// Gemma quotes strings and writes numbers bare -- `path:<|"|>a.rs<|"|>`
+    /// beside `line:38` -- and the probes only ever pass strings, so the
+    /// derived "name to value" span carried the opening quote welded on.
+    /// `line:38` then matched no argument at all.
+    ///
+    /// Measured on a real review: it had found the bug it was asked to
+    /// find, and spent its last four turns unable to say where, because
+    /// every `comment` call arrived without a line and was refused.
+    #[cfg(feature = "template")]
+    #[test]
+    fn a_bare_value_parses_beside_a_wrapped_one() {
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else {
+            eprintln!("skipping absent fixture");
+            return;
+        };
+        let render = crate::chat_template::probe_renderer();
+        let format = derive_tool_call_format(&template, &render).expect("derivable");
+
+        // Exactly what the model emitted, verbatim from the run.
+        let text = "<|tool_call>call:comment{comment:<|\"|>The sort only uses seconds<|\"|>,\
+                    file:<|\"|>src/timeline.rs<|\"|>,line:38}<tool_call|>";
+        let calls = parse_tool_calls(text, &format);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "comment");
+        assert_eq!(calls[0].arguments["comment"], "The sort only uses seconds");
+        assert_eq!(calls[0].arguments["file"], "src/timeline.rs");
+        assert_eq!(calls[0].arguments["line"], "38", "a bare value has to parse too");
+        assert_eq!(
+            calls[0].arguments.as_object().expect("object").len(),
+            3,
+            "and nothing else: {:?}",
+            calls[0].arguments
+        );
+    }
+
+    /// Two calls in one turn must not bleed into each other -- the
+    /// failure that turned one unparsed argument into a key hundreds of
+    /// characters long.
+    #[cfg(feature = "template")]
+    #[test]
+    fn two_calls_in_one_turn_stay_separate() {
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else { return };
+        let render = crate::chat_template::probe_renderer();
+        let format = derive_tool_call_format(&template, &render).expect("derivable");
+
+        let text = "<|tool_call>call:read{path:<|\"|>a.rs<|\"|>,line:38}<tool_call|>\n\
+                    thinking out loud\n\
+                    <|tool_call>call:verify{}<tool_call|>";
+        let calls = parse_tool_calls(text, &format);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["path"], "a.rs");
+        assert_eq!(calls[0].arguments["line"], "38");
+        assert_eq!(calls[1].name, "verify");
+        assert_eq!(calls[1].arguments.as_object().expect("object").len(), 0, "no arguments at all");
+    }
+
     #[cfg(feature = "template")]
     #[test]
     fn every_real_chat_template_round_trips_its_own_call_format() {
         let render = crate::chat_template::probe_renderer();
         let mut checked = 0;
 
-        for fixture in ["tests/fixtures/qwen3-coder.jinja", "tests/fixtures/qwen3_8_chat_template.jinja"] {
+        for fixture in [
+            "tests/fixtures/qwen3-coder.jinja",
+            "tests/fixtures/qwen3_8_chat_template.jinja",
+            // Gemma's is the reason `ToolFormat::Separated` exists: its
+            // arguments are comma-separated rather than individually
+            // delimited, which `Delimited` cannot express at all.
+            "tests/fixtures/gemma4-12b.jinja",
+        ] {
             let Ok(template) = std::fs::read_to_string(fixture) else {
                 eprintln!("skipping absent fixture: {fixture}");
                 continue;
@@ -1199,13 +1677,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("{fixture} must yield result spans"));
             let two = spans.render(&["FIRSTRESULT".to_string(), "SECONDRESULT".to_string()]);
             assert!(two.contains("FIRSTRESULT") && two.contains("SECONDRESULT"), "{fixture}: {two}");
-            assert!(
-                two.matches("<tool_response>").count() == 2,
-                "{fixture}: each result needs its own element, got {two}"
-            );
-            // ...and one result must render exactly as it always did.
+            // Family-agnostic, which the previous version was not: it
+            // counted `<tool_response>` literally, Qwen's spelling, so
+            // Gemma's `<|tool_response>` scored zero and a working
+            // template looked broken. What actually has to hold is that
+            // the two results are separated by whatever this template
+            // separates them with -- exactly once for two, never for one.
             let one = spans.render(&["ONLYRESULT".to_string()]);
-            assert_eq!(one.matches("<tool_response>").count(), 1, "{fixture}: {one}");
+            assert_eq!(two.matches(&spans.separator).count(), 1, "{fixture}: {two}");
+            assert_eq!(one.matches(&spans.separator).count(), 0, "{fixture}: {one}");
+
+            // And no probe sentinel may survive into what a model sees.
+            for rendered in [&one, &two] {
+                for sentinel in [NAME, ARG1, VAL1, RESULT, PLAIN] {
+                    assert!(!rendered.contains(sentinel), "{fixture} leaks a probe sentinel: {rendered:?}");
+                }
+            }
         }
 
         assert!(checked > 0, "no fixtures present -- this test proved nothing");

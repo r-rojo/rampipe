@@ -191,6 +191,40 @@ pub enum ToolFormat {
         arg_close: String,
         call_close: String,
     },
+    /// Arguments *separated* rather than individually delimited --
+    /// Gemma-style:
+    /// `<|tool_call>call:NAME{arg1:value1,arg2:value2}<tool_call|>`
+    ///
+    /// # Why this cannot be a `Delimited` with clever spans
+    ///
+    /// `Delimited` puts a closer after every argument, including the
+    /// last. Here the comma sits *between* arguments and the last one is
+    /// followed by the call's own close, so no single `arg_close` is
+    /// correct for both. Expressing it as `Delimited` would need
+    /// `arg_close` to be `,` for every argument except the final one,
+    /// which the type cannot say.
+    ///
+    /// Found by trying to run Gemma 4 12B: its template carries full
+    /// tool-call handling, `derive_tool_call_format` returned `None`
+    /// anyway, and `agent99` correctly refused to start rather than
+    /// spend a budget on replies it could not parse.
+    Separated {
+        call_open: String,
+        name_close: String,
+        /// Between an argument's name and its value -- Gemma's is `":"`.
+        arg_name_close: String,
+        /// Wraps the start of a value, when the family wraps them.
+        /// Gemma's is `"<|\"|>"`, and it appears around strings but not
+        /// around numbers: `path:<|\"|>a.rs<|\"|>` beside `line:38`. So
+        /// it is optional at parse time, not required.
+        value_open: String,
+        /// Closes a value. Empty for a family that does not wrap them.
+        arg_close: String,
+        /// Between one argument and the next. Never after the last one,
+        /// which is the whole reason this is not a `Delimited`.
+        arg_sep: String,
+        call_close: String,
+    },
 }
 
 /// A request to generate against one model. `model_path` is a real,
