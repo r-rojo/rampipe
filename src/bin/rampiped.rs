@@ -305,6 +305,14 @@ impl SharedState {
             self.registry
                 .load(path, Residency::Lazy)
                 .context("touching cached model for LRU accounting")?;
+            // Touched first, so this model is the most recent entry in
+            // the LRU order before anything below considers evicting.
+            //
+            // A cache hit used to return here, which meant every
+            // budget check in this file guarded *model loading* and
+            // nothing guarded the allocation that actually fails. See
+            // `make_device_room_besides`.
+            self.make_device_room_besides(path)?;
             return Ok(());
         }
 
@@ -416,6 +424,95 @@ impl SharedState {
             self.registry
                 .evict(evict_id)
                 .context("evicting LRU model")?;
+        }
+    }
+
+    /// Frees device memory for the *context* an already-resident model
+    /// is about to allocate, by evicting other resident models.
+    ///
+    /// # The gap this closes
+    ///
+    /// [`Self::make_room_for`] runs only on the path that loads a model
+    /// that is not resident yet -- `ensure_loaded` returns before
+    /// reaching it on a cache hit. So the budget guarded model weights
+    /// and never guarded a context, even though a context is allocated
+    /// per generation, is sized by the client (16k tokens is an ordinary
+    /// ask), and is device memory just the same.
+    ///
+    /// Measured on genie: `gemma-4-12B` (6.4 GB) and
+    /// `Qwen3-Coder-30B-A3B` (17.7 GB) both resident on a 16.3 GB card,
+    /// 14126 MiB held and 1.68 GB free, and every generation against
+    /// *either* model failing. Nothing was pinned and both had been used
+    /// minutes apart -- the daemon simply had no path that would give
+    /// memory back, because neither request was a load. llama.cpp cannot
+    /// report an exhausted device, so each failure surfaced as
+    /// `null reference from llama.cpp`.
+    ///
+    /// The 30B is larger than the whole device budget on its own, so
+    /// `make_room_for`'s "bigger than budget, proceed anyway" branch let
+    /// it in alongside a model that was already there. That branch is
+    /// right -- a model too big for the budget must still be servable --
+    /// which is exactly why the *other* side needs this: what one
+    /// request is allowed to over-commit, the next one has to be able to
+    /// reclaim.
+    ///
+    /// Evicts other models only. The model being generated against is
+    /// the point of the request.
+    fn make_device_room_besides(&mut self, keep: &Path) -> Result<()> {
+        loop {
+            // No device means no device budget to violate.
+            let Some((free, _total)) = rampipe::llama::gpu_memory_bytes() else {
+                return Ok(());
+            };
+            // Zero additional bytes: the question here is not whether
+            // something new fits, it is whether what is *already*
+            // resident has left anything to allocate into.
+            if self
+                .registry
+                .fits_within_device_budget(0, free, self.budget_fraction)
+            {
+                return Ok(());
+            }
+
+            let lru_ids = self.registry.resident_ids_by_lru();
+            let evictable = lru_ids.into_iter().find_map(|id| {
+                let evict_path = self.path_for_id(id)?;
+                if evict_path == keep {
+                    return None;
+                }
+                let session = self.sessions.get(&evict_path)?;
+                // Same invariant `make_room_for` relies on: a live
+                // conversation holds its own clone, and evicting under
+                // it would fail anyway.
+                if Arc::strong_count(session) != 1 {
+                    return None;
+                }
+                // Evicting a model that never touched the GPU frees no
+                // GPU memory, so it is not a candidate for this.
+                session.device_bytes()?;
+                Some((id, evict_path))
+            });
+
+            let Some((evict_id, evict_path)) = evictable else {
+                // Nothing left to give back -- every other resident
+                // model is pinned, CPU-only, or there are none. Proceed
+                // and let the allocation succeed or fail on its own
+                // terms, the same judgement `make_room_for` makes: this
+                // function exists to reclaim memory, not to add a new
+                // way to refuse a request.
+                return Ok(());
+            };
+
+            eprintln!(
+                "rampiped: evicting {} (LRU) to leave device memory for a context on {}",
+                evict_path.display(),
+                keep.display()
+            );
+            self.sessions.remove(&evict_path); // drops LlamaSession -> drops its ModelHandle
+            self.model_stats.remove(&evict_path);
+            self.registry
+                .evict(evict_id)
+                .context("evicting LRU model to free device memory for a context")?;
         }
     }
 

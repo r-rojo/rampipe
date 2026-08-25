@@ -52,6 +52,28 @@ pub enum LlamaSessionError {
     ModelLoad(#[from] llama_cpp_2::LlamaModelLoadError),
     #[error("llama.cpp context error: {0}")]
     ContextLoad(#[from] llama_cpp_2::LlamaContextLoadError),
+    /// What running out of device memory actually looks like.
+    ///
+    /// llama.cpp has no "out of VRAM" result: a context it cannot
+    /// allocate comes back as a null pointer, which `llama_cpp_2` turns
+    /// into `LlamaContextLoadError::NullReturn` and this crate used to
+    /// pass straight through as `llama.cpp context error: null reference
+    /// from llama.cpp`. That message named neither the size asked for
+    /// nor the memory available, and the same text is produced by an
+    /// exhausted device, an absurd `n_ctx`, and a genuinely broken
+    /// model -- three problems with three different answers.
+    #[error(
+        "could not allocate a {n_ctx}-token context: {source} -- {free_mib} MiB free of \
+         {total_mib} MiB on the device (llama.cpp reports an exhausted device as a null \
+         pointer, so this is usually what out-of-memory looks like)"
+    )]
+    ContextAllocation {
+        n_ctx: u32,
+        free_mib: u64,
+        total_mib: u64,
+        #[source]
+        source: llama_cpp_2::LlamaContextLoadError,
+    },
     #[error("llama.cpp decode error: {0}")]
     Decode(#[from] llama_cpp_2::DecodeError),
     #[error("tokenize error: {0}")]
@@ -793,6 +815,37 @@ impl LlamaSession {
         self.handle.id()
     }
 
+    /// `LlamaModel::new_context`, with an out-of-memory failure that
+    /// says so.
+    ///
+    /// Every context in this file goes through here rather than calling
+    /// `new_context` directly, because the failure being translated is
+    /// indistinguishable at the call site -- see
+    /// [`LlamaSessionError::ContextAllocation`]. `asked` is passed in
+    /// rather than read back off `params`, so the number in the message
+    /// is the one the caller intended, including where that is zero
+    /// meaning the model's own trained size.
+    fn new_context_reporting(
+        &self,
+        params: LlamaContextParams,
+        asked: u32,
+    ) -> Result<LlamaContext<'_>, LlamaSessionError> {
+        match self.model.new_context(&self.backend, params) {
+            Ok(context) => Ok(context),
+            // With no device to report on there is nothing to add, and
+            // the plain error is still the honest one.
+            Err(source) => Err(match gpu_memory_bytes() {
+                Some((free, total)) => LlamaSessionError::ContextAllocation {
+                    n_ctx: asked,
+                    free_mib: free / (1024 * 1024),
+                    total_mib: total / (1024 * 1024),
+                    source,
+                },
+                None => LlamaSessionError::ContextLoad(source),
+            }),
+        }
+    }
+
     /// GPU/device memory this session's model is using, if any -- see
     /// `ModelHandle::device_bytes`. `None` for a model that ran CPU-only.
     pub fn device_bytes(&self) -> Option<u64> {
@@ -853,7 +906,7 @@ impl LlamaSession {
         if let Some(pooling_type) = pooling.to_llama() {
             ctx_params = ctx_params.with_pooling_type(pooling_type);
         }
-        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let mut ctx = self.new_context_reporting(ctx_params, 0)?;
 
         let capacity = (ctx.n_ctx() as usize).min(EMBED_MAX_TOKENS).max(1);
         let mut batch = LlamaBatch::new(capacity, 1);
@@ -909,7 +962,7 @@ impl LlamaSession {
         // the KV cache again (~224MiB -> ~448MiB at this model size),
         // still negligible next to the ~4.4GiB model weights.
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(8192));
-        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let mut ctx = self.new_context_reporting(ctx_params, 8192)?;
 
         let mut formatted_prompt = self.formatted_prompt(prompt)?;
         // Prefilling the assistant turn: `formatted_prompt` already ends
@@ -1052,7 +1105,7 @@ impl LlamaSession {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(Some(options.n_ctx))
             .with_defrag_thold(defrag_thold);
-        let ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let ctx = self.new_context_reporting(ctx_params, options.n_ctx.get())?;
         let n_ctx = ctx.n_ctx() as i32;
 
         let template_text = self
@@ -1134,7 +1187,7 @@ impl LlamaSession {
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(meta.n_ctx as u32))
             .with_defrag_thold(CONVERSATION_DEFRAG_THOLD);
-        let mut ctx = self.model.new_context(&self.backend, ctx_params)?;
+        let mut ctx = self.new_context_reporting(ctx_params, meta.n_ctx as u32)?;
         let n_ctx = ctx.n_ctx() as i32;
 
         let template_text = self
