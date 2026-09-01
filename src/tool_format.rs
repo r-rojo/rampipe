@@ -268,7 +268,7 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
     // Detected by actually parsing the payload with the sentinels still
     // in place, never by looking for a brace: a delimited-family value
     // that happened to contain `{` would pass that and fail this.
-    if let Some(format) = derive_json_format(&region) {
+    if let Some(format) = derive_json_format(region) {
         return Some(format);
     }
 
@@ -284,8 +284,8 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
     // is unambiguously that one. `Separated` is what remains when there
     // is no per-argument opener at all.
     let format = derive_delimited_format(
-        &region,
-        &no_args_region,
+        region,
+        no_args_region,
         name_at,
         arg1_at,
         val1_at,
@@ -294,8 +294,8 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
     )
     .or_else(|| {
         derive_separated_format(
-            &region,
-            &no_args_region,
+            region,
+            no_args_region,
             name_at,
             arg1_at,
             val1_at,
