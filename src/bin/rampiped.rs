@@ -536,7 +536,11 @@ impl SharedState {
 /// one line, done); `OpenConversation` hands the rest of this
 /// connection's lifetime to [`handle_conversation`], which reads and
 /// replies to any number of further turns on the same connection.
-fn handle_connection(stream: UnixStream, state: &Mutex<SharedState>, settings: &ModelSettings) -> Result<()> {
+fn handle_connection(
+    stream: UnixStream,
+    state: &Mutex<SharedState>,
+    settings: &ModelSettings,
+) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone().context("cloning connection stream")?);
     let mut line = String::new();
     reader.read_line(&mut line).context("reading request")?;
@@ -643,8 +647,11 @@ fn handle_request(
         .sessions
         .get(&request.model_path)
         .expect("ensure_loaded just guaranteed this");
-    let sampling =
-        wire_sampling_to_sampling(request.sampling.unwrap_or_else(|| settings.sampling_for(&request.model_path)));
+    let sampling = wire_sampling_to_sampling(
+        request
+            .sampling
+            .unwrap_or_else(|| settings.sampling_for(&request.model_path)),
+    );
     let max_new_tokens = request
         .max_new_tokens
         .or_else(|| settings.max_new_tokens_for(&request.model_path))
@@ -938,7 +945,10 @@ fn run_conversation_turn(
     // Caller first, then the model's own configured cap, then a floor
     // generous enough to write a file. The old default was the caller's
     // problem to get right and it got it wrong.
-    let max_new_tokens = turn.max_new_tokens.or(configured_tokens).unwrap_or(DEFAULT_MAX_NEW_TOKENS);
+    let max_new_tokens = turn
+        .max_new_tokens
+        .or(configured_tokens)
+        .unwrap_or(DEFAULT_MAX_NEW_TOKENS);
     let grammar_complete = turn
         .grammar_completion
         .clone()
@@ -1038,17 +1048,25 @@ fn main() -> Result<()> {
         .clone()
         .or_else(ModelSettings::default_path)
         .unwrap_or_else(|| PathBuf::from("models.toml"));
-    let settings = Arc::new(ModelSettings::load(&settings_path).with_context(|| {
-        format!("reading model settings from {}", settings_path.display())
-    })?);
+    let settings = Arc::new(
+        ModelSettings::load(&settings_path)
+            .with_context(|| format!("reading model settings from {}", settings_path.display()))?,
+    );
     if settings.models.is_empty() && settings.default.is_none() {
-        println!("rampiped: no per-model settings at {} -- callers get what they send", settings_path.display());
+        println!(
+            "rampiped: no per-model settings at {} -- callers get what they send",
+            settings_path.display()
+        );
     } else {
         println!(
             "rampiped: model settings from {} ({} model(s){})",
             settings_path.display(),
             settings.models.len(),
-            if settings.default.is_some() { ", plus a default" } else { "" }
+            if settings.default.is_some() {
+                ", plus a default"
+            } else {
+                ""
+            }
         );
     }
 

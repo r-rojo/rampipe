@@ -24,7 +24,7 @@
 
 use anyhow::{Context, Result, bail};
 use rampipe::client::{RampipedClient, RampipedConversation};
-use rampipe::protocol::{WireOverflowPolicy};
+use rampipe::protocol::WireOverflowPolicy;
 use std::path::PathBuf;
 
 const MAX_NEW_TOKENS: i32 = 60;
@@ -37,9 +37,17 @@ fn main() -> Result<()> {
     let model_b = PathBuf::from(args.next().context(usage)?);
 
     println!("=== turn 1: context carryover over the wire ===");
-    let mut conversation =
-        RampipedConversation::open(&socket_path, &model_a, 4096, WireOverflowPolicy::Fail, None, None, Vec::new(), None)
-            .context("opening conversation")?;
+    let mut conversation = RampipedConversation::open(
+        &socket_path,
+        &model_a,
+        4096,
+        WireOverflowPolicy::Fail,
+        None,
+        None,
+        Vec::new(),
+        None,
+    )
+    .context("opening conversation")?;
 
     let turn1 = conversation
         .send(

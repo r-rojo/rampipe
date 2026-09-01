@@ -50,7 +50,10 @@ fn main() {
         std::process::exit(2);
     };
     if !args.is_empty() {
-        eprintln!("rampiped-script: unrecognized argument(s): {}", args.join(" "));
+        eprintln!(
+            "rampiped-script: unrecognized argument(s): {}",
+            args.join(" ")
+        );
         std::process::exit(2);
     }
 
@@ -65,7 +68,11 @@ fn main() {
         "rampiped-script: {} turn(s) from {script_path}, context {}, tool calls {}",
         script.turns.len(),
         script.context_size,
-        if script.supports_tool_calls { "supported" } else { "UNSUPPORTED (deliberately)" }
+        if script.supports_tool_calls {
+            "supported"
+        } else {
+            "UNSUPPORTED (deliberately)"
+        }
     );
 
     let daemon = match ScriptedDaemon::bind(&socket, script) {
@@ -103,10 +110,16 @@ fn main() {
 /// can grep it and a person can diff it.
 fn full_record(said: &Said) -> String {
     match said {
-        Said::Opened { system, tools, n_ctx } => format!(
+        Said::Opened {
+            system,
+            tools,
+            n_ctx,
+        } => format!(
             "===== OPENED n_ctx={n_ctx} tools=[{}]\n{}\n",
             tools.join(", "),
-            system.clone().unwrap_or_else(|| "(no system block)".to_string())
+            system
+                .clone()
+                .unwrap_or_else(|| "(no system block)".to_string())
         ),
         Said::Message(text) => format!("===== MESSAGE\n{text}\n"),
         Said::ToolResults(results) => format!(
@@ -119,7 +132,11 @@ fn full_record(said: &Said) -> String {
 
 fn render(said: &Said) -> String {
     match said {
-        Said::Opened { system, tools, n_ctx } => format!(
+        Said::Opened {
+            system,
+            tools,
+            n_ctx,
+        } => format!(
             "\n── opened ── n_ctx {n_ctx}, tools [{}]\n   system block: {}",
             tools.join(", "),
             match system {
@@ -132,7 +149,11 @@ fn render(said: &Said) -> String {
         ),
         Said::Message(text) => format!("\n── message ──\n{}", indent(text)),
         Said::ToolResults(results) => {
-            format!("\n── tool results ({}) ──\n{}", results.len(), indent(&results.join("\n---\n")))
+            format!(
+                "\n── tool results ({}) ──\n{}",
+                results.len(),
+                indent(&results.join("\n---\n"))
+            )
         }
     }
 }
@@ -143,7 +164,11 @@ fn render(said: &Said) -> String {
 fn indent(text: &str) -> String {
     const MAX_LINES: usize = 12;
     let lines: Vec<&str> = text.lines().collect();
-    let mut out: Vec<String> = lines.iter().take(MAX_LINES).map(|line| format!("   | {line}")).collect();
+    let mut out: Vec<String> = lines
+        .iter()
+        .take(MAX_LINES)
+        .map(|line| format!("   | {line}"))
+        .collect();
     if lines.len() > MAX_LINES {
         out.push(format!("   | ... ({} more lines)", lines.len() - MAX_LINES));
     }

@@ -98,7 +98,8 @@ pub struct ChatCapabilities {
 /// the renderer as a function keeps this module free of any direct
 /// minijinja dependency, so the derivation logic below is ordinary
 /// string code that unit tests can drive with a trivial stub.
-pub type RenderFn<'a> = &'a dyn Fn(&str, &serde_json::Value, Option<&serde_json::Value>) -> Option<String>;
+pub type RenderFn<'a> =
+    &'a dyn Fn(&str, &serde_json::Value, Option<&serde_json::Value>) -> Option<String>;
 
 /// Probes `template_text` for each capability in [`ChatCapabilities`].
 #[must_use]
@@ -282,10 +283,26 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
     // non-empty opener before every argument -- so a format it accepts
     // is unambiguously that one. `Separated` is what remains when there
     // is no per-argument opener at all.
-    let format = derive_delimited_format(&region, &no_args_region, name_at, arg1_at, val1_at, arg2_at, val2_at)
-        .or_else(|| {
-            derive_separated_format(&region, &no_args_region, name_at, arg1_at, val1_at, arg2_at, val2_at)
-        })?;
+    let format = derive_delimited_format(
+        &region,
+        &no_args_region,
+        name_at,
+        arg1_at,
+        val1_at,
+        arg2_at,
+        val2_at,
+    )
+    .or_else(|| {
+        derive_separated_format(
+            &region,
+            &no_args_region,
+            name_at,
+            arg1_at,
+            val1_at,
+            arg2_at,
+            val2_at,
+        )
+    })?;
     Some(format)
 }
 
@@ -294,7 +311,10 @@ pub fn derive_tool_call_format(template_text: &str, render: RenderFn<'_>) -> Opt
 /// renders share.
 fn diverging_region<'a>(plain: &str, with_calls: &'a str) -> Option<&'a str> {
     let prefix = common_prefix_len(plain.as_bytes(), with_calls.as_bytes());
-    let suffix = common_suffix_len(&plain.as_bytes()[prefix..], &with_calls.as_bytes()[prefix..]);
+    let suffix = common_suffix_len(
+        &plain.as_bytes()[prefix..],
+        &with_calls.as_bytes()[prefix..],
+    );
     let end = with_calls.len().checked_sub(suffix)?;
     // Byte offsets from a bytewise comparison can land inside a
     // multi-byte character; `get` yields None rather than panicking,
@@ -307,7 +327,11 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 }
 
 fn common_suffix_len(a: &[u8], b: &[u8]) -> usize {
-    a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count()
+    a.iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count()
 }
 
 /// Recovers a [`ToolFormat::Json`] if `region`'s payload really is a
@@ -331,10 +355,17 @@ fn derive_json_format(region: &str) -> Option<ToolFormat> {
     let object = parsed.as_object()?;
     // Locate the keys by their *values*, never by assuming a key name:
     // "name"/"arguments" is the common spelling but not a guarantee.
-    let name_key = object.iter().find(|(_, value)| value.as_str() == Some(NAME)).map(|(key, _)| key.clone())?;
+    let name_key = object
+        .iter()
+        .find(|(_, value)| value.as_str() == Some(NAME))
+        .map(|(key, _)| key.clone())?;
     let arguments_key = object
         .iter()
-        .find(|(_, value)| value.as_object().is_some_and(|args| args.values().any(|v| v.as_str() == Some(VAL1))))
+        .find(|(_, value)| {
+            value
+                .as_object()
+                .is_some_and(|args| args.values().any(|v| v.as_str() == Some(VAL1)))
+        })
         .map(|(key, _)| key.clone())?;
 
     Some(ToolFormat::Json {
@@ -503,7 +534,11 @@ fn derive_separated_format(
     // empty names, values, or an unbounded call. `arg_close` may
     // legitimately be empty -- a family that does not wrap its values --
     // which is why it is not on this list.
-    if name_close.is_empty() || arg_name_close.is_empty() || arg_sep.is_empty() || call_close.is_empty() {
+    if name_close.is_empty()
+        || arg_name_close.is_empty()
+        || arg_sep.is_empty()
+        || call_close.is_empty()
+    {
         return None;
     }
 
@@ -539,12 +574,28 @@ fn shared_prefix<'a>(a: &'a str, b: &str) -> &'a str {
 #[must_use]
 pub fn parse_tool_calls(text: &str, format: &ToolFormat) -> Vec<ToolCall> {
     match format {
-        ToolFormat::Json { call_open, call_close, name_key, arguments_key } => {
-            parse_json_calls(text, call_open, call_close, name_key, arguments_key)
-        }
-        ToolFormat::Delimited { call_open, name_close, arg_open, arg_name_close, arg_close, call_close } => {
-            parse_delimited_calls(text, call_open, name_close, arg_open, arg_name_close, arg_close, call_close)
-        }
+        ToolFormat::Json {
+            call_open,
+            call_close,
+            name_key,
+            arguments_key,
+        } => parse_json_calls(text, call_open, call_close, name_key, arguments_key),
+        ToolFormat::Delimited {
+            call_open,
+            name_close,
+            arg_open,
+            arg_name_close,
+            arg_close,
+            call_close,
+        } => parse_delimited_calls(
+            text,
+            call_open,
+            name_close,
+            arg_open,
+            arg_name_close,
+            arg_close,
+            call_close,
+        ),
         ToolFormat::Separated {
             call_open,
             name_close,
@@ -624,7 +675,10 @@ fn named(name: String, arguments: serde_json::Map<String, serde_json::Value>) ->
     if name.is_empty() {
         return None;
     }
-    Some(ToolCall { name, arguments: serde_json::Value::Object(arguments) })
+    Some(ToolCall {
+        name,
+        arguments: serde_json::Value::Object(arguments),
+    })
 }
 
 fn parse_json_calls(
@@ -637,7 +691,10 @@ fn parse_json_calls(
     scan_calls(text, call_open, call_close, |body| {
         let value = serde_json::from_str::<serde_json::Value>(body.trim()).ok()?;
         let name = value.get(name_key)?.as_str()?.to_string();
-        let arguments = value.get(arguments_key).cloned().unwrap_or(serde_json::Value::Null);
+        let arguments = value
+            .get(arguments_key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         (!name.is_empty()).then_some(ToolCall { name, arguments })
     })
 }
@@ -727,7 +784,9 @@ fn split_args<'a>(
         // A piece with no name separator is malformed, and ends the
         // walk rather than being fatal -- the same treatment the
         // delimited parser gives a severed argument.
-        let Some(at) = rest.find(arg_name_close) else { break };
+        let Some(at) = rest.find(arg_name_close) else {
+            break;
+        };
         let key = rest[..at].trim().to_string();
         let after_name = &rest[at + arg_name_close.len()..];
 
@@ -814,7 +873,9 @@ fn parse_delimited_calls(
         let mut args_rest = &body[name_end + name_close.len()..];
         while let Some(arg_start) = args_rest.find(arg_open) {
             let after_arg_open = &args_rest[arg_start + arg_open.len()..];
-            let Some(arg_name_end) = after_arg_open.find(arg_name_close) else { break };
+            let Some(arg_name_end) = after_arg_open.find(arg_name_close) else {
+                break;
+            };
             let arg_name = after_arg_open[..arg_name_end].trim().to_string();
             let after_name = &after_arg_open[arg_name_end + arg_name_close.len()..];
             // A value is whatever sits before the closer, verbatim
@@ -822,7 +883,10 @@ fn parse_delimited_calls(
             // beyond the delimiters' own newlines would corrupt
             // file content passed as an argument.
             let (value, next) = match after_name.find(arg_close) {
-                Some(value_end) => (&after_name[..value_end], &after_name[value_end + arg_close.len()..]),
+                Some(value_end) => (
+                    &after_name[..value_end],
+                    &after_name[value_end + arg_close.len()..],
+                ),
                 None => (after_name, ""),
             };
             arguments.insert(arg_name, serde_json::Value::String(value.to_string()));
@@ -884,16 +948,31 @@ impl TurnEnd {
     #[must_use]
     pub fn of(format: &ToolFormat) -> Self {
         let (call_open, call_close) = match format {
-            ToolFormat::Json { call_open, call_close, .. }
-            | ToolFormat::Delimited { call_open, call_close, .. }
-            | ToolFormat::Separated { call_open, call_close, .. } => (call_open, call_close),
+            ToolFormat::Json {
+                call_open,
+                call_close,
+                ..
+            }
+            | ToolFormat::Delimited {
+                call_open,
+                call_close,
+                ..
+            }
+            | ToolFormat::Separated {
+                call_open,
+                call_close,
+                ..
+            } => (call_open, call_close),
         };
         Self {
             call_open: call_open.clone(),
             // Same candidate list the parser and `ends_mid_call` use, so
             // a family whose model emits a shorter closer than the
             // template renders stops where it actually stops.
-            closers: close_candidates(call_close).into_iter().map(str::to_string).collect(),
+            closers: close_candidates(call_close)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         }
     }
 
@@ -953,11 +1032,21 @@ impl TurnEnd {
 #[must_use]
 pub fn ends_mid_call(text: &str, format: &ToolFormat) -> bool {
     let (call_open, call_close) = match format {
-        ToolFormat::Json { call_open, call_close, .. }
-        | ToolFormat::Delimited { call_open, call_close, .. }
-        | ToolFormat::Separated { call_open, call_close, .. } => {
-            (call_open, call_close)
+        ToolFormat::Json {
+            call_open,
+            call_close,
+            ..
         }
+        | ToolFormat::Delimited {
+            call_open,
+            call_close,
+            ..
+        }
+        | ToolFormat::Separated {
+            call_open,
+            call_close,
+            ..
+        } => (call_open, call_close),
     };
     if call_open.is_empty() {
         return false;
@@ -1049,7 +1138,11 @@ pub fn render_opening(
     messages.push(serde_json::json!({ "role": "user", "content": USER }));
 
     let tools = tools.map(|tools| serde_json::json!(tools));
-    let rendered = render(template_text, &serde_json::Value::Array(messages), tools.as_ref())?;
+    let rendered = render(
+        template_text,
+        &serde_json::Value::Array(messages),
+        tools.as_ref(),
+    )?;
     let user_at = rendered.find(USER)?;
     Some(rendered[..user_at].to_string())
 }
@@ -1088,7 +1181,12 @@ impl ToolResultSpans {
     /// Wraps `results` in this template's own shape.
     #[must_use]
     pub fn render(&self, results: &[String]) -> String {
-        format!("{}{}{}", self.open, results.join(&self.separator), self.close)
+        format!(
+            "{}{}{}",
+            self.open,
+            results.join(&self.separator),
+            self.close
+        )
     }
 }
 
@@ -1105,14 +1203,20 @@ impl ToolResultSpans {
 /// turn and emits its own `<|im_end|>`), so it is derived rather than
 /// assembled.
 #[must_use]
-pub fn derive_tool_result_spans(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
+pub fn derive_tool_result_spans(
+    template_text: &str,
+    render: RenderFn<'_>,
+) -> Option<ToolResultSpans> {
     derive_tool_result_spans_by_role(template_text, render)
         .or_else(|| derive_tool_result_spans_native(template_text, render))
 }
 
 /// The `{"role": "tool"}` convention -- what the OpenAI-shaped families
 /// use, and what this crate assumed was the only one.
-fn derive_tool_result_spans_by_role(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
+fn derive_tool_result_spans_by_role(
+    template_text: &str,
+    render: RenderFn<'_>,
+) -> Option<ToolResultSpans> {
     let rendered = render(
         template_text,
         &serde_json::json!([
@@ -1132,9 +1236,15 @@ fn derive_tool_result_spans_by_role(template_text: &str, render: RenderFn<'_>) -
         return None;
     }
     Some(ToolResultSpans {
-        open: rendered.get(assistant_at + PLAIN.len()..first_at)?.to_string(),
-        separator: rendered.get(first_at + RESULT.len()..second_at)?.to_string(),
-        close: rendered.get(second_at + RESULT2.len()..reply_at)?.to_string(),
+        open: rendered
+            .get(assistant_at + PLAIN.len()..first_at)?
+            .to_string(),
+        separator: rendered
+            .get(first_at + RESULT.len()..second_at)?
+            .to_string(),
+        close: rendered
+            .get(second_at + RESULT2.len()..reply_at)?
+            .to_string(),
     })
 }
 
@@ -1154,7 +1264,10 @@ fn derive_tool_result_spans_by_role(template_text: &str, render: RenderFn<'_>) -
 /// message as a `tool_responses` array. Same three spans out the other
 /// end, so everything downstream is unchanged -- only the question being
 /// asked of the template differs.
-fn derive_tool_result_spans_native(template_text: &str, render: RenderFn<'_>) -> Option<ToolResultSpans> {
+fn derive_tool_result_spans_native(
+    template_text: &str,
+    render: RenderFn<'_>,
+) -> Option<ToolResultSpans> {
     let rendered = render(
         template_text,
         &serde_json::json!([
@@ -1199,11 +1312,14 @@ fn derive_tool_result_spans_native(template_text: &str, render: RenderFn<'_>) ->
     }
     Some(ToolResultSpans {
         open: rendered.get(anchor_at + USER.len()..first_at)?.to_string(),
-        separator: rendered.get(first_at + RESULT.len()..second_at)?.to_string(),
-        close: rendered.get(second_at + RESULT2.len()..reply_at)?.to_string(),
+        separator: rendered
+            .get(first_at + RESULT.len()..second_at)?
+            .to_string(),
+        close: rendered
+            .get(second_at + RESULT2.len()..reply_at)?
+            .to_string(),
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1244,7 +1360,6 @@ mod tests {
         );
     }
 
-
     use super::*;
 
     /// A stub renderer standing in for minijinja: enough of the two real
@@ -1268,8 +1383,15 @@ mod tests {
         let all = messages.as_array()?;
         for (index, message) in all.iter().enumerate() {
             let role = message.get("role")?.as_str()?;
-            let content = message.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
-            let role_at = |i: usize| all.get(i).and_then(|m| m.get("role")).and_then(serde_json::Value::as_str);
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let role_at = |i: usize| {
+                all.get(i)
+                    .and_then(|m| m.get("role"))
+                    .and_then(serde_json::Value::as_str)
+            };
             match role {
                 // Consecutive tool results share one user turn, exactly
                 // as the real template does (`if loop.previtem.role !=
@@ -1333,7 +1455,10 @@ mod tests {
         }
         for message in messages.as_array()? {
             let role = message.get("role")?.as_str()?;
-            let content = message.get("content").and_then(serde_json::Value::as_str).unwrap_or("");
+            let content = message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             match role {
                 "tool" => {
                     out.push_str("<|im_start|>tool\n");
@@ -1381,7 +1506,12 @@ mod tests {
             if role == "system" || role == "tool" {
                 continue;
             }
-            out.push_str(message.get("content").and_then(serde_json::Value::as_str).unwrap_or(""));
+            out.push_str(
+                message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(""),
+            );
         }
         Some(out)
     }
@@ -1397,7 +1527,14 @@ mod tests {
     fn derives_the_nested_xml_family() {
         let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
         match format {
-            ToolFormat::Delimited { call_open, name_close, arg_open, arg_name_close, arg_close, call_close } => {
+            ToolFormat::Delimited {
+                call_open,
+                name_close,
+                arg_open,
+                arg_name_close,
+                arg_close,
+                call_close,
+            } => {
                 assert_eq!(call_open, "<tool_call>\n<function=");
                 assert_eq!(arg_name_close, ">\n");
                 // No span may be empty -- an empty one matches at every
@@ -1413,7 +1550,10 @@ mod tests {
                 // The factorizations must recompose into the text the
                 // template really emits between each pair of sentinels.
                 assert_eq!(format!("{name_close}{arg_open}"), ">\n<parameter=");
-                assert_eq!(format!("{arg_close}{call_close}"), "\n</parameter>\n</function>\n</tool_call>");
+                assert_eq!(
+                    format!("{arg_close}{call_close}"),
+                    "\n</parameter>\n</function>\n</tool_call>"
+                );
             }
             other => panic!("expected Delimited, got {other:?}"),
         }
@@ -1423,7 +1563,12 @@ mod tests {
     fn derives_the_json_family() {
         let format = derive_tool_call_format("", &hermes_json_render).expect("derivable");
         match format {
-            ToolFormat::Json { call_open, call_close, name_key, arguments_key } => {
+            ToolFormat::Json {
+                call_open,
+                call_close,
+                name_key,
+                arguments_key,
+            } => {
                 assert_eq!(call_open, "<tool_call>\n");
                 assert_eq!(call_close, "\n</tool_call>");
                 assert_eq!(name_key, "name");
@@ -1442,7 +1587,13 @@ mod tests {
         let calls = parse_tool_calls(emitted, &format);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments.get("path").and_then(serde_json::Value::as_str), Some("src/main.rs"));
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str),
+            Some("src/main.rs")
+        );
     }
 
     #[test]
@@ -1452,7 +1603,13 @@ mod tests {
         let calls = parse_tool_calls(emitted, &format);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "read");
-        assert_eq!(calls[0].arguments.get("path").and_then(serde_json::Value::as_str), Some("src/main.rs"));
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str),
+            Some("src/main.rs")
+        );
     }
 
     #[test]
@@ -1474,7 +1631,13 @@ mod tests {
         );
         let calls = parse_tool_calls(emitted, &format);
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].arguments.get("path").and_then(serde_json::Value::as_str), Some("b.py"));
+        assert_eq!(
+            calls[1]
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str),
+            Some("b.py")
+        );
     }
 
     /// A value containing the delimiters' own characters (file content
@@ -1486,7 +1649,10 @@ mod tests {
         let emitted = "<tool_call>\n<function=write>\n<parameter=content>\nfn main() {\n    println!(\"<hi>\");\n}\n</parameter>\n</function>\n</tool_call>";
         let calls = parse_tool_calls(emitted, &format);
         assert_eq!(
-            calls[0].arguments.get("content").and_then(serde_json::Value::as_str),
+            calls[0]
+                .arguments
+                .get("content")
+                .and_then(serde_json::Value::as_str),
             Some("fn main() {\n    println!(\"<hi>\");\n}")
         );
     }
@@ -1497,7 +1663,13 @@ mod tests {
         let emitted = "<tool_call>\n<function=read>\n<parameter=path>\nsrc/main.rs";
         let calls = parse_tool_calls(emitted, &format);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments.get("path").and_then(serde_json::Value::as_str), Some("src/main.rs"));
+        assert_eq!(
+            calls[0]
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str),
+            Some("src/main.rs")
+        );
     }
 
     /// The measured failure -- see `ends_mid_call`'s own doc comment.
@@ -1505,14 +1677,23 @@ mod tests {
     fn a_reply_severed_just_inside_a_call_marker_is_not_a_final_answer() {
         let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
         let severed = "Let me create the UI module properly:\n<tool_call>";
-        assert!(parse_tool_calls(severed, &format).is_empty(), "nothing recoverable yet");
-        assert!(ends_mid_call(severed, &format), "but it is plainly not finished");
+        assert!(
+            parse_tool_calls(severed, &format).is_empty(),
+            "nothing recoverable yet"
+        );
+        assert!(
+            ends_mid_call(severed, &format),
+            "but it is plainly not finished"
+        );
     }
 
     #[test]
     fn a_reply_severed_part_way_through_the_marker_is_also_caught() {
         let format = derive_tool_call_format("", &qwen_xml_render).expect("derivable");
-        for severed in ["Now I will write it.\n<tool", "Now I will write it.\n<tool_call>\n<func"] {
+        for severed in [
+            "Now I will write it.\n<tool",
+            "Now I will write it.\n<tool_call>\n<func",
+        ] {
             assert!(ends_mid_call(severed, &format), "{severed:?}");
         }
     }
@@ -1542,7 +1723,10 @@ mod tests {
         // Still parses, and still is not flagged: the unterminated-call
         // rule must not sweep up calls that really did close.
         assert_eq!(parse_tool_calls(complete, &format).len(), 1);
-        assert!(!ends_mid_call("I have finished the task.", &format), "prose is not a severed call");
+        assert!(
+            !ends_mid_call("I have finished the task.", &format),
+            "prose is not a severed call"
+        );
     }
 
     #[test]
@@ -1561,10 +1745,24 @@ mod tests {
     #[test]
     fn capabilities_are_detected_per_field() {
         let full = derive_capabilities("", &qwen_xml_render);
-        assert_eq!(full, ChatCapabilities { system: true, tools: true, tool_results: true });
+        assert_eq!(
+            full,
+            ChatCapabilities {
+                system: true,
+                tools: true,
+                tool_results: true
+            }
+        );
 
         let none = derive_capabilities("", &plain_render);
-        assert_eq!(none, ChatCapabilities { system: false, tools: false, tool_results: false });
+        assert_eq!(
+            none,
+            ChatCapabilities {
+                system: false,
+                tools: false,
+                tool_results: false
+            }
+        );
     }
 
     /// A template that ignores the `tools` variable renders identically
@@ -1578,7 +1776,12 @@ mod tests {
         ) -> Option<String> {
             let mut out = String::new();
             for message in messages.as_array()? {
-                out.push_str(message.get("content").and_then(serde_json::Value::as_str).unwrap_or(""));
+                out.push_str(
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                );
             }
             Some(out)
         }
@@ -1592,13 +1795,22 @@ mod tests {
 
     #[test]
     fn render_opening_includes_the_system_text_and_tool_names() {
-        let tools = vec![ToolSpec::new("read", "Read a file", serde_json::json!({
-            "type": "object",
-            "properties": { "path": { "type": "string", "description": "the path" } },
-            "required": ["path"]
-        }))];
-        let opening =
-            render_opening("", Some("You are a coding agent."), Some(&tools), &qwen_xml_render).expect("renders");
+        let tools = vec![ToolSpec::new(
+            "read",
+            "Read a file",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "the path" } },
+                "required": ["path"]
+            }),
+        )];
+        let opening = render_opening(
+            "",
+            Some("You are a coding agent."),
+            Some(&tools),
+            &qwen_xml_render,
+        )
+        .expect("renders");
         assert!(opening.contains("You are a coding agent."), "{opening}");
         assert!(opening.contains("read"), "{opening}");
         // Everything up to, but not including, the first user content.
@@ -1643,7 +1855,10 @@ mod tests {
         let call = "<|tool_call>call:read{path:<|\"|>src/timeline.rs<|\"|>}<tool_call|>";
 
         // Mid-call: nothing has closed, so nothing is decided.
-        assert_eq!(end.reached("<|tool_call>call:read{path:<|\"|>src/tim"), None);
+        assert_eq!(
+            end.reached("<|tool_call>call:read{path:<|\"|>src/tim"),
+            None
+        );
         // Closed, nothing after it yet: still undecided, the model may
         // be about to open another call.
         assert_eq!(end.reached(call), None);
@@ -1652,17 +1867,31 @@ mod tests {
         // A second genuine call must survive -- this is the case that
         // makes "stop at the first closer" wrong.
         let two = format!("{call}\n<|tool_call>call:verify{{}}<tool_call|>");
-        assert_eq!(end.reached(&two), None, "a turn may hold more than one call");
+        assert_eq!(
+            end.reached(&two),
+            None,
+            "a turn may hold more than one call"
+        );
         // ...including while the second opener is still arriving.
-        assert_eq!(end.reached(&format!("{call}\n<|tool")), None, "an opener half-emitted is not prose");
+        assert_eq!(
+            end.reached(&format!("{call}\n<|tool")),
+            None,
+            "an opener half-emitted is not prose"
+        );
 
         // The real failure: the model narrating a result it invented.
         let invented = format!(
             "{call}\n<|channel>thought\n<channel|>Read /home/rrojo/.agent99/workspace/pcapgen/src/timeline.rs \
              (lines 111-120):\n        }})\n            .collect();"
         );
-        let at = end.reached(&invented).expect("the model moved on from calling tools");
-        assert_eq!(&invented[..at], call, "the turn keeps the real call and drops the fabrication");
+        let at = end
+            .reached(&invented)
+            .expect("the model moved on from calling tools");
+        assert_eq!(
+            &invented[..at],
+            call,
+            "the turn keeps the real call and drops the fabrication"
+        );
     }
 
     /// A complete Gemma call is not a severed one.
@@ -1701,7 +1930,10 @@ mod tests {
 
         // ...and a genuinely severed one still reports as severed.
         let severed = "<|channel>thought\n<channel|><|tool_call>call:read{path:<|\"|>src/tim";
-        assert!(ends_mid_call(severed, &format), "this one really was cut off mid-argument");
+        assert!(
+            ends_mid_call(severed, &format),
+            "this one really was cut off mid-argument"
+        );
     }
 
     /// The comment a review records is a sentence, and a sentence has
@@ -1733,7 +1965,11 @@ mod tests {
             3,
             "three arguments -- the prose is one value, not several: {arguments:#?}"
         );
-        assert_eq!(arguments["comment"], serde_json::json!(prose), "the whole sentence");
+        assert_eq!(
+            arguments["comment"],
+            serde_json::json!(prose),
+            "the whole sentence"
+        );
         assert_eq!(arguments["file"], serde_json::json!("src/timeline.rs"));
         assert_eq!(arguments["line"], serde_json::json!("38"));
     }
@@ -1766,7 +2002,10 @@ mod tests {
         assert_eq!(calls[0].name, "comment");
         assert_eq!(calls[0].arguments["comment"], "The sort only uses seconds");
         assert_eq!(calls[0].arguments["file"], "src/timeline.rs");
-        assert_eq!(calls[0].arguments["line"], "38", "a bare value has to parse too");
+        assert_eq!(
+            calls[0].arguments["line"], "38",
+            "a bare value has to parse too"
+        );
         assert_eq!(
             calls[0].arguments.as_object().expect("object").len(),
             3,
@@ -1781,7 +2020,9 @@ mod tests {
     #[cfg(feature = "template")]
     #[test]
     fn two_calls_in_one_turn_stay_separate() {
-        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else { return };
+        let Ok(template) = std::fs::read_to_string("tests/fixtures/gemma4-12b.jinja") else {
+            return;
+        };
         let render = crate::chat_template::probe_renderer();
         let format = derive_tool_call_format(&template, &render).expect("derivable");
 
@@ -1794,7 +2035,11 @@ mod tests {
         assert_eq!(calls[0].arguments["path"], "a.rs");
         assert_eq!(calls[0].arguments["line"], "38");
         assert_eq!(calls[1].name, "verify");
-        assert_eq!(calls[1].arguments.as_object().expect("object").len(), 0, "no arguments at all");
+        assert_eq!(
+            calls[1].arguments.as_object().expect("object").len(),
+            0,
+            "no arguments at all"
+        );
     }
 
     #[cfg(feature = "template")]
@@ -1821,8 +2066,8 @@ mod tests {
             assert!(capabilities.system, "{fixture} renders a system block");
             assert!(capabilities.tools, "{fixture} renders a tool list");
 
-            let format =
-                derive_tool_call_format(&template, &render).unwrap_or_else(|| panic!("{fixture} must be derivable"));
+            let format = derive_tool_call_format(&template, &render)
+                .unwrap_or_else(|| panic!("{fixture} must be derivable"));
 
             // Let the template render a call in whatever format it
             // chooses, with values a real coding agent would send --
@@ -1843,15 +2088,25 @@ mod tests {
             .unwrap_or_else(|| panic!("{fixture} must render a call"));
 
             let calls = parse_tool_calls(&rendered, &format);
-            assert_eq!(calls.len(), 1, "{fixture}: format {format:?} on {rendered:?}");
+            assert_eq!(
+                calls.len(),
+                1,
+                "{fixture}: format {format:?} on {rendered:?}"
+            );
             assert_eq!(calls[0].name, "write", "{fixture}");
             assert_eq!(
-                calls[0].arguments.get("path").and_then(serde_json::Value::as_str),
+                calls[0]
+                    .arguments
+                    .get("path")
+                    .and_then(serde_json::Value::as_str),
                 Some("src/main.rs"),
                 "{fixture}"
             );
             assert_eq!(
-                calls[0].arguments.get("content").and_then(serde_json::Value::as_str),
+                calls[0]
+                    .arguments
+                    .get("content")
+                    .and_then(serde_json::Value::as_str),
                 Some(content),
                 "{fixture}: a multi-line value must survive verbatim"
             );
@@ -1865,9 +2120,17 @@ mod tests {
                     "required": ["path"]
                 }),
             )];
-            let opening = render_opening(&template, Some("You are a coding agent."), Some(&tools), &render)
-                .unwrap_or_else(|| panic!("{fixture} must render an opening"));
-            assert!(opening.contains("You are a coding agent."), "{fixture}: {opening}");
+            let opening = render_opening(
+                &template,
+                Some("You are a coding agent."),
+                Some(&tools),
+                &render,
+            )
+            .unwrap_or_else(|| panic!("{fixture} must render an opening"));
+            assert!(
+                opening.contains("You are a coding agent."),
+                "{fixture}: {opening}"
+            );
             assert!(opening.contains("read"), "{fixture}: {opening}");
 
             // Result spans, against the real template rather than the
@@ -1877,7 +2140,10 @@ mod tests {
             let spans = derive_tool_result_spans(&template, &render)
                 .unwrap_or_else(|| panic!("{fixture} must yield result spans"));
             let two = spans.render(&["FIRSTRESULT".to_string(), "SECONDRESULT".to_string()]);
-            assert!(two.contains("FIRSTRESULT") && two.contains("SECONDRESULT"), "{fixture}: {two}");
+            assert!(
+                two.contains("FIRSTRESULT") && two.contains("SECONDRESULT"),
+                "{fixture}: {two}"
+            );
             // Family-agnostic, which the previous version was not: it
             // counted `<tool_response>` literally, Qwen's spelling, so
             // Gemma's `<|tool_response>` scored zero and a working
@@ -1891,12 +2157,18 @@ mod tests {
             // And no probe sentinel may survive into what a model sees.
             for rendered in [&one, &two] {
                 for sentinel in [NAME, ARG1, VAL1, RESULT, PLAIN] {
-                    assert!(!rendered.contains(sentinel), "{fixture} leaks a probe sentinel: {rendered:?}");
+                    assert!(
+                        !rendered.contains(sentinel),
+                        "{fixture} leaks a probe sentinel: {rendered:?}"
+                    );
                 }
             }
         }
 
-        assert!(checked > 0, "no fixtures present -- this test proved nothing");
+        assert!(
+            checked > 0,
+            "no fixtures present -- this test proved nothing"
+        );
     }
 
     /// A real template that renders no tool calls at all must decline
@@ -1906,7 +2178,9 @@ mod tests {
     #[cfg(feature = "template")]
     #[test]
     fn a_real_template_without_tool_calls_declines() {
-        let Ok(template) = std::fs::read_to_string("tests/fixtures/jamba_mini_1_7_chat_template.jinja") else {
+        let Ok(template) =
+            std::fs::read_to_string("tests/fixtures/jamba_mini_1_7_chat_template.jinja")
+        else {
             eprintln!("skipping: jamba fixture not present");
             return;
         };
@@ -1915,9 +2189,17 @@ mod tests {
         // format whose spans are empty -- the degenerate case that
         // silently yields empty names.
         if let Some(format) = derive_tool_call_format(&template, &render)
-            && let ToolFormat::Delimited { name_close, arg_open, arg_close, .. } = &format
+            && let ToolFormat::Delimited {
+                name_close,
+                arg_open,
+                arg_close,
+                ..
+            } = &format
         {
-            assert!(!name_close.is_empty() && !arg_open.is_empty() && !arg_close.is_empty(), "{format:?}");
+            assert!(
+                !name_close.is_empty() && !arg_open.is_empty() && !arg_close.is_empty(),
+                "{format:?}"
+            );
         }
     }
 
@@ -1929,8 +2211,14 @@ mod tests {
     #[test]
     fn tool_result_spans_wrap_the_result_and_reopen_the_assistant() {
         let spans = derive_tool_result_spans("", &qwen_xml_render).expect("derivable");
-        assert_eq!(spans.open, "<|im_end|>\n<|im_start|>user\n<tool_response>\n");
-        assert_eq!(spans.close, "\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n");
+        assert_eq!(
+            spans.open,
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\n"
+        );
+        assert_eq!(
+            spans.close,
+            "\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n"
+        );
     }
 
     /// The fidelity gap this closes: several results must render as
@@ -1955,4 +2243,3 @@ mod tests {
         assert_eq!(rendered.matches("<tool_response>").count(), 1, "{rendered}");
     }
 }
-

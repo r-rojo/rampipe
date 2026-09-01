@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "template")]
+pub mod chat_template;
 #[cfg(feature = "client")]
 pub mod client;
 pub mod conversation;
 #[cfg(feature = "llama")]
 pub mod llama;
-#[cfg(feature = "template")]
-pub mod chat_template;
 pub mod model_settings;
 pub mod protocol;
 /// A `rampiped` that says what you tell it to -- see the module docs.

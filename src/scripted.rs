@@ -118,7 +118,10 @@ impl Turn {
     /// flag exists separately from the list.
     #[must_use]
     pub fn truncated(text: impl Into<String>) -> Self {
-        Self { truncated_tool_call: true, ..Self::says(text) }
+        Self {
+            truncated_tool_call: true,
+            ..Self::says(text)
+        }
     }
 
     /// A reply that has collapsed into repetition.
@@ -168,7 +171,11 @@ fn default_true() -> bool {
 impl Script {
     #[must_use]
     pub fn new(turns: Vec<Turn>) -> Self {
-        Self { turns, context_size: default_context(), supports_tool_calls: true }
+        Self {
+            turns,
+            context_size: default_context(),
+            supports_tool_calls: true,
+        }
     }
 
     /// Reads a script from a TOML file.
@@ -184,9 +191,14 @@ impl Script {
     /// committed_tokens = 11448   # 93% of the window -- where a real run collapsed
     /// ```
     pub fn from_file(path: &Path) -> Result<Self, ScriptError> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|source| ScriptError::Io { path: path.to_path_buf(), source })?;
-        toml::from_str(&text).map_err(|source| ScriptError::Parse { path: path.to_path_buf(), source })
+        let text = std::fs::read_to_string(path).map_err(|source| ScriptError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| ScriptError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -216,7 +228,11 @@ pub enum Said {
     /// The conversation was opened with this system block and these
     /// tools. Both are part of the protected opening in the real daemon,
     /// so what a harness puts here is what survives a full context.
-    Opened { system: Option<String>, tools: Vec<String>, n_ctx: u32 },
+    Opened {
+        system: Option<String>,
+        tools: Vec<String>,
+        n_ctx: u32,
+    },
     /// A user turn.
     Message(String),
     /// Tool results fed back, in call order.
@@ -281,7 +297,8 @@ impl ScriptedDaemon {
         let shutdown = Arc::new(Mutex::new(false));
 
         let handle = std::thread::spawn({
-            let (transcript, served, shutdown) = (transcript.clone(), served.clone(), shutdown.clone());
+            let (transcript, served, shutdown) =
+                (transcript.clone(), served.clone(), shutdown.clone());
             move || {
                 loop {
                     if *shutdown.lock().expect("shutdown lock") {
@@ -354,8 +371,15 @@ impl Drop for ScriptedDaemon {
 }
 
 /// One client connection: an open, then turns until it disconnects.
-fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, served: &Mutex<usize>) {
-    let Ok(writer) = stream.try_clone() else { return };
+fn serve(
+    stream: UnixStream,
+    script: &Script,
+    transcript: &Mutex<Vec<Said>>,
+    served: &Mutex<usize>,
+) {
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
     let mut writer = writer;
     let mut reader = BufReader::new(stream);
 
@@ -363,13 +387,17 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
     if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
         return;
     }
-    let Ok(ClientMessage::OpenConversation(open)) = serde_json::from_str::<ClientMessage>(line.trim())
+    let Ok(ClientMessage::OpenConversation(open)) =
+        serde_json::from_str::<ClientMessage>(line.trim())
     else {
         // Anything else is a client this does not pretend to be. Saying
         // so beats a silent hang while it waits for a reply.
-        let _ = reply(&mut writer, &ConversationResponse::Err {
-            message: "this is a scripted rampiped -- it serves conversations only".to_string(),
-        });
+        let _ = reply(
+            &mut writer,
+            &ConversationResponse::Err {
+                message: "this is a scripted rampiped -- it serves conversations only".to_string(),
+            },
+        );
         return;
     };
     record(transcript, said_opened(&open));
@@ -377,7 +405,9 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
     let response = if open.tools.is_empty() {
         ConversationResponse::Opened
     } else {
-        ConversationResponse::OpenedWithTools { supports_tool_calls: script.supports_tool_calls }
+        ConversationResponse::OpenedWithTools {
+            supports_tool_calls: script.supports_tool_calls,
+        }
     };
     if reply(&mut writer, &response).is_err() {
         return;
@@ -398,9 +428,12 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
             continue;
         }
         let Ok(request) = serde_json::from_str::<ConversationRequest>(line.trim()) else {
-            let _ = reply(&mut writer, &ConversationResponse::Err {
-                message: format!("scripted rampiped could not decode: {}", line.trim()),
-            });
+            let _ = reply(
+                &mut writer,
+                &ConversationResponse::Err {
+                    message: format!("scripted rampiped could not decode: {}", line.trim()),
+                },
+            );
             return;
         };
         let turn = match request {
@@ -411,10 +444,13 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
             ConversationRequest::Turn(turn) => turn,
         };
 
-        record(transcript, match &turn.tool_results {
-            Some(results) => Said::ToolResults(results.clone()),
-            None => Said::Message(turn.message.clone()),
-        });
+        record(
+            transcript,
+            match &turn.tool_results {
+                Some(results) => Said::ToolResults(results.clone()),
+                None => Said::Message(turn.message.clone()),
+            },
+        );
         committed += estimate_tokens(&match &turn.tool_results {
             Some(results) => results.join("\n"),
             None => turn.message.clone(),
@@ -432,17 +468,22 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
             // author did not predict, and that is the finding -- masking
             // it with a plausible answer would turn a discovery into a
             // passing test.
-            let _ = reply(&mut writer, &ConversationResponse::Err {
-                message: format!(
-                    "scripted rampiped ran out: the script has {} turn(s) and the harness asked for turn {}",
-                    script.turns.len(),
-                    at + 1
-                ),
-            });
+            let _ = reply(
+                &mut writer,
+                &ConversationResponse::Err {
+                    message: format!(
+                        "scripted rampiped ran out: the script has {} turn(s) and the harness asked for turn {}",
+                        script.turns.len(),
+                        at + 1
+                    ),
+                },
+            );
             return;
         };
 
-        let generated = scripted.tokens_generated.unwrap_or_else(|| estimate_tokens(&scripted.text));
+        let generated = scripted
+            .tokens_generated
+            .unwrap_or_else(|| estimate_tokens(&scripted.text));
         committed += generated;
         let response = ConversationResponse::Turn {
             text: scripted.text.clone(),
@@ -463,7 +504,11 @@ fn serve(stream: UnixStream, script: &Script, transcript: &Mutex<Vec<Said>>, ser
 fn said_opened(open: &OpenConversationRequest) -> Said {
     Said::Opened {
         system: open.system.clone(),
-        tools: open.tools.iter().map(|tool| tool.function.name.clone()).collect(),
+        tools: open
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect(),
         n_ctx: open.n_ctx,
     }
 }
@@ -499,7 +544,11 @@ mod tests {
     use crate::protocol::{ToolSpec, WireOverflowPolicy};
 
     fn tools() -> Vec<ToolSpec> {
-        vec![ToolSpec::new("read", "read a file", serde_json::json!({"type": "object", "properties": {}}))]
+        vec![ToolSpec::new(
+            "read",
+            "read a file",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )]
     }
 
     /// The whole point: what the harness said is recoverable, and *where*
@@ -518,7 +567,9 @@ mod tests {
             None,
         )
         .expect("open");
-        conversation.send("begin", None, None, None, None, None).expect("turn");
+        conversation
+            .send("begin", None, None, None, None, None)
+            .expect("turn");
         drop(conversation);
 
         let transcript = daemon.transcript();
@@ -532,7 +583,10 @@ mod tests {
             }
         );
         assert_eq!(transcript[1], Said::Message("begin".to_string()));
-        assert_eq!(daemon.system_block().as_deref(), Some("SYSTEM: the briefing"));
+        assert_eq!(
+            daemon.system_block().as_deref(),
+            Some("SYSTEM: the briefing")
+        );
     }
 
     /// A tool result must be recorded as a result, not as user text.
@@ -540,9 +594,11 @@ mod tests {
     /// a `<tool_response>` answering no call at all.
     #[test]
     fn a_tool_result_is_not_recorded_as_a_message() {
-        let daemon =
-            ScriptedDaemon::start(Script::new(vec![Turn::calls("read", serde_json::json!({})), Turn::says("done")]))
-                .expect("start");
+        let daemon = ScriptedDaemon::start(Script::new(vec![
+            Turn::calls("read", serde_json::json!({})),
+            Turn::says("done"),
+        ]))
+        .expect("start");
         let mut conversation = RampipedConversation::open(
             daemon.socket(),
             Path::new("/nonexistent/model.gguf"),
@@ -554,8 +610,14 @@ mod tests {
             None,
         )
         .expect("open");
-        let first = conversation.send("go", None, None, None, None, None).expect("turn");
-        assert_eq!(first.tool_calls.len(), 1, "the script's call has to arrive as a call");
+        let first = conversation
+            .send("go", None, None, None, None, None)
+            .expect("turn");
+        assert_eq!(
+            first.tool_calls.len(),
+            1,
+            "the script's call has to arrive as a call"
+        );
         conversation
             .send_tool_results(&["the file contents".to_string()], None, None, None, None)
             .expect("results");
@@ -563,7 +625,10 @@ mod tests {
 
         let transcript = daemon.transcript();
         assert_eq!(transcript[1], Said::Message("go".to_string()));
-        assert_eq!(transcript[2], Said::ToolResults(vec!["the file contents".to_string()]));
+        assert_eq!(
+            transcript[2],
+            Said::ToolResults(vec!["the file contents".to_string()])
+        );
     }
 
     /// Context pressure on demand -- the condition under which a real
@@ -587,9 +652,16 @@ mod tests {
         )
         .expect("open");
 
-        let healthy = conversation.send("one", None, None, None, None, None).expect("turn");
-        assert_eq!((healthy.committed_tokens, healthy.context_size), (7031, 12288));
-        let collapsed = conversation.send("two", None, None, None, None, None).expect("turn");
+        let healthy = conversation
+            .send("one", None, None, None, None, None)
+            .expect("turn");
+        assert_eq!(
+            (healthy.committed_tokens, healthy.context_size),
+            (7031, 12288)
+        );
+        let collapsed = conversation
+            .send("two", None, None, None, None, None)
+            .expect("turn");
         assert_eq!(collapsed.committed_tokens, 11448);
         assert!(collapsed.text.matches("I'm in the world").count() > 30);
     }
@@ -598,7 +670,8 @@ mod tests {
     /// by repeating the last reply.
     #[test]
     fn asking_for_more_turns_than_the_script_has_is_an_error() {
-        let daemon = ScriptedDaemon::start(Script::new(vec![Turn::says("only one")])).expect("start");
+        let daemon =
+            ScriptedDaemon::start(Script::new(vec![Turn::says("only one")])).expect("start");
         let mut conversation = RampipedConversation::open(
             daemon.socket(),
             Path::new("/nonexistent/model.gguf"),
@@ -610,17 +683,25 @@ mod tests {
             None,
         )
         .expect("open");
-        conversation.send("one", None, None, None, None, None).expect("the first is scripted");
+        conversation
+            .send("one", None, None, None, None, None)
+            .expect("the first is scripted");
         let second = conversation.send("two", None, None, None, None, None);
         let error = second.expect_err("the second is not").to_string();
-        assert!(error.contains("ran out") && error.contains("turn 2"), "{error}");
+        assert!(
+            error.contains("ran out") && error.contains("turn 2"),
+            "{error}"
+        );
     }
 
     /// A daemon that cannot parse tool calls is a real, reachable state,
     /// and a harness is supposed to refuse to start against one.
     #[test]
     fn a_script_can_refuse_to_support_tool_calls() {
-        let script = Script { supports_tool_calls: false, ..Script::new(vec![Turn::says("hi")]) };
+        let script = Script {
+            supports_tool_calls: false,
+            ..Script::new(vec![Turn::says("hi")])
+        };
         let daemon = ScriptedDaemon::start(script).expect("start");
         let conversation = RampipedConversation::open(
             daemon.socket(),
@@ -675,6 +756,9 @@ committed_tokens = 7900
             let daemon = ScriptedDaemon::bind(&path, Script::new(vec![])).expect("bind");
             assert!(daemon.socket().exists());
         }
-        assert!(!path.exists(), "a leftover socket makes the next bind fail as 'address in use'");
+        assert!(
+            !path.exists(),
+            "a leftover socket makes the next bind fail as 'address in use'"
+        );
     }
 }

@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result, bail};
 use rampipe::client::RampipedClient;
-use rampipe::protocol::{GrammarCompletion};
+use rampipe::protocol::GrammarCompletion;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

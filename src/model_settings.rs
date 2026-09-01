@@ -150,7 +150,8 @@ impl ModelSettings {
     /// socket, because both belong to the daemon.
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rampipe").join("models.toml"))
+        std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".rampipe").join("models.toml"))
     }
 
     /// Reads `path`, or answers empty settings when it is not there.
@@ -163,10 +164,20 @@ impl ModelSettings {
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
-            Err(source) => return Err(SettingsError::Io { path: path.to_path_buf(), source }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(source) => {
+                return Err(SettingsError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         };
-        toml::from_str(&raw).map_err(|source| SettingsError::Parse { path: path.to_path_buf(), source })
+        toml::from_str(&raw).map_err(|source| SettingsError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 
     /// The entry for `model_path`: longest matching key, else `default`.
@@ -185,14 +196,19 @@ impl ModelSettings {
     /// not say.
     #[must_use]
     pub fn max_new_tokens_for(&self, model_path: &Path) -> Option<i32> {
-        self.entry_for(model_path).and_then(|entry| entry.max_new_tokens)
+        self.entry_for(model_path)
+            .and_then(|entry| entry.max_new_tokens)
     }
 
     /// What to sample with for `model_path` when a caller did not say.
     #[must_use]
     pub fn sampling_for(&self, model_path: &Path) -> WireSampling {
-        self.entry_for(model_path)
-            .map_or_else(|| WireSampling::Greedy { penalties: WirePenalties::default() }, Entry::sampling)
+        self.entry_for(model_path).map_or_else(
+            || WireSampling::Greedy {
+                penalties: WirePenalties::default(),
+            },
+            Entry::sampling,
+        )
     }
 }
 
@@ -233,8 +249,14 @@ mod tests {
             "[models.\"Qwen3-Coder\"]\ntemperature = 0.7\ntop_p = 0.8\ntop_k = 20\nmin_p = 0.0\n\
              repeat_penalty = 1.05\n",
         );
-        let WireSampling::Temperature { temperature, top_k, top_p, min_p, penalties, .. } =
-            config.sampling_for(Path::new("/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"))
+        let WireSampling::Temperature {
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            penalties,
+            ..
+        } = config.sampling_for(Path::new("/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"))
         else {
             panic!("a temperature was configured, so not greedy");
         };
@@ -251,7 +273,9 @@ mod tests {
     #[test]
     fn top_p_and_min_p_default_to_disabled() {
         let config = settings("[models.x]\ntemperature = 0.7\n");
-        let WireSampling::Temperature { top_p, min_p, .. } = config.sampling_for(Path::new("/m/x.gguf")) else {
+        let WireSampling::Temperature { top_p, min_p, .. } =
+            config.sampling_for(Path::new("/m/x.gguf"))
+        else {
             panic!("temperature");
         };
         assert_eq!(top_p, 1.0);
@@ -262,14 +286,22 @@ mod tests {
     /// driving it. See `Entry::max_new_tokens`.
     #[test]
     fn a_generation_cap_can_be_configured_per_model() {
-        let config = settings("[models.big]\nmax_new_tokens = 8192\n\n[models.small]\nrepeat_penalty = 1.1\n");
-        assert_eq!(config.max_new_tokens_for(Path::new("/m/big-Q4.gguf")), Some(8192));
+        let config = settings(
+            "[models.big]\nmax_new_tokens = 8192\n\n[models.small]\nrepeat_penalty = 1.1\n",
+        );
+        assert_eq!(
+            config.max_new_tokens_for(Path::new("/m/big-Q4.gguf")),
+            Some(8192)
+        );
         assert_eq!(
             config.max_new_tokens_for(Path::new("/m/small-Q4.gguf")),
             None,
             "an entry that says nothing about it leaves the caller's own value alone"
         );
-        assert_eq!(config.max_new_tokens_for(Path::new("/m/unknown.gguf")), None);
+        assert_eq!(
+            config.max_new_tokens_for(Path::new("/m/unknown.gguf")),
+            None
+        );
     }
 
     #[test]
@@ -292,7 +324,9 @@ mod tests {
         assert_eq!(penalties.repeat, 1.18);
         assert_eq!(penalties.last_n, 512);
         assert_eq!(
-            config.entry_for(Path::new("/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf")).and_then(|e| e.note.as_deref()),
+            config
+                .entry_for(Path::new("/m/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"))
+                .and_then(|e| e.note.as_deref()),
             Some("from the model card"),
             "the file records where a number came from"
         );
@@ -322,15 +356,24 @@ mod tests {
             WireSampling::Temperature { penalties, .. } => penalties.repeat,
         };
         assert_eq!(repeat("/m/Qwen3-Coder-30B-A3B-Q4.gguf"), 1.18);
-        assert_eq!(repeat("/m/Qwen3.8-27B-UD-IQ4_XS.gguf"), 1.1, "the general entry still covers its siblings");
+        assert_eq!(
+            repeat("/m/Qwen3.8-27B-UD-IQ4_XS.gguf"),
+            1.1,
+            "the general entry still covers its siblings"
+        );
     }
 
     /// A card that says not to decode greedily has to be expressible.
     #[test]
     fn a_temperature_entry_produces_temperature_sampling() {
-        let config = settings("[models.thinking]\ntemperature = 0.7\ntop_k = 20\nrepeat_penalty = 1.05\n");
-        let WireSampling::Temperature { temperature, top_k, penalties, .. } =
-            config.sampling_for(Path::new("/m/thinking.gguf"))
+        let config =
+            settings("[models.thinking]\ntemperature = 0.7\ntop_k = 20\nrepeat_penalty = 1.05\n");
+        let WireSampling::Temperature {
+            temperature,
+            top_k,
+            penalties,
+            ..
+        } = config.sampling_for(Path::new("/m/thinking.gguf"))
         else {
             panic!("a temperature was configured");
         };
@@ -342,8 +385,10 @@ mod tests {
     /// A host that never wrote one must behave exactly as before.
     #[test]
     fn no_file_means_no_penalty_which_is_what_llama_cpp_itself_defaults_to() {
-        let config = ModelSettings::load(Path::new("/nonexistent/models.toml")).expect("missing is not an error");
-        let WireSampling::Greedy { penalties } = config.sampling_for(Path::new("/m/anything.gguf")) else {
+        let config = ModelSettings::load(Path::new("/nonexistent/models.toml"))
+            .expect("missing is not an error");
+        let WireSampling::Greedy { penalties } = config.sampling_for(Path::new("/m/anything.gguf"))
+        else {
             panic!("greedy");
         };
         assert_eq!(penalties.repeat, 1.0);
@@ -357,7 +402,10 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("models.toml");
         std::fs::write(&path, "[models.x]\nrepeat_penalty = \"not a number\"\n").expect("write");
-        assert!(matches!(ModelSettings::load(&path), Err(SettingsError::Parse { .. })));
+        assert!(matches!(
+            ModelSettings::load(&path),
+            Err(SettingsError::Parse { .. })
+        ));
     }
 
     /// A typo in a key must not be accepted as "no setting".
@@ -366,6 +414,9 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let path = dir.path().join("models.toml");
         std::fs::write(&path, "[models.x]\nrepetition_penalty = 1.1\n").expect("write");
-        assert!(matches!(ModelSettings::load(&path), Err(SettingsError::Parse { .. })));
+        assert!(matches!(
+            ModelSettings::load(&path),
+            Err(SettingsError::Parse { .. })
+        ));
     }
 }

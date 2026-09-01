@@ -1214,8 +1214,18 @@ impl LlamaSession {
         // moot (`turns` is non-empty, so neither is ever consulted
         // again), while the tool *format* is re-derived from the same
         // template, since parsing the next reply still needs it.
-        let ToolSetup { tool_format, tool_result_spans, capabilities, .. } =
-            prepare_tools(&template_text, &template, None, &meta.tools, meta.tool_format.as_ref());
+        let ToolSetup {
+            tool_format,
+            tool_result_spans,
+            capabilities,
+            ..
+        } = prepare_tools(
+            &template_text,
+            &template,
+            None,
+            &meta.tools,
+            meta.tool_format.as_ref(),
+        );
 
         Ok(Conversation {
             ctx,
@@ -1662,12 +1672,15 @@ fn prepare_tools(
         .then(|| crate::tool_format::render_opening(template_text, system_block, offered, &render))
         .flatten();
 
-    let tool_format = offered.is_some().then(|| {
-        crate::tool_format::derive_tool_call_format(template_text, &render)
-            // Derivation first, config second -- see
-            // `ConversationOptions::tool_format`.
-            .or_else(|| configured_format.cloned())
-    }).flatten();
+    let tool_format = offered
+        .is_some()
+        .then(|| {
+            crate::tool_format::derive_tool_call_format(template_text, &render)
+                // Derivation first, config second -- see
+                // `ConversationOptions::tool_format`.
+                .or_else(|| configured_format.cloned())
+        })
+        .flatten();
     let tool_result_spans = (offered.is_some() && capabilities.tool_results)
         .then(|| crate::tool_format::derive_tool_result_spans(template_text, &render))
         .flatten();
@@ -1681,7 +1694,9 @@ fn prepare_tools(
         // the template has no system block, or because rendering the
         // opening failed and the derived span (which contains no system
         // text) is being used instead.
-        system_for_first_turn: system.filter(|_| !opening_carries_system).map(str::to_string),
+        system_for_first_turn: system
+            .filter(|_| !opening_carries_system)
+            .map(str::to_string),
         tool_format,
         tool_result_spans,
         capabilities,
@@ -1831,7 +1846,10 @@ impl<'a> Conversation<'a> {
         // Built per turn from the format this conversation derived, so a
         // model that keeps generating past its own tool call is stopped
         // rather than left to invent the results. See `TurnEnd`.
-        let turn_end = self.tool_format.as_ref().map(crate::tool_format::TurnEnd::of);
+        let turn_end = self
+            .tool_format
+            .as_ref()
+            .map(crate::tool_format::TurnEnd::of);
         let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut self.ctx,
             self.model,
@@ -1923,7 +1941,14 @@ impl<'a> Conversation<'a> {
         grammar_complete: Option<&dyn Fn(&str) -> bool>,
     ) -> Result<GenerationResult, LlamaSessionError> {
         let Some(spans) = self.tool_result_spans.clone() else {
-            return self.send(&results.join("\n"), max_new_tokens, sampling, grammar, None, grammar_complete);
+            return self.send(
+                &results.join("\n"),
+                max_new_tokens,
+                sampling,
+                grammar,
+                None,
+                grammar_complete,
+            );
         };
 
         let start = Instant::now();
@@ -1956,7 +1981,10 @@ impl<'a> Conversation<'a> {
         // Built per turn from the format this conversation derived, so a
         // model that keeps generating past its own tool call is stopped
         // rather than left to invent the results. See `TurnEnd`.
-        let turn_end = self.tool_format.as_ref().map(crate::tool_format::TurnEnd::of);
+        let turn_end = self
+            .tool_format
+            .as_ref()
+            .map(crate::tool_format::TurnEnd::of);
         let (text, generated_tokens, time_to_first_token) = run_generation_loop(
             &mut self.ctx,
             self.model,
@@ -2090,7 +2118,8 @@ impl<'a> Conversation<'a> {
             // span begins at `start`, not at zero: the opening stays put
             // at the front, and every earlier drop has already shifted
             // what follows down to meet it.
-            self.tokens.drain(start as usize..assistant.end_pos as usize);
+            self.tokens
+                .drain(start as usize..assistant.end_pos as usize);
             freed += removed;
         }
         Ok(())

@@ -132,7 +132,11 @@ impl ToolSpec {
     /// so a constructor is friendlier than making every call site repeat
     /// the one legal value.
     #[must_use]
-    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: serde_json::Value) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters: serde_json::Value,
+    ) -> Self {
         Self {
             kind: "function".to_string(),
             function: ToolFunction {

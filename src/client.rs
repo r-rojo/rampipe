@@ -437,7 +437,10 @@ impl RampipedConversation {
     /// One request/reply round trip on this conversation's own socket --
     /// shared by `send` and `send_tool_results`, which differ only in
     /// the request they build.
-    fn exchange(&mut self, turn: ConversationTurnRequest) -> Result<GenerateOutcome, RampipedError> {
+    fn exchange(
+        &mut self,
+        turn: ConversationTurnRequest,
+    ) -> Result<GenerateOutcome, RampipedError> {
         let turn = ConversationRequest::Turn(turn);
         let mut payload = serde_json::to_vec(&turn).map_err(RampipedError::Encode)?;
         payload.push(b'\n');
@@ -477,11 +480,9 @@ impl RampipedConversation {
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
             ConversationResponse::Opened
             | ConversationResponse::OpenedWithTools { .. }
-            | ConversationResponse::Snapshotted => {
-                Err(RampipedError::Remote(
-                    "rampiped sent an unexpected response to a conversation turn".to_string(),
-                ))
-            }
+            | ConversationResponse::Snapshotted => Err(RampipedError::Remote(
+                "rampiped sent an unexpected response to a conversation turn".to_string(),
+            )),
         }
     }
 
@@ -521,11 +522,9 @@ impl RampipedConversation {
             ConversationResponse::Err { message } => Err(RampipedError::Remote(message)),
             ConversationResponse::Opened
             | ConversationResponse::OpenedWithTools { .. }
-            | ConversationResponse::Turn { .. } => {
-                Err(RampipedError::Remote(
-                    "rampiped sent an unexpected response to a snapshot request".to_string(),
-                ))
-            }
+            | ConversationResponse::Turn { .. } => Err(RampipedError::Remote(
+                "rampiped sent an unexpected response to a snapshot request".to_string(),
+            )),
         }
     }
 }

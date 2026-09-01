@@ -49,7 +49,10 @@ const CODENAME: &str = "MARIGOLD";
 fn download_model() -> Result<PathBuf> {
     let client = HFClientSync::new().context("creating Hugging Face Hub client")?;
     let repo = client.model(REPO_OWNER, REPO_NAME);
-    repo.download_file().filename(FILENAME).send().context("downloading GGUF file")
+    repo.download_file()
+        .filename(FILENAME)
+        .send()
+        .context("downloading GGUF file")
 }
 
 fn main() -> Result<()> {
@@ -71,7 +74,9 @@ fn main() -> Result<()> {
         tools: Vec::new(),
         tool_format: None,
     };
-    let mut conversation = session.open_conversation(options).context("opening conversation")?;
+    let mut conversation = session
+        .open_conversation(options)
+        .context("opening conversation")?;
 
     // Filler. Each turn is small; together they are several times the
     // window, so the front of the cache is reclaimed many times over.
@@ -81,7 +86,9 @@ fn main() -> Result<()> {
             .send(
                 &format!("Count from {i} to {}. Numbers only.", i + 6),
                 MAX_NEW_TOKENS,
-                Sampling::Greedy { penalties: Penalties::default() },
+                Sampling::Greedy {
+                    penalties: Penalties::default(),
+                },
                 None,
                 None,
                 None,
@@ -90,7 +97,16 @@ fn main() -> Result<()> {
     }
 
     let answer = conversation
-        .send("What is the project codename?", MAX_NEW_TOKENS, Sampling::Greedy { penalties: Penalties::default() }, None, None, None)
+        .send(
+            "What is the project codename?",
+            MAX_NEW_TOKENS,
+            Sampling::Greedy {
+                penalties: Penalties::default(),
+            },
+            None,
+            None,
+            None,
+        )
         .context("asking for the codename after the drops")?;
     let text = answer.text.trim().to_string();
     println!("\nafter {TURNS} turns of eviction, asked for the codename: {text:?}");

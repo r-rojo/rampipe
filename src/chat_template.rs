@@ -135,15 +135,26 @@ mod tests {
 
     #[test]
     fn a_template_raising_an_exception_fails_rather_than_panicking() {
-        assert!(render_messages("{{ raise_exception('nope') }}", &[("user", "hi")], false).is_none());
+        assert!(
+            render_messages("{{ raise_exception('nope') }}", &[("user", "hi")], false).is_none()
+        );
     }
 
     #[test]
     fn tools_are_absent_rather_than_empty_when_not_supplied() {
         let template = "{% if tools is defined %}HAS{% else %}NONE{% endif %}";
-        assert_eq!(render_json(template, &serde_json::json!([]), None, false).as_deref(), Some("NONE"));
         assert_eq!(
-            render_json(template, &serde_json::json!([]), Some(&serde_json::json!([])), false).as_deref(),
+            render_json(template, &serde_json::json!([]), None, false).as_deref(),
+            Some("NONE")
+        );
+        assert_eq!(
+            render_json(
+                template,
+                &serde_json::json!([]),
+                Some(&serde_json::json!([])),
+                false
+            )
+            .as_deref(),
             Some("HAS")
         );
     }
